@@ -22,9 +22,9 @@ jobs:
         if: github.ref == 'refs/heads/test'
         run: |
           # 1. Синхронизируем код, строго исключая локальный рабочий конфиг и whitelist тестовой папки
-          rsync -av --exclude='.git*' --exclude='config*' --exclude='allowed_users*' ./ /home/pi/app/pptx2png/test/
+          rsync -av --exclude='.git*' --exclude='config*' --exclude='allowed_users*' ./ /mnt/external_data/pptx2png/test/
           
-          cd /home/pi/app/pptx2png/test/
+          cd /mnt/external_data/pptx2png/test/
           chmod +x manage.sh
           
           # 2. Гарантированно останавливаем старую запущенную копию теста перед новым тестом
