@@ -47,8 +47,8 @@ jobs:
               cp "$SHM_LOG_DIR/bot.log" ${{ github.workspace }}/bot.log || true
               cp "$SHM_LOG_DIR/debug.log" ${{ github.workspace }}/debug.log || true
               
-              # Гасим тестового бота, чтобы он не висел в памяти вечно, если это просто секундный запуск
-              ./manage.sh stop
+              # Оставляем бота работать (test — это живой бот для тестового окружения)
+              echo "🟢 Бот оставлен работать в фоне."
           else
               echo "❌ Ошибка старта бота! Сборка провалена."
               SHM_LOG_DIR="/dev/shm/pptx2png_tasks/test/logs"
