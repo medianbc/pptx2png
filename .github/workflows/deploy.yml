@@ -22,8 +22,7 @@ jobs:
         if: github.ref == 'refs/heads/test'
         run: |
           # 1. Синхронизируем код, строго исключая локальный рабочий конфиг и whitelist тестовой папки
-          rsync -av --exclude='.git*' --exclude='config*' --exclude='allowed_users*' ./ /mnt/external_data/pptx2png/test/
-          
+          rsync -av --delete --exclude='.git*' --exclude='config*' --exclude='allowed_users*' --exclude='user_settings*' --exclude='.run_state/' --exclude='__pycache__/' --exclude='*.log' ./ /mnt/external_data/pptx2png/test/
           cd /mnt/external_data/pptx2png/test/
           chmod +x manage.sh
           
@@ -73,7 +72,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           # 1. Синхронизируем код, строго исключая перезапись боевого config/allowed_users
-          rsync -av --exclude='.git*' --exclude='debug.log' --exclude='config*' --exclude='allowed_users*' ./ /home/pi/app/pptx2png/prod/
+          rsync -av --delete --exclude='.git*' --exclude='debug.log' --exclude='config*' --exclude='allowed_users*' --exclude='user_settings*' --exclude='.run_state/' --exclude='__pycache__/' --exclude='*.log' ./ /home/pi/app/pptx2png/prod/
           
           # 2. Автоматический перезапуск продакшн-бота через manage.sh
           cd /home/pi/app/pptx2png/prod/
