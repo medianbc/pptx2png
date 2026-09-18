@@ -81,9 +81,25 @@ def setup_environment():
             log_dir = os.path.join(str(shm_dir), "logs")
 
     os.makedirs(log_dir, exist_ok=True)
+        # ──── Параметры Яндекс.Диска ────
+    yandex_token = ""
+    try:
+        yandex_token = config.get("YandexDisk", "token").strip()
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        yandex_token = ""
 
-    return script_dir, env_name, bot_token, admin_id, shm_dir, log_dir
+    yandex_base_path = settings_config.get("YandexDisk", "base_path", fallback="").strip()
+    yandex_source_folder = settings_config.get("YandexDisk", "source_folder", fallback="Служение").strip()
+    yandex_target_folder = settings_config.get("YandexDisk", "target_folder", fallback="Трансляция").strip()
+    yandex_pptx2png_folder = settings_config.get("YandexDisk", "pptx2png_folder", fallback="pptx2png").strip()
+    yandex_sermon_folder = settings_config.get("YandexDisk", "sermon_folder", fallback="проповедь - png").strip()
+    yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
+    yandex_template_file = settings_config.get("YandexDisk", "template_file", fallback="template.yaml").strip()
 
+    return (script_dir, env_name, bot_token, admin_id, shm_dir, log_dir,
+            yandex_token, yandex_base_path, yandex_source_folder,
+            yandex_target_folder, yandex_pptx2png_folder,
+            yandex_sermon_folder, yandex_sermon_keyword, yandex_template_file)
 
 # ==========================================
 # 2. НАСТРОЙКА ЛОГИРОВАНИЯ С РОТАЦИЕЙ
@@ -185,6 +201,35 @@ def create_bot_and_dispatcher(bot_token: str, admin_id: int, shm_dir: Path, scri
 
     user_mgr = UserManager(admin_id=admin_id, base_dir=Path(script_dir))
     http_session = aiohttp.ClientSession()
+
+    def create_bot_and_dispatcher(
+    bot_token, admin_id, shm_dir, script_dir,
+    yandex_token, yandex_base_path, yandex_source_folder,
+    yandex_target_folder, yandex_pptx2png_folder,
+    yandex_sermon_folder, yandex_sermon_keyword, yandex_template_file,
+    ):
+        bot = Bot(token=bot_token)
+        dp = Dispatcher()
+ 
+        user_mgr = UserManager(admin_id=admin_id, base_dir=Path(script_dir))
+        http_session = aiohttp.ClientSession()
+    
+        # ──── Инициализация Яндекс.Диска ────
+        import handlers
+        from yandex_disk import YandexDiskClient
+
+        if yandex_token and yandex_base_path:
+            handlers.yandex_client = YandexDiskClient(yandex_token)
+            handlers.yandex_base_path = yandex_base_path
+            handlers.yandex_source_folder = yandex_source_folder
+            handlers.yandex_target_folder = yandex_target_folder
+            handlers.yandex_pptx2png_folder = yandex_pptx2png_folder
+            handlers.yandex_sermon_folder = yandex_sermon_folder
+            handlers.yandex_sermon_keyword = yandex_sermon_keyword
+            handlers.yandex_template_file = yandex_template_file
+            logging.info(f"✅ Яндекс.Диск инициализирован: {yandex_base_path}")
+        else:
+            logging.warning("⚠️ Яндекс.Диск не настроен — /sunday будет недоступна")
 
     def get_settings_keyboard(user_id):
         cfg = user_mgr.get_user_config(user_id)
