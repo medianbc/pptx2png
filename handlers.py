@@ -20,6 +20,39 @@ from utils import extract_text_from_pptx, check_spelling, download_file_by_url, 
 import converter_engine
 from converter_engine import make_dark_mode
 
+# В начале файла добавьте:
+from yandex_disk import (
+    YandexDiskClient,
+    get_nearest_sunday,
+    month_folder_name,
+    resolve_sunday_paths,
+    find_pptx_in_source,
+    pptx_matches_date,
+)
+
+# Глобальные переменные для Яндекс.Диска
+yandex_client: Optional[YandexDiskClient] = None
+yandex_base_path: str = ""
+yandex_source_folder: str = "Служение"
+yandex_target_folder: str = "Трансляция"
+yandex_pptx2png_folder: str = "pptx2png"
+yandex_sermon_folder: str = "проповедь - png"
+yandex_sermon_keyword: str = "проповед"
+yandex_template_file: str = "template.yaml"
+
+
+# ==========================================
+# БЛОКИРОВКА СЕССИЙ ЯНДЕКС.ДИСКА
+# ==========================================
+# Не позволяем одновременно запускать несколько сессий /sunday
+# с выгрузкой на Яндекс.Диск.
+
+yd_session_lock = asyncio.Lock()
+yd_active_sessions: Set[str] = set()  # {(user_id, chat_id)}
+
+
+def yd_session_key(user_id: int, chat_id: int) -> str:
+    return f"{user_id}:{chat_id}"
 
 # ==========================================
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
@@ -517,8 +550,52 @@ async def send_welcome(message: types.Message, get_settings_keyboard):
 async def cmd_start(message: types.Message, check_access, get_settings_keyboard):
     if not await check_access(message):
         return
-    await send_welcome(message, get_settings_keyboard)
 
+    # Проверяем Яндекс.Диск
+    yd_status = "⚪ Не настроен"
+    sunday_line = ""
+
+    if yandex_client is not None:
+        ok, err = await yandex_client.check_access()
+        if ok:
+            yd_status = "✅ Доступен"
+
+            # Проверяем наличие pptx на ближайшее воскресенье
+            sunday = get_nearest_sunday()
+            paths = await resolve_sunday_paths(
+                yandex_client, yandex_base_path, sunday,
+                yandex_source_folder, yandex_target_folder,
+            )
+            if paths:
+                pptx_files = await find_pptx_in_source(
+                    yandex_client, paths["source"], sunday
+                )
+                if pptx_files:
+                    sunday_line = (
+                        f"\n📅 На **{sunday:%d.%m.%Y}** "
+                        f"найдено pptx: **{len(pptx_files)}**\n"
+                        f"→ /sunday для выбора"
+                    )
+                else:
+                    sunday_line = (
+                        f"\n📅 На **{sunday:%d.%m.%Y}** pptx пока нет."
+                    )
+            else:
+                sunday_line = (
+                    f"\n📅 Структура для **{sunday:%d.%m.%Y}** не найдена."
+                )
+        else:
+            yd_status = f"❌ {err}"
+
+    await message.reply(
+        f"👋 Привет!\n\n"
+        f"🟢 Яндекс.Диск: {yd_status}"
+        f"{sunday_line}\n\n"
+        f"Загрузите презентацию, отправьте ссылку или используйте /sunday.\n\n"
+        f"⚙️ Настройки:",
+        reply_markup=get_settings_keyboard(message.from_user.id),
+    )
+    
 # ==========================================
 # 2. ОБРАБОТЧИК ВЫБОРА СЛАЙДОВ (callback)
 # ==========================================
