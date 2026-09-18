@@ -21,6 +21,16 @@ RUSSIAN_MONTHS = [
 # ==========================================
 # КЛИЕНТ
 # ==========================================
+# В начале файла
+class YandexDiskError(Exception):
+    """Ошибка обращения к API Яндекс.Диска."""
+    pass
+
+
+class YandexDiskNotFoundError(YandexDiskError):
+    """Ресурс не найден (404)."""
+    pass
+
 
 class YandexDiskClient:
     """Асинхронный клиент для REST API Яндекс.Диска."""
@@ -53,13 +63,18 @@ class YandexDiskClient:
 
     # ---------- Метаданные ----------
 
-    async def get_resource(
+        async def get_resource(
         self,
         path: str,
         limit: int = 1000,
         offset: int = 0,
-    ) -> Optional[Dict[str, Any]]:
-        """Получить метаданные файла/папки."""
+    ) -> Dict[str, Any]:
+        """
+        Получить метаданные файла/папки.
+        Возвращает dict с данными.
+        Бросает YandexDiskNotFoundError при 404.
+        Бросает YandexDiskError при других ошибках.
+        """
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
@@ -73,27 +88,29 @@ class YandexDiskClient:
                     url, headers=self.headers, params=params, timeout=30
                 ) as resp:
                     if resp.status == 404:
-                        return None
+                        raise YandexDiskNotFoundError(f"Не найдено: {path}")
                     if resp.status != 200:
-                        logging.error(f"get_resource {path}: HTTP {resp.status}")
-                        return None
+                        raise YandexDiskError(
+                            f"HTTP {resp.status} для {path}"
+                        )
                     return await resp.json()
+        except aiohttp.ClientError as e:
+            raise YandexDiskError(f"Сеть: {e}")
+        except (YandexDiskNotFoundError, YandexDiskError):
+            raise  # пробрасываем наши
         except Exception as e:
-            logging.error(f"Ошибка get_resource: {e}")
-            return None
+            raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
-    async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
+        async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
         """
-        Список содержимого папки с ПОЛНОЙ пагинацией.
-        Проходит все страницы, пока не соберёт все элементы.
+        Список содержимого папки с полной пагинацией.
+        Бросает YandexDiskError при ошибке API.
         """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
         while True:
             resource = await self.get_resource(path, limit=page_size, offset=offset)
-            if not resource:
-                break
 
             embedded = resource.get("_embedded", {})
             items = embedded.get("items", [])
@@ -105,15 +122,41 @@ class YandexDiskClient:
             all_items.extend(items)
             offset += len(items)
 
-            # Собрали всё — выходим
             if offset >= total:
                 break
 
-            # Защита от бесконечного цикла
             if len(items) < page_size:
                 break
 
         return all_items
+
+    async def folder_exists(self, path: str) -> bool:
+        """Проверяет, что папка существует. Возвращает False при 404, бросает при ошибке."""
+        try:
+            resource = await self.get_resource(path)
+        except YandexDiskNotFoundError:
+            return False
+        return resource.get("type") == "dir"
+
+    async def find_child_folder(
+        self,
+        parent_path: str,
+        predicate: Callable[[str], bool],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Найти дочернюю папку по предикату.
+        Бросает YandexDiskError при ошибке API.
+        """
+        items = await self.list_folder(parent_path)
+        for item in items:
+            if item.get("type") != "dir":
+                continue
+            try:
+                if predicate(item["name"]):
+                    return item
+            except Exception as e:
+                logging.error(f"Ошибка предиката для '{item['name']}': {e}")
+        return None
 
     async def folder_exists(self, path: str) -> bool:
         resource = await self.get_resource(path)
@@ -246,9 +289,13 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
-    """Находит все pptx в папке 'Служение' с датой воскресенья в имени."""
-    if not await client.folder_exists(source_path):
-        return []
+    """Находит pptx в 'Служение'. Бросает YandexDiskError."""
+    try:
+        if not await client.folder_exists(source_path):
+            return []
+    except YandexDiskError as e:
+        logging.error(f"Ошибка доступа к {source_path}: {e}")
+        raise
 
     items = await client.list_folder(source_path)
     result = []
