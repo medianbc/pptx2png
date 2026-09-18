@@ -1,8 +1,6 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (исправлен)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.2)
 # ==========================================
-
-# 20260903
 
 import sys
 import os
@@ -82,11 +80,41 @@ def setup_environment():
 
     os.makedirs(log_dir, exist_ok=True)
 
-    return script_dir, env_name, bot_token, admin_id, shm_dir, log_dir
+    # ──── Параметры Яндекс.Диска ────
+    yandex_token = ""
+    try:
+        yandex_token = config.get("YandexDisk", "token").strip()
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        yandex_token = ""
+
+    yandex_base_path = settings_config.get("YandexDisk", "base_path", fallback="").strip()
+    yandex_source_folder = settings_config.get("YandexDisk", "source_folder", fallback="Служение").strip()
+    yandex_target_folder = settings_config.get("YandexDisk", "target_folder", fallback="Трансляция").strip()
+    yandex_pptx2png_folder = settings_config.get("YandexDisk", "pptx2png_folder", fallback="pptx2png").strip()
+    yandex_sermon_folder = settings_config.get("YandexDisk", "sermon_folder", fallback="проповедь - png").strip()
+    yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
+    yandex_template_file = settings_config.get("YandexDisk", "template_file", fallback="template.yaml").strip()
+
+    return {
+        "script_dir": script_dir,
+        "env_name": env_name,
+        "bot_token": bot_token,
+        "admin_id": admin_id,
+        "shm_dir": shm_dir,
+        "log_dir": log_dir,
+        "yandex_token": yandex_token,
+        "yandex_base_path": yandex_base_path,
+        "yandex_source_folder": yandex_source_folder,
+        "yandex_target_folder": yandex_target_folder,
+        "yandex_pptx2png_folder": yandex_pptx2png_folder,
+        "yandex_sermon_folder": yandex_sermon_folder,
+        "yandex_sermon_keyword": yandex_sermon_keyword,
+        "yandex_template_file": yandex_template_file,
+    }
 
 
 # ==========================================
-# 2. НАСТРОЙКА ЛОГИРОВАНИЯ С РОТАЦИЕЙ
+# 2. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ==========================================
 
 def setup_logging(log_dir: str):
@@ -96,9 +124,7 @@ def setup_logging(log_dir: str):
 
     info_handler = RotatingFileHandler(
         os.path.join(log_dir, "bot.log"),
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding='utf-8'
+        maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
     )
     info_handler.setLevel(logging.INFO)
     info_handler.setFormatter(log_formatter)
@@ -106,9 +132,7 @@ def setup_logging(log_dir: str):
 
     debug_handler = RotatingFileHandler(
         os.path.join(log_dir, "debug.log"),
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
-        encoding='utf-8'
+        maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8'
     )
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(log_formatter)
@@ -121,52 +145,39 @@ def setup_logging(log_dir: str):
 
 
 # ==========================================
-# 3. АСИНХРОННАЯ ОЧИСТКА С ПРОВЕРКОЙ АКТИВНОСТИ
+# 3. ОЧИСТКА ЗАДАЧ
 # ==========================================
 
 async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     """
-    Удаляет папки задач, которые не обновлялись дольше max_age_seconds
-    И НЕ являются активными (не захвачены блокировкой).
+    Удаляет старые НЕактивные папки задач.
+    Активные задачи (захваченные task_lock_manager) не удаляются.
     """
     if not shm_dir.exists():
         return
-
     current_time = time.time()
     deleted = 0
 
     for item in shm_dir.iterdir():
         if not item.is_dir() or not item.name.startswith("task_"):
             continue
-
         task_id = item.name
-
-        # Проверяем, активна ли задача (захвачена ли блокировка)
         if await task_lock_manager.is_active(task_id):
-            continue  # не удаляем активную задачу
-
+            continue
         try:
             mtime = item.stat().st_mtime
             age_seconds = current_time - mtime
-
             if age_seconds > max_age_seconds:
                 await asyncio.to_thread(shutil.rmtree, item)
                 deleted += 1
-                age_min = age_seconds / 60
-                logging.info(f"🧹 Удалена старая папка {item.name} ({age_min:.1f} мин)")
+                logging.info(f"🧹 Удалена старая папка {item.name} ({age_seconds/60:.1f} мин)")
         except Exception as e:
             logging.error(f"Ошибка обработки {item}: {e}")
-
     if deleted:
         logging.info(f"🧹 Очищено {deleted} старых папок")
 
 
 async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
-    """
-    Фоновый цикл очистки старых задач.
-    Запускается каждые interval секунд (по умолчанию 5 минут).
-    Ошибки не прерывают цикл.
-    """
     while True:
         await asyncio.sleep(interval)
         try:
@@ -179,43 +190,57 @@ async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
 # 4. СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА
 # ==========================================
 
-def create_bot_and_dispatcher(bot_token: str, admin_id: int, shm_dir: Path, script_dir: str):
-    bot = Bot(token=bot_token)
+def create_bot_and_dispatcher(cfg: dict):
+    bot = Bot(token=cfg["bot_token"])
     dp = Dispatcher()
 
-    user_mgr = UserManager(admin_id=admin_id, base_dir=Path(script_dir))
+    user_mgr = UserManager(admin_id=cfg["admin_id"], base_dir=Path(cfg["script_dir"]))
     http_session = aiohttp.ClientSession()
 
-    def get_settings_keyboard(user_id):
-        cfg = user_mgr.get_user_config(user_id)
-        q_std = "✅ Standard" if cfg["quality"] == "standard" else "Standard"
-        q_2k = "✅ 2K" if cfg["quality"] == "2k" else "2K"
-        q_4k = "✅ 4K" if cfg["quality"] == "4k" else "4K"
-        pdf_status = "✅ Да (ZIP + PDF)" if cfg["keep_pdf"] else "❌ Нет (Только ZIP)"
+    # ──── Инициализация Яндекс.Диска ────
+    import handlers
+    from yandex_disk import YandexDiskClient
 
-        builder = InlineKeyboardBuilder()
-        builder.row(
+    if cfg["yandex_token"] and cfg["yandex_base_path"]:
+        handlers.yandex_client = YandexDiskClient(cfg["yandex_token"])
+        handlers.yandex_base_path = cfg["yandex_base_path"]
+        handlers.yandex_source_folder = cfg["yandex_source_folder"]
+        handlers.yandex_target_folder = cfg["yandex_target_folder"]
+        handlers.yandex_pptx2png_folder = cfg["yandex_pptx2png_folder"]
+        handlers.yandex_sermon_folder = cfg["yandex_sermon_folder"]
+        handlers.yandex_sermon_keyword = cfg["yandex_sermon_keyword"]
+        handlers.yandex_template_file = cfg["yandex_template_file"]
+        logging.info(f"✅ Яндекс.Диск инициализирован: {cfg['yandex_base_path']}")
+    else:
+        logging.warning("⚠️ Яндекс.Диск не настроен — /sunday будет недоступна")
+
+    def get_settings_keyboard(user_id):
+        c = user_mgr.get_user_config(user_id)
+        q_std = "✅ Standard" if c["quality"] == "standard" else "Standard"
+        q_2k = "✅ 2K" if c["quality"] == "2k" else "2K"
+        q_4k = "✅ 4K" if c["quality"] == "4k" else "4K"
+        pdf_status = "✅ Да (ZIP + PDF)" if c["keep_pdf"] else "❌ Нет (Только ZIP)"
+        b = InlineKeyboardBuilder()
+        b.row(
             InlineKeyboardButton(text=q_std, callback_data="set_q_standard"),
             InlineKeyboardButton(text=q_2k, callback_data="set_q_2k"),
             InlineKeyboardButton(text=q_4k, callback_data="set_q_4k")
         )
-        builder.row(InlineKeyboardButton(text=f"Возвращать PDF: {pdf_status}", callback_data="toggle_pdf"))
-        return builder.as_markup()
+        b.row(InlineKeyboardButton(text=f"Возвращать PDF: {pdf_status}", callback_data="toggle_pdf"))
+        return b.as_markup()
 
     async def check_access_by_user(user: types.User, bot: Bot) -> bool:
         user_id = user.id
         if user_id in user_mgr.load_allowed_users():
             return True
-
         admin_kb = InlineKeyboardBuilder()
         admin_kb.row(
             InlineKeyboardButton(text="✅ Разрешить", callback_data=f"adm_allow_{user_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_deny_{user_id}")
         )
-
         try:
             await bot.send_message(
-                chat_id=admin_id,
+                chat_id=cfg["admin_id"],
                 text=(
                     f"🔔 <b>Запрос доступа!</b>\n\n"
                     f"• <b>Имя:</b> <code>{user.full_name or 'без имени'}</code>\n"
@@ -234,14 +259,14 @@ def create_bot_and_dispatcher(bot_token: str, admin_id: int, shm_dir: Path, scri
         return await check_access_by_user(message.from_user, bot)
 
     dp.workflow_data.update({
-        "SHM_DIR": str(shm_dir),
+        "SHM_DIR": str(cfg["shm_dir"]),
         "user_mgr": user_mgr,
         "check_access": check_access,
         "check_access_by_user": check_access_by_user,
         "get_settings_keyboard": get_settings_keyboard,
         "http_session": http_session,
         "bot": bot,
-        "ADMIN_ID": admin_id
+        "ADMIN_ID": cfg["admin_id"],
     })
 
     dp.include_router(router)
@@ -255,20 +280,19 @@ def create_bot_and_dispatcher(bot_token: str, admin_id: int, shm_dir: Path, scri
 async def main():
     logging.info("🚀 Запуск PPTX2PNG Telegram Bot...")
 
-    script_dir, env_name, bot_token, admin_id, shm_dir, log_dir = setup_environment()
-    setup_logging(log_dir)
+    cfg = setup_environment()
+    setup_logging(cfg["log_dir"])
 
-    logging.info(f"📁 Окружение: {env_name}")
-    logging.info(f"💾 RAM-диск: {shm_dir}")
-    logging.info(f"📄 Логи: {log_dir}")
+    logging.info(f"📁 Окружение: {cfg['env_name']}")
+    logging.info(f"💾 RAM-диск: {cfg['shm_dir']}")
+    logging.info(f"📄 Логи: {cfg['log_dir']}")
 
-    # ✅ Стартовая очистка УДАЛЕНА — теперь только периодическая.
-    # Это предотвращает удаление задач, обрабатываемых другим экземпляром.
+    # ✅ Стартовая очистка НЕ вызывается (multi-instance safety).
+    # Активные задачи будут очищены по возрасту через cleanup_loop.
 
-    bot, dp, user_mgr, http_session = create_bot_and_dispatcher(bot_token, admin_id, shm_dir, script_dir)
+    bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
-    # ✅ Фоновый процесс очистки старых задач (каждые 5 минут, порог 2 часа)
-    asyncio.create_task(cleanup_loop(shm_dir, interval=300, max_age=7200))
+    asyncio.create_task(cleanup_loop(cfg["shm_dir"], interval=300, max_age=7200))
 
     logging.info("✅ Бот успешно инициализирован и готов к работе")
 
