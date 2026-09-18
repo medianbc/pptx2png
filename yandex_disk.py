@@ -1,20 +1,16 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска
+# yandex_disk.py — клиент Яндекс.Диска (исправлен)
 # ==========================================
 
 import aiohttp
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 from datetime import datetime, timedelta
 
 
 YANDEX_API_BASE = "https://cloud-api.yandex.net/v1/disk"
 
-
-# ==========================================
-# РУССКИЕ НАЗВАНИЯ МЕСЯЦЕВ
-# ==========================================
 
 RUSSIAN_MONTHS = [
     "", "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
@@ -36,19 +32,12 @@ class YandexDiskClient:
     # ---------- Проверка доступности ----------
 
     async def check_access(self) -> Tuple[bool, Optional[str]]:
-        """
-        Проверяет доступность Диска.
-        Возвращает (True, None) если ОК, иначе (False, "сообщение").
-        """
         if not self.token:
             return False, "Токен не задан"
-
         url = f"{YANDEX_API_BASE}/"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=self.headers, timeout=15
-                ) as resp:
+                async with session.get(url, headers=self.headers, timeout=15) as resp:
                     if resp.status == 200:
                         return True, None
                     elif resp.status == 401:
@@ -64,12 +53,18 @@ class YandexDiskClient:
 
     # ---------- Метаданные ----------
 
-    async def get_resource(self, path: str, limit: int = 1000) -> Optional[Dict[str, Any]]:
+    async def get_resource(
+        self,
+        path: str,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> Optional[Dict[str, Any]]:
         """Получить метаданные файла/папки."""
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
             "limit": limit,
+            "offset": offset,
             "fields": "name,path,type,size,created,modified,_embedded",
         }
         try:
@@ -87,23 +82,61 @@ class YandexDiskClient:
             logging.error(f"Ошибка get_resource: {e}")
             return None
 
-    async def list_folder(self, path: str) -> List[Dict[str, Any]]:
-        """Список содержимого папки."""
-        resource = await self.get_resource(path)
-        if not resource:
-            return []
-        return resource.get("_embedded", {}).get("items", [])
+    async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
+        """
+        Список содержимого папки с ПОЛНОЙ пагинацией.
+        Проходит все страницы, пока не соберёт все элементы.
+        """
+        all_items: List[Dict[str, Any]] = []
+        offset = 0
+
+        while True:
+            resource = await self.get_resource(path, limit=page_size, offset=offset)
+            if not resource:
+                break
+
+            embedded = resource.get("_embedded", {})
+            items = embedded.get("items", [])
+            total = embedded.get("total", 0)
+
+            if not items:
+                break
+
+            all_items.extend(items)
+            offset += len(items)
+
+            # Собрали всё — выходим
+            if offset >= total:
+                break
+
+            # Защита от бесконечного цикла
+            if len(items) < page_size:
+                break
+
+        return all_items
 
     async def folder_exists(self, path: str) -> bool:
         resource = await self.get_resource(path)
         return resource is not None and resource.get("type") == "dir"
 
-    async def find_child_folder(self, parent_path: str, predicate) -> Optional[Dict[str, Any]]:
-        """Найти дочернюю папку по предикату."""
+    async def find_child_folder(
+        self,
+        parent_path: str,
+        predicate: Callable[[str], bool],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Найти дочернюю папку по предикату.
+        ⚠️ Предикат должен быть СИНХРОННЫМ (def, не async def).
+        """
         items = await self.list_folder(parent_path)
         for item in items:
-            if item.get("type") == "dir" and predicate(item["name"]):
-                return item
+            if item.get("type") != "dir":
+                continue
+            try:
+                if predicate(item["name"]):
+                    return item
+            except Exception as e:
+                logging.error(f"Ошибка предиката для '{item['name']}': {e}")
         return None
 
 
@@ -112,11 +145,17 @@ class YandexDiskClient:
 # ==========================================
 
 def get_nearest_sunday(reference_date: Optional[datetime] = None) -> datetime:
-    """Ближайшее ПРОШЕДШЕЕ воскресенье (включая сегодня)."""
+    """
+    Ближайшее ПРЕДСТОЯЩЕЕ воскресенье.
+    - Если сегодня воскресенье — возвращает сегодня.
+    - Иначе — следующее воскресенье (в будущем).
+    """
     if reference_date is None:
         reference_date = datetime.now()
-    days_since_sunday = (reference_date.weekday() + 1) % 7
-    return reference_date - timedelta(days=days_since_sunday)
+
+    # weekday(): Пн=0, Вт=1, ..., Вс=6
+    days_until_sunday = (6 - reference_date.weekday()) % 7
+    return reference_date + timedelta(days=days_until_sunday)
 
 
 def month_folder_name(date: datetime) -> str:
@@ -127,25 +166,23 @@ def month_folder_name(date: datetime) -> str:
 def date_folder_variants(date: datetime) -> List[str]:
     """Возможные имена папки даты (только цифровые форматы)."""
     return [
-        date.strftime("%d.%m.%Y"),                 # 06.09.2026
-        date.strftime("%d.%m.%y"),                 # 06.09.26
-        date.strftime("%Y-%m-%d"),                 # 2026-09-06
-        date.strftime("%d-%m-%Y"),                 # 06-09-2026
-        date.strftime("%d-%m-%y"),                 # 06-09-26
-        date.strftime("%d_%m_%Y"),                 # 06_09_2026
-        date.strftime("%d_%m_%y"),                 # 06_09_26
-        f"{date.day}.{date.month}.{date.year}",    # 6.9.2026
+        date.strftime("%d.%m.%Y"),
+        date.strftime("%d.%m.%y"),
+        date.strftime("%Y-%m-%d"),
+        date.strftime("%d-%m-%Y"),
+        date.strftime("%d-%m-%y"),
+        date.strftime("%d_%m_%Y"),
+        date.strftime("%d_%m_%y"),
+        f"{date.day}.{date.month}.{date.year}",
     ]
 
 
 def date_folder_matches(name: str, date: datetime) -> bool:
-    """Проверить, соответствует ли имя папки дате."""
     name_clean = name.strip()
     return any(name_clean == v for v in date_folder_variants(date))
 
 
 def pptx_matches_date(filename: str, date: datetime) -> bool:
-    """Проверить, что pptx относится к дате (по цифровым вариантам)."""
     variants = [
         date.strftime("%d.%m.%y"),
         date.strftime("%d.%m.%Y"),
@@ -175,7 +212,8 @@ async def resolve_sunday_paths(
     """
     month_name = month_folder_name(sunday)
 
-    async def match_month(name: str) -> bool:
+    # ⚠️ ВАЖНО: предикат должен быть СИНХРОННЫМ (def, не async def)
+    def match_month(name: str) -> bool:
         return " ".join(name.upper().split()) == " ".join(month_name.upper().split())
 
     month = await client.find_child_folder(base_path, match_month)
@@ -208,9 +246,7 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
-    """
-    Находит все pptx в папке 'Служение' с датой воскресенья в имени.
-    """
+    """Находит все pptx в папке 'Служение' с датой воскресенья в имени."""
     if not await client.folder_exists(source_path):
         return []
 
@@ -225,4 +261,4 @@ async def find_pptx_in_source(
         if pptx_matches_date(name, sunday):
             result.append(item)
     return result
-  
+
