@@ -202,7 +202,10 @@ def create_bot_and_dispatcher(cfg: dict):
     from yandex_disk import YandexDiskClient
 
     if cfg["yandex_token"] and cfg["yandex_base_path"]:
-        handlers.yandex_client = YandexDiskClient(cfg["yandex_token"])
+        handlers.yandex_client = YandexDiskClient(
+            cfg["yandex_token"],
+            http_session,  # ✅ используем общую сессию
+        )
         handlers.yandex_base_path = cfg["yandex_base_path"]
         handlers.yandex_source_folder = cfg["yandex_source_folder"]
         handlers.yandex_target_folder = cfg["yandex_target_folder"]
