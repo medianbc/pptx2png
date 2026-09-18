@@ -1218,9 +1218,7 @@ async def cmd_sunday(message: types.Message, check_access):
         return
 
     if yandex_client is None:
-        await message.reply(
-            "❌ Яндекс.Диск не настроен. Обратитесь к администратору."
-        )
+        await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
         return
 
     # ✅ Атомарная защита от параллельных сессий
@@ -1231,20 +1229,23 @@ async def cmd_sunday(message: types.Message, check_access):
         )
         return
 
-    status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
+    # ✅ Гарантированный release блокировки, если сессия не создана
+    session_created = False
+    status_msg = None
 
     try:
+        status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
+
         # 1. Проверка доступности Диска
         ok, err = await yandex_client.check_access()
         if not ok:
-            await yd_release(message.from_user.id, message.chat.id)
             await status_msg.edit_text(
                 f"❌ **Яндекс.Диск недоступен**\n\n"
                 f"Причина: `{err}`\n\n"
                 f"Проверьте токен в `config.ini`.",
                 parse_mode="Markdown",
             )
-            return
+            return  # finally с release сработает
 
         # 2. Определяем ближайшее ПРЕДСТОЯЩЕЕ воскресенье
         sunday = get_nearest_sunday()
@@ -1259,7 +1260,7 @@ async def cmd_sunday(message: types.Message, check_access):
             parse_mode="Markdown",
         )
 
-        # 3. Разрешение путей (месяц → дата → source/target)
+        # 3. Разрешение путей
         paths = await resolve_sunday_paths(
             yandex_client,
             yandex_base_path,
@@ -1269,7 +1270,6 @@ async def cmd_sunday(message: types.Message, check_access):
         )
 
         if not paths:
-            await yd_release(message.from_user.id, message.chat.id)
             await status_msg.edit_text(
                 f"❌ **Структура папок не найдена**\n\n"
                 f"Ожидалось:\n"
@@ -1280,17 +1280,14 @@ async def cmd_sunday(message: types.Message, check_access):
                 f"`      Трансляция/`",
                 parse_mode="Markdown",
             )
-            return
+            return  # finally с release сработает
 
-        # 4. Поиск pptx в папке «Служение»
+        # 4. Поиск pptx
         pptx_files = await find_pptx_in_source(
-            yandex_client,
-            paths["source"],
-            sunday,
+            yandex_client, paths["source"], sunday
         )
 
         if not pptx_files:
-            await yd_release(message.from_user.id, message.chat.id)
             await status_msg.edit_text(
                 f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
                 f"📍 Папка: `{paths['source']}`\n\n"
@@ -1299,9 +1296,9 @@ async def cmd_sunday(message: types.Message, check_access):
                 f"в папку `Служение` и попробуйте снова.",
                 parse_mode="Markdown",
             )
-            return
+            return  # finally с release сработает
 
-        # 5. Формируем список файлов
+        # 5. Формируем список файлов (без кнопок — баг #4)
         lines = [
             f"📅 Ближайшее воскресенье: **{sunday_str}**",
             f"📍 Папка: `{paths['source']}`",
@@ -1314,23 +1311,10 @@ async def cmd_sunday(message: types.Message, check_access):
             lines.append(f"{idx}. `{f['name']}` — {size_mb:.1f} МБ")
 
         lines.append("")
-        lines.append("🎬 Выберите файл для обработки:")
+        lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
+        lines.append("Пока можно только проверить наличие файлов.")
 
-        # 6. Формируем кнопки
-        kb = InlineKeyboardBuilder()
-        for idx, f in enumerate(pptx_files):
-            # 🎯 — файл со словом «служение», 📄 — остальные (объявления и т.п.)
-            prefix = "🎯" if "служение" in f["name"].lower() else "📄"
-            kb.row(InlineKeyboardButton(
-                text=f"{prefix} {f['name']}",
-                callback_data=f"yd_pick:{sunday_str}:{idx}",
-            ))
-        kb.row(InlineKeyboardButton(
-            text="❌ Отмена",
-            callback_data="yd_cancel",
-        ))
-
-        # 7. Сохраняем сессию для дальнейшей обработки
+        # 6. Сохраняем сессию
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
         sessions[session_key] = {
             "user_id": message.from_user.id,
@@ -1342,28 +1326,35 @@ async def cmd_sunday(message: types.Message, check_access):
             "created_at": time.time(),
         }
 
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="❌ Отмена", callback_data="yd_cancel"))
+
         await status_msg.edit_text(
             "\n".join(lines),
             parse_mode="Markdown",
             reply_markup=kb.as_markup(),
         )
 
+        # ✅ Сессия создана — при выходе release НЕ вызываем
+        session_created = True
+
     except Exception as e:
         logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
-        await yd_release(message.from_user.id, message.chat.id)
         try:
-            await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+            if status_msg:
+                await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+            else:
+                await message.reply(f"❌ Ошибка: {str(e)[:200]}")
         except Exception:
             pass
-
-@router.callback_query(F.data.startswith("yd_pick:"))
-async def yd_pick(callback: types.CallbackQuery):
-    """Заглушка на этапе подшага 1.1 — обработка в 1.2."""
-    await callback.answer(
-        "⏳ Обработка файла появится в следующем обновлении.\n"
-        "Сейчас можно только проверить наличие файлов.",
-        show_alert=True,
-    )
+    finally:
+        # ✅ Если сессия НЕ создана успешно — снимаем блокировку
+        if not session_created:
+            await yd_release(message.from_user.id, message.chat.id)
+            logging.info(
+                f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+                f"освобождена (неудачный запуск)"
+            )
 
 @router.message(Command("cancel_yd"))
 async def cmd_cancel_yd(message: types.Message, check_access):
@@ -1373,4 +1364,17 @@ async def cmd_cancel_yd(message: types.Message, check_access):
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     sessions.pop(session_key, None)
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
+
+@router.callback_query(F.data == "yd_cancel")
+async def yd_cancel_callback(callback: types.CallbackQuery):
+    """Обработчик кнопки ❌ Отмена под списком файлов."""
+    await yd_release(callback.from_user.id, callback.message.chat.id)
+    session_key = f"yd_{callback.from_user.id}_{callback.message.chat.id}"
+    sessions.pop(session_key, None)
+    try:
+        await callback.message.edit_text("❌ Операция отменена.")
+    except Exception:
+        pass
+    await callback.answer()
+
 
