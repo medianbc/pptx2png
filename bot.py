@@ -1,5 +1,5 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (исправлен)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.1)
 # ==========================================
 
 import sys
@@ -148,28 +148,11 @@ def setup_logging(log_dir: str):
 # 3. ОЧИСТКА ЗАДАЧ
 # ==========================================
 
-def cleanup_all_tasks(shm_dir: Path):
-    """
-    Удаляет ВСЕ папки задач при запуске бота.
-    Используется только для /dev/shm — временное хранилище.
-    """
-    if not shm_dir.exists():
-        return
-    deleted = 0
-    for item in shm_dir.iterdir():
-        if item.is_dir() and item.name.startswith("task_"):
-            try:
-                shutil.rmtree(item)
-                deleted += 1
-                logging.info(f"🧹 Удалена папка при старте: {item.name}")
-            except Exception as e:
-                logging.error(f"Ошибка удаления {item}: {e}")
-    if deleted:
-        logging.info(f"🧹 Очищено {deleted} папок при старте")
-
-
 async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
-    """Удаляет старые НЕактивные папки задач."""
+    """
+    Удаляет старые НЕактивные папки задач.
+    Активные задачи (захваченные task_lock_manager) не удаляются.
+    """
     if not shm_dir.exists():
         return
     current_time = time.time()
@@ -195,6 +178,7 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
 
 
 async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
+    """Фоновый цикл очистки. Ошибки не прерывают цикл."""
     while True:
         await asyncio.sleep(interval)
         try:
@@ -204,7 +188,7 @@ async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
 
 
 # ==========================================
-# 4. СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА (единая сигнатура)
+# 4. СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА
 # ==========================================
 
 def create_bot_and_dispatcher(cfg: dict):
@@ -305,8 +289,8 @@ async def main():
     logging.info(f"💾 RAM-диск: {cfg['shm_dir']}")
     logging.info(f"📄 Логи: {cfg['log_dir']}")
 
-    # ✅ Очистка при старте
-    cleanup_all_tasks(cfg["shm_dir"])
+    # ✅ Стартовая очистка НЕ вызывается (безопасность multi-instance)
+    # Активные задачи будут очищены по возрасту через cleanup_loop
 
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
@@ -344,4 +328,3 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"❌ Необработанная ошибка: {e}", exc_info=True)
         sys.exit(1)
-
