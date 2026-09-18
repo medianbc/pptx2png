@@ -1290,14 +1290,16 @@ async def cmd_sunday(message: types.Message, check_access):
             yandex_source_folder, yandex_target_folder,
         )
         if not paths:
+            src_esc = html_module.escape(yandex_source_folder)
+            tgt_esc = html_module.escape(yandex_target_folder)
             await status_msg.edit_text(
                 f"❌ <b>Структура папок не найдена</b>\n\n"
                 f"Ожидалось:\n"
                 f"<code>{html_module.escape(yandex_base_path)}/</code>\n"
                 f"<code>  {html_module.escape(month_str)}/</code>\n"
                 f"<code>    {html_module.escape(sunday_str)}/</code>\n"
-                f"<code>      Служение/</code>\n"
-                f"<code>      Трансляция/</code>",
+                f"<code>      {src_esc}/</code>\n"
+                f"<code>      {tgt_esc}/</code>",
                 parse_mode="HTML",
             )
             return
@@ -1316,14 +1318,14 @@ async def cmd_sunday(message: types.Message, check_access):
                 parse_mode="HTML",
             )
             return
-
         if not pptx_files:
+            src_esc = html_module.escape(yandex_source_folder)
             await status_msg.edit_text(
                 f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
                 f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>\n\n"
                 f"❌ <b>pptx-файлы не найдены.</b>\n\n"
                 f"Положите pptx с датой <code>{sunday:%d.%m.%y}</code> "
-                f"в папку <code>Служение</code> и попробуйте снова.",
+                f"в папку <code>{src_esc}</code> и попробуйте снова.",
                 parse_mode="HTML",
             )
             return
