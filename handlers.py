@@ -1356,8 +1356,10 @@ async def cmd_sunday(message: types.Message, check_access):
         body_lines.append("")
         body_lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
 
-        # 6. Сессия
+        # 6. Сессия с уникальным nonce
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+        nonce = secrets.token_hex(8)  # уникальный идентификатор сессии
+
         sessions[session_key] = {
             "user_id": message.from_user.id,
             "chat_id": message.chat.id,
@@ -1365,13 +1367,15 @@ async def cmd_sunday(message: types.Message, check_access):
             "sunday_str": sunday_str,
             "paths": paths,
             "files": pptx_files,
+            "nonce": nonce,
             "created_at": time.time(),
         }
 
+        # ✅ callback_data содержит nonce — старая кнопка не сработает на новой сессии
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(
             text="❌ Отмена",
-            callback_data=f"yd_cancel:{message.from_user.id}"
+            callback_data=f"yd_cancel:{message.from_user.id}:{nonce}"
         ))
 
         await status_msg.edit_text(
@@ -1421,9 +1425,9 @@ async def yd_pick(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("yd_cancel:"))
 async def yd_cancel_callback(callback: types.CallbackQuery):
-    """Отмена сессии — только её владельцем."""
+    """Отмена сессии — только её владельцем и только для активной сессии."""
     parts = callback.data.split(":")
-    if len(parts) != 2:
+    if len(parts) != 3:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
         return
 
@@ -1433,7 +1437,9 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
         return
 
-    # ✅ Проверка владельца — только он может отменить сессию
+    callback_nonce = parts[2]
+
+    # ✅ 1. Проверка владельца
     if callback.from_user.id != owner_user_id:
         await callback.answer(
             "❌ Только автор запроса может отменить операцию.",
@@ -1441,13 +1447,23 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
         )
         return
 
-    # Проверяем, что это тот же чат
+    # ✅ 2. Проверка nonce — кнопка принадлежит ТЕКУЩЕЙ сессии?
     session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
     session = sessions.get(session_key)
     if not session:
         await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
         return
 
+    if session.get("nonce") != callback_nonce:
+        # Кнопка от старой сессии — новая уже активна
+        await callback.answer(
+            "❌ Эта кнопка от предыдущей сессии.\n"
+            "Используйте кнопку в актуальном сообщении или /cancel_yd.",
+            show_alert=True
+        )
+        return
+
+    # ✅ 3. Всё совпало — снимаем сессию
     await yd_release(owner_user_id, callback.message.chat.id)
     sessions.pop(session_key, None)
 
