@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.2)
+# yandex_disk.py — клиент Яндекс.Диска (v1.3)
 # ==========================================
 
 import aiohttp
@@ -37,10 +37,15 @@ class YandexDiskNotFoundError(YandexDiskError):
 # ==========================================
 
 class YandexDiskClient:
-    """Асинхронный клиент для REST API Яндекс.Диска."""
+    """
+    Асинхронный клиент для REST API Яндекс.Диска.
+    Использует ОБЩУЮ aiohttp.ClientSession (передаётся извне),
+    чтобы не открывать новое TCP-соединение при каждом запросе.
+    """
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, http_session: aiohttp.ClientSession):
         self.token = token
+        self.session = http_session
         self.headers = {"Authorization": f"OAuth {token}"}
 
     # ---------- Проверка доступности ----------
@@ -50,16 +55,17 @@ class YandexDiskClient:
             return False, "Токен не задан"
         url = f"{YANDEX_API_BASE}/"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, timeout=15) as resp:
-                    if resp.status == 200:
-                        return True, None
-                    elif resp.status == 401:
-                        return False, "Неверный токен (401)"
-                    elif resp.status == 403:
-                        return False, "Доступ запрещён (403)"
-                    else:
-                        return False, f"HTTP {resp.status}"
+            async with self.session.get(
+                url, headers=self.headers, timeout=15
+            ) as resp:
+                if resp.status == 200:
+                    return True, None
+                elif resp.status == 401:
+                    return False, "Неверный токен (401)"
+                elif resp.status == 403:
+                    return False, "Доступ запрещён (403)"
+                else:
+                    return False, f"HTTP {resp.status}"
         except aiohttp.ClientError as e:
             return False, f"Ошибка сети: {e}"
         except Exception as e:
@@ -81,15 +87,14 @@ class YandexDiskClient:
             "fields": "name,path,type,size,created,modified,_embedded",
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=self.headers, params=params, timeout=30
-                ) as resp:
-                    if resp.status == 404:
-                        raise YandexDiskNotFoundError(f"Не найдено: {path}")
-                    if resp.status != 200:
-                        raise YandexDiskError(f"HTTP {resp.status} для {path}")
-                    return await resp.json()
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status == 404:
+                    raise YandexDiskNotFoundError(f"Не найдено: {path}")
+                if resp.status != 200:
+                    raise YandexDiskError(f"HTTP {resp.status} для {path}")
+                return await resp.json()
         except aiohttp.ClientError as e:
             raise YandexDiskError(f"Сеть: {e}")
         except (YandexDiskNotFoundError, YandexDiskError):
@@ -155,53 +160,51 @@ class YandexDiskClient:
         url = f"{YANDEX_API_BASE}/resources/download"
         params = {"path": remote_path}
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=self.headers, params=params, timeout=30
-                ) as resp:
-                    if resp.status != 200:
-                        logging.error(f"Yandex API download: HTTP {resp.status}")
-                        return False
-                    data = await resp.json()
-                    href = data.get("href")
-                    if not href:
-                        return False
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Yandex API download: HTTP {resp.status}")
+                    return False
+                data = await resp.json()
+                href = data.get("href")
+                if not href:
+                    return False
 
-                async with session.get(href, timeout=600) as file_resp:
-                    if file_resp.status != 200:
-                        logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
-                        return False
-                    # ✅ Потоковая запись блоками по 64 КБ
-                    with open(destination, "wb") as f:
-                        async for chunk in file_resp.content.iter_chunked(64 * 1024):
-                            f.write(chunk)
-                return True
+            async with self.session.get(href, timeout=600) as file_resp:
+                if file_resp.status != 200:
+                    logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
+                    return False
+                with open(destination, "wb") as f:
+                    async for chunk in file_resp.content.iter_chunked(64 * 1024):
+                        f.write(chunk)
+            return True
         except Exception as e:
             logging.error(f"Ошибка download_file: {e}", exc_info=True)
             return False
 
-    async def upload_file(self, local_path: Path, remote_path: str, overwrite: bool = True) -> bool:
+    async def upload_file(self, local_path: Path, remote_path: str,
+                          overwrite: bool = True) -> bool:
         url = f"{YANDEX_API_BASE}/resources/upload"
         params = {"path": remote_path, "overwrite": str(overwrite).lower()}
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=self.headers, params=params, timeout=30
-                ) as resp:
-                    if resp.status != 200:
-                        logging.error(f"Yandex API upload URL: HTTP {resp.status}")
-                        return False
-                    data = await resp.json()
-                    href = data.get("href")
-                    if not href:
-                        return False
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Yandex API upload URL: HTTP {resp.status}")
+                    return False
+                data = await resp.json()
+                href = data.get("href")
+                if not href:
+                    return False
 
-                with open(local_path, "rb") as f:
-                    async with session.put(href, data=f, timeout=600) as upload_resp:
-                        if upload_resp.status not in (200, 201, 202):
-                            logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
-                            return False
-                return True
+            with open(local_path, "rb") as f:
+                async with self.session.put(href, data=f, timeout=600) as upload_resp:
+                    if upload_resp.status not in (200, 201, 202):
+                        logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
+                        return False
+            return True
         except Exception as e:
             logging.error(f"Ошибка upload_file: {e}", exc_info=True)
             return False
@@ -209,42 +212,30 @@ class YandexDiskClient:
     # ---------- Создание папок ----------
 
     async def create_folder(self, path: str) -> bool:
-        """
-        Создаёт папку. Возвращает True если создана или уже существует.
-        Разбирает 409 — отличает «уже существует» от других конфликтов.
-        """
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.put(
-                    url, headers=self.headers, params=params, timeout=30
-                ) as resp:
-                    if resp.status == 201:
-                        return True
-                    if resp.status == 409:
-                        # ✅ Разбираем ошибку 409 — только "уже существует" = успех
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            logging.error(
-                                f"create_folder {path}: 409 без JSON"
-                            )
-                            return False
-                        err = data.get("error", "")
-                        if err in (
-                            "DiskPathAlreadyExistsError",
-                            "DiskResourceAlreadyExistsError",
-                        ):
-                            return True
-                        logging.error(
-                            f"create_folder {path}: 409 error={err}"
-                        )
+            async with self.session.put(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status == 201:
+                    return True
+                if resp.status == 409:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        logging.error(f"create_folder {path}: 409 без JSON")
                         return False
-                    logging.error(
-                        f"create_folder {path}: HTTP {resp.status}"
-                    )
+                    err = data.get("error", "")
+                    if err in (
+                        "DiskPathAlreadyExistsError",
+                        "DiskResourceAlreadyExistsError",
+                    ):
+                        return True
+                    logging.error(f"create_folder {path}: 409 error={err}")
                     return False
+                logging.error(f"create_folder {path}: HTTP {resp.status}")
+                return False
         except Exception as e:
             logging.error(f"Ошибка create_folder: {e}")
             return False
@@ -267,11 +258,7 @@ class YandexDiskClient:
 # ==========================================
 
 def get_nearest_sunday(reference_date: Optional[datetime] = None) -> datetime:
-    """
-    Ближайшее ПРЕДСТОЯЩЕЕ воскресенье.
-    - Если сегодня воскресенье — возвращает сегодня.
-    - Иначе — следующее воскресенье.
-    """
+    """Ближайшее ПРЕДСТОЯЩЕЕ воскресенье."""
     if reference_date is None:
         reference_date = datetime.now()
     days_until_sunday = (6 - reference_date.weekday()) % 7
