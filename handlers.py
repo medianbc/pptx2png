@@ -58,29 +58,58 @@ yandex_template_file: str = "template.yaml"
 # ==========================================
 
 yd_session_lock = asyncio.Lock()
-yd_active_sessions: Set[str] = set()
+# {user_id:chat_id -> nonce (generation)}
+yd_active_sessions: Dict[str, str] = {}
 
 
 def yd_session_key(user_id: int, chat_id: int) -> str:
     return f"{user_id}:{chat_id}"
 
 
-async def yd_try_acquire(user_id: int, chat_id: int) -> bool:
-    """Атомарно проверяет и добавляет ключ сессии."""
+async def yd_try_acquire(user_id: int, chat_id: int) -> Optional[str]:
+    """
+    Захватывает блокировку для сессии.
+    Возвращает nonce (generation) при успехе или None, если уже занято.
+    """
     key = yd_session_key(user_id, chat_id)
+    nonce = secrets.token_hex(8)
     async with yd_session_lock:
         if key in yd_active_sessions:
-            return False
-        yd_active_sessions.add(key)
+            return None
+        yd_active_sessions[key] = nonce
+        return nonce
+
+
+async def yd_release(user_id: int, chat_id: int, nonce: Optional[str] = None) -> bool:
+    """
+    Освобождает блокировку.
+    Если передан nonce — снимает только при совпадении (защита от отмены чужих сессий).
+    Возвращает True, если блокировка была снята (или уже отсутствовала с совпадающим nonce).
+    """
+    key = yd_session_key(user_id, chat_id)
+    async with yd_session_lock:
+        current = yd_active_sessions.get(key)
+        if current is None:
+            return True  # уже нет — нечего освобождать
+        if nonce is not None and current != nonce:
+            return False  # чужая сессия — не трогаем
+        yd_active_sessions.pop(key, None)
         return True
 
 
-async def yd_release(user_id: int, chat_id: int):
-    """Убирает ключ сессии."""
+async def yd_is_active(user_id: int, chat_id: int, nonce: Optional[str] = None) -> bool:
+    """
+    Проверяет, активна ли сессия.
+    Если передан nonce — проверяет и совпадение.
+    """
     key = yd_session_key(user_id, chat_id)
     async with yd_session_lock:
-        yd_active_sessions.discard(key)
-
+        current = yd_active_sessions.get(key)
+        if current is None:
+            return False
+        if nonce is not None and current != nonce:
+            return False
+        return True
 
 # ==========================================
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (общие)
@@ -1247,15 +1276,16 @@ async def cmd_sunday(message: types.Message, check_access):
         await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
         return
 
-    if not await yd_try_acquire(message.from_user.id, message.chat.id):
+    nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
+    if nonce is None:
         await message.reply(
             "⏳ У вас уже активна сессия подготовки трансляции.\n"
             "Дождитесь завершения или нажмите /cancel_yd."
         )
         return
 
-    session_created = False
     status_msg = None
+    session_created = False
 
     try:
         status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
@@ -1374,6 +1404,31 @@ async def cmd_sunday(message: types.Message, check_access):
         }
 
         # ✅ callback_data содержит nonce — старая кнопка не сработает на новой сессии
+        # Проверяем, что нас не отменили за время работы
+        if not await yd_is_active(message.from_user.id, message.chat.id, nonce):
+            logging.info(
+                f"Сессия {message.from_user.id}:{message.chat.id} "
+                f"была отменена во время выполнения"
+            )
+            try:
+                await status_msg.edit_text("❌ Операция отменена пользователем.")
+            except Exception:
+                pass
+            return
+
+        # ✅ Сохраняем сессию с nonce
+        session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+        sessions[session_key] = {
+            "user_id": message.from_user.id,
+            "chat_id": message.chat.id,
+            "sunday": sunday,
+            "sunday_str": sunday_str,
+            "paths": paths,
+            "files": pptx_files,
+            "nonce": nonce,
+            "created_at": time.time(),
+        }
+
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(
             text="❌ Отмена",
@@ -1386,6 +1441,15 @@ async def cmd_sunday(message: types.Message, check_access):
             reply_markup=kb.as_markup(),
         )
         session_created = True
+
+        # ✅ Снимаем блокировку сразу после успешного показа
+        # (сессия остаётся в sessions для возможного использования в будущем,
+        #  но новый /sunday уже можно запустить)
+        await yd_release(message.from_user.id, message.chat.id, nonce)
+        logging.info(
+            f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+            f"освобождена после показа списка (nonce={nonce})"
+        )
 
     except Exception as e:
         logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
@@ -1401,11 +1465,18 @@ async def cmd_sunday(message: types.Message, check_access):
             pass
     finally:
         if not session_created:
-            await yd_release(message.from_user.id, message.chat.id)
-            logging.info(
-                f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
-                f"освобождена (неудачный запуск)"
-            )
+            # Освобождаем ТОЛЬКО наше поколение — чужие не трогаем
+            released = await yd_release(message.from_user.id, message.chat.id, nonce)
+            if released:
+                logging.info(
+                    f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+                    f"освобождена (неудачный запуск, nonce={nonce})"
+                )
+            else:
+                logging.info(
+                    f"ℹ️ Сессия {message.from_user.id}:{message.chat.id} "
+                    f"уже освобождена другим вызовом (nonce={nonce})"
+                )
 
 
 # ==========================================
@@ -1441,7 +1512,6 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
 
     callback_nonce = parts[2]
 
-    # ✅ 1. Проверка владельца
     if callback.from_user.id != owner_user_id:
         await callback.answer(
             "❌ Только автор запроса может отменить операцию.",
@@ -1449,24 +1519,22 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
         )
         return
 
-    # ✅ 2. Проверка nonce — кнопка принадлежит ТЕКУЩЕЙ сессии?
     session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
     session = sessions.get(session_key)
-    if not session:
+
+    # Проверка nonce — кнопка принадлежит текущей сессии?
+    if session is None or session.get("nonce") != callback_nonce:
+        # Сессия уже завершена/отменена или кнопка от предыдущей сессии
+        await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
+        try:
+            await callback.message.edit_text("❌ Сессия уже неактивна.")
+        except Exception:
+            pass
         await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
         return
 
-    if session.get("nonce") != callback_nonce:
-        # Кнопка от старой сессии — новая уже активна
-        await callback.answer(
-            "❌ Эта кнопка от предыдущей сессии.\n"
-            "Используйте кнопку в актуальном сообщении или /cancel_yd.",
-            show_alert=True
-        )
-        return
-
-    # ✅ 3. Всё совпало — снимаем сессию
-    await yd_release(owner_user_id, callback.message.chat.id)
+    # ✅ Снимаем блокировку (если ещё висит) и удаляем сессию
+    await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
     sessions.pop(session_key, None)
 
     try:
@@ -1485,12 +1553,17 @@ async def cmd_cancel_yd(message: types.Message, check_access):
     if not await check_access(message):
         return
 
-    user_key = yd_session_key(message.from_user.id, message.chat.id)
-    if user_key not in yd_active_sessions:
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    session = sessions.get(session_key)
+
+    # Освобождаем блокировку (если активна)
+    released = await yd_release(message.from_user.id, message.chat.id)
+
+    if session is None and released:
         await message.reply("ℹ️ У вас нет активной сессии Яндекс.Диска.")
         return
 
-    await yd_release(message.from_user.id, message.chat.id)
-    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    # Удаляем сессию (если была)
     sessions.pop(session_key, None)
+
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
