@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional, Set, Dict, List, Tuple
 from aiogram import Router, F, types, Bot
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -40,19 +40,34 @@ yandex_sermon_folder: str = "проповедь - png"
 yandex_sermon_keyword: str = "проповед"
 yandex_template_file: str = "template.yaml"
 
-
 # ==========================================
 # БЛОКИРОВКА СЕССИЙ ЯНДЕКС.ДИСКА
 # ==========================================
-# Не позволяем одновременно запускать несколько сессий /sunday
-# с выгрузкой на Яндекс.Диск.
 
 yd_session_lock = asyncio.Lock()
-yd_active_sessions: Set[str] = set()  # {(user_id, chat_id)}
+yd_active_sessions: Set[str] = set()
 
 
 def yd_session_key(user_id: int, chat_id: int) -> str:
     return f"{user_id}:{chat_id}"
+
+
+async def yd_try_acquire(user_id: int, chat_id: int) -> bool:
+    """Атомарно проверяет и добавляет ключ сессии."""
+    key = yd_session_key(user_id, chat_id)
+    async with yd_session_lock:
+        if key in yd_active_sessions:
+            return False
+        yd_active_sessions.add(key)
+        return True
+
+
+async def yd_release(user_id: int, chat_id: int):
+    """Убирает ключ сессии."""
+    key = yd_session_key(user_id, chat_id)
+    async with yd_session_lock:
+        yd_active_sessions.discard(key)
+
 
 # ==========================================
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
@@ -1315,20 +1330,18 @@ async def cmd_sunday(message: types.Message, check_access):
 
 @router.callback_query(F.data.startswith("yd_pick:"))
 async def yd_pick(callback: types.CallbackQuery):
-    """Пока заглушка — будет реализовано в подшаге 1.2."""
+    """Заглушка на этапе подшага 1.1 — обработка в 1.2."""
     await callback.answer(
-        "⏳ Подготовка будет доступна в следующем обновлении.",
+        "⏳ Обработка файла появится в следующем обновлении.\n"
+        "Сейчас можно только проверить наличие файлов.",
         show_alert=True,
     )
 
-
 @router.message(Command("cancel_yd"))
 async def cmd_cancel_yd(message: types.Message, check_access):
-    """Отмена активной сессии Яндекс.Диска."""
     if not await check_access(message):
         return
-    user_key = yd_session_key(message.from_user.id, message.chat.id)
-    yd_active_sessions.discard(user_key)
+    await yd_release(message.from_user.id, message.chat.id)
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     sessions.pop(session_key, None)
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
