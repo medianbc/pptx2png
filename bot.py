@@ -1,5 +1,5 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.1)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.2)
 # ==========================================
 
 import sys
@@ -178,7 +178,6 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
 
 
 async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
-    """Фоновый цикл очистки. Ошибки не прерывают цикл."""
     while True:
         await asyncio.sleep(interval)
         try:
@@ -192,7 +191,6 @@ async def cleanup_loop(shm_dir: Path, interval: int = 300, max_age: int = 7200):
 # ==========================================
 
 def create_bot_and_dispatcher(cfg: dict):
-    """Создаёт бота, dispatcher, инициализирует Яндекс.Диск."""
     bot = Bot(token=cfg["bot_token"])
     dp = Dispatcher()
 
@@ -289,8 +287,8 @@ async def main():
     logging.info(f"💾 RAM-диск: {cfg['shm_dir']}")
     logging.info(f"📄 Логи: {cfg['log_dir']}")
 
-    # ✅ Стартовая очистка НЕ вызывается (безопасность multi-instance)
-    # Активные задачи будут очищены по возрасту через cleanup_loop
+    # ✅ Стартовая очистка НЕ вызывается (multi-instance safety).
+    # Активные задачи будут очищены по возрасту через cleanup_loop.
 
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
