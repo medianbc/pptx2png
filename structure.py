@@ -3,6 +3,7 @@
 # ==========================================
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -65,7 +66,7 @@ async def create_structure(
                 if not ok:
                     logging.error(f"Не удалось создать папку: {folder_path}")
                     return False
-                # Рекурсия в подпапки
+                # Рекурсия в подпапки (если есть)
                 if isinstance(children, dict) and children:
                     if not await _create_recursive(folder_path, children):
                         return False
@@ -81,7 +82,7 @@ async def create_structure(
 
 
 # ==========================================
-# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ — БЕЗОПАСНОЕ ИМЯ ПАПКИ
+# БЕЗОПАСНОЕ ИМЯ ПАПКИ
 # ==========================================
 
 def safe_folder_name(filename: str) -> str:
@@ -89,7 +90,6 @@ def safe_folder_name(filename: str) -> str:
     Преобразует имя файла в безопасное имя папки.
     Пример: 'Служение 20.09.26.pptx' → 'Служение_20.09.26'
     """
-    import re
     name = Path(filename).stem
     name = re.sub(r'[^\w\s.-]', '', name)
     name = re.sub(r'\s+', '_', name).strip('_')
