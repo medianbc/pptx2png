@@ -1388,9 +1388,9 @@ async def cmd_sunday(message: types.Message, check_access):
         body_lines.append("")
         body_lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
 
-        # 6. Сессия с уникальным nonce
+        # 6. Сохраняем сессию — используем nonce из yd_try_acquire
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
-        nonce = secrets.token_hex(8)  # уникальный идентификатор сессии
+        # ⚠️ nonce уже получен выше из yd_try_acquire — НЕ пересоздаём!
 
         sessions[session_key] = {
             "user_id": message.from_user.id,
@@ -1399,7 +1399,7 @@ async def cmd_sunday(message: types.Message, check_access):
             "sunday_str": sunday_str,
             "paths": paths,
             "files": pptx_files,
-            "nonce": nonce,
+            "nonce": nonce,  # ← тот же nonce, что и в yd_active_sessions
             "created_at": time.time(),
         }
 
