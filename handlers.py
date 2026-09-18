@@ -10,6 +10,7 @@ import asyncio
 import zipfile
 import time
 from pathlib import Path
+import html as html_module
 from typing import Optional, Set, Dict, List, Tuple
 from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart, Command
@@ -1237,6 +1238,8 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
 @router.message(Command("sunday"))
 async def cmd_sunday(message: types.Message, check_access):
     """Проверка Диска + вывод найденных pptx для ближайшего предстоящего воскресенья."""
+    import html as html_module
+
     if not await check_access(message):
         return
 
@@ -1244,7 +1247,6 @@ async def cmd_sunday(message: types.Message, check_access):
         await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
         return
 
-    # ✅ Атомарная защита от параллельных сессий
     if not await yd_try_acquire(message.from_user.id, message.chat.id):
         await message.reply(
             "⏳ У вас уже активна сессия подготовки трансляции.\n"
@@ -1252,35 +1254,34 @@ async def cmd_sunday(message: types.Message, check_access):
         )
         return
 
-    # ✅ Гарантированный release, если сессия не создана
     session_created = False
     status_msg = None
 
     try:
         status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
 
-        # 1. Проверка доступности
+        # 1. Доступность
         ok, err = await yandex_client.check_access()
         if not ok:
             await status_msg.edit_text(
-                f"❌ **Яндекс.Диск недоступен**\n\n"
-                f"Причина: `{err}`\n\n"
-                f"Проверьте токен в `config.ini`.",
-                parse_mode="Markdown",
+                f"❌ <b>Яндекс.Диск недоступен</b>\n\n"
+                f"Причина: <code>{html_module.escape(str(err))}</code>\n\n"
+                f"Проверьте токен в <code>config.ini</code>.",
+                parse_mode="HTML",
             )
             return
 
-        # 2. Дата и путь
+        # 2. Дата
         sunday = get_nearest_sunday()
         sunday_str = sunday.strftime("%d.%m.%Y")
         month_str = month_folder_name(sunday)
 
         await status_msg.edit_text(
             f"✅ Яндекс.Диск доступен\n"
-            f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
-            f"📁 Ожидаемая папка: `{month_str}/{sunday_str}`\n\n"
+            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
+            f"📁 Ожидаемая папка: <code>{html_module.escape(f'{month_str}/{sunday_str}')}</code>\n\n"
             f"🔍 Проверяю структуру папок...",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
         # 3. Разрешение путей
@@ -1288,17 +1289,16 @@ async def cmd_sunday(message: types.Message, check_access):
             yandex_client, yandex_base_path, sunday,
             yandex_source_folder, yandex_target_folder,
         )
-
         if not paths:
             await status_msg.edit_text(
-                f"❌ **Структура папок не найдена**\n\n"
+                f"❌ <b>Структура папок не найдена</b>\n\n"
                 f"Ожидалось:\n"
-                f"`{yandex_base_path}/`\n"
-                f"`  {month_str}/`\n"
-                f"`    {sunday_str}/`\n"
-                f"`      Служение/`\n"
-                f"`      Трансляция/`",
-                parse_mode="Markdown",
+                f"<code>{html_module.escape(yandex_base_path)}/</code>\n"
+                f"<code>  {html_module.escape(month_str)}/</code>\n"
+                f"<code>    {html_module.escape(sunday_str)}/</code>\n"
+                f"<code>      Служение/</code>\n"
+                f"<code>      Трансляция/</code>",
+                parse_mode="HTML",
             )
             return
 
@@ -1310,39 +1310,53 @@ async def cmd_sunday(message: types.Message, check_access):
         except YandexDiskError as e:
             logging.error(f"Ошибка доступа к источнику: {e}")
             await status_msg.edit_text(
-                f"❌ **Ошибка обращения к Яндекс.Диску**\n\n`{e}`\n\nПопробуйте позже.",
-                parse_mode="Markdown",
+                f"❌ <b>Ошибка обращения к Яндекс.Диску</b>\n\n"
+                f"<code>{html_module.escape(str(e))}</code>\n\n"
+                f"Попробуйте позже.",
+                parse_mode="HTML",
             )
             return
 
         if not pptx_files:
             await status_msg.edit_text(
-                f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
-                f"📍 Папка: `{paths['source']}`\n\n"
-                f"❌ **pptx-файлы не найдены.**\n\n"
-                f"Положите pptx с датой `{sunday:%d.%m.%y}` "
-                f"в папку `Служение` и попробуйте снова.",
-                parse_mode="Markdown",
+                f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
+                f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>\n\n"
+                f"❌ <b>pptx-файлы не найдены.</b>\n\n"
+                f"Положите pptx с датой <code>{sunday:%d.%m.%y}</code> "
+                f"в папку <code>Служение</code> и попробуйте снова.",
+                parse_mode="HTML",
             )
             return
 
-        # 5. Формируем список
-        lines = [
-            f"📅 Ближайшее воскресенье: **{sunday_str}**",
-            f"📍 Папка: `{paths['source']}`",
+        # 5. Список с экранированием и лимитом
+        MAX_LEN = 3500
+        header_lines = [
+            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>",
+            f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>",
             "",
-            f"📄 **Найдено файлов: {len(pptx_files)}**",
+            f"📄 <b>Найдено файлов: {len(pptx_files)}</b>",
             "",
         ]
+        body_lines = []
+        omitted = 0
         for idx, f in enumerate(pptx_files, start=1):
             size_mb = f.get("size", 0) / (1024 * 1024)
-            lines.append(f"{idx}. `{f['name']}` — {size_mb:.1f} МБ")
+            name_escaped = html_module.escape(f["name"])
+            line = f"{idx}. <code>{name_escaped}</code> — {size_mb:.1f} МБ"
+            candidate = "\n".join(header_lines + body_lines + [line])
+            if len(candidate) > MAX_LEN:
+                omitted = len(pptx_files) - idx + 1
+                break
+            body_lines.append(line)
 
-        lines.append("")
-        lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
-        lines.append("Пока можно только проверить наличие файлов.")
+        if omitted > 0:
+            body_lines.append("")
+            body_lines.append(f"…и ещё <b>{omitted}</b> файл(ов) не показано.")
 
-        # 6. Сохраняем сессию
+        body_lines.append("")
+        body_lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
+
+        # 6. Сессия
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
         sessions[session_key] = {
             "user_id": message.from_user.id,
@@ -1355,28 +1369,31 @@ async def cmd_sunday(message: types.Message, check_access):
         }
 
         kb = InlineKeyboardBuilder()
-        kb.row(InlineKeyboardButton(text="❌ Отмена", callback_data="yd_cancel"))
+        kb.row(InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"yd_cancel:{message.from_user.id}"
+        ))
 
         await status_msg.edit_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
+            "\n".join(header_lines + body_lines),
+            parse_mode="HTML",
             reply_markup=kb.as_markup(),
         )
-
-        # ✅ Сессия создана успешно — release НЕ вызываем
         session_created = True
 
     except Exception as e:
         logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
         try:
             if status_msg:
-                await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+                await status_msg.edit_text(
+                    f"❌ Ошибка: <code>{html_module.escape(str(e)[:200])}</code>",
+                    parse_mode="HTML"
+                )
             else:
                 await message.reply(f"❌ Ошибка: {str(e)[:200]}")
         except Exception:
             pass
     finally:
-        # ✅ Если сессия НЕ создана — снимаем блокировку
         if not session_created:
             await yd_release(message.from_user.id, message.chat.id)
             logging.info(
@@ -1402,12 +1419,38 @@ async def yd_pick(callback: types.CallbackQuery):
 # 14. yd_cancel — кнопка отмены
 # ==========================================
 
-@router.callback_query(F.data == "yd_cancel")
+@router.callback_query(F.data.startswith("yd_cancel:"))
 async def yd_cancel_callback(callback: types.CallbackQuery):
-    """Обработчик кнопки ❌ Отмена — снимает блокировку сессии."""
-    await yd_release(callback.from_user.id, callback.message.chat.id)
-    session_key = f"yd_{callback.from_user.id}_{callback.message.chat.id}"
+    """Отмена сессии — только её владельцем."""
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    try:
+        owner_user_id = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    # ✅ Проверка владельца — только он может отменить сессию
+    if callback.from_user.id != owner_user_id:
+        await callback.answer(
+            "❌ Только автор запроса может отменить операцию.",
+            show_alert=True
+        )
+        return
+
+    # Проверяем, что это тот же чат
+    session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
+    session = sessions.get(session_key)
+    if not session:
+        await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
+        return
+
+    await yd_release(owner_user_id, callback.message.chat.id)
     sessions.pop(session_key, None)
+
     try:
         await callback.message.edit_text("❌ Операция отменена.")
     except Exception:
@@ -1423,8 +1466,13 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
 async def cmd_cancel_yd(message: types.Message, check_access):
     if not await check_access(message):
         return
+
+    user_key = yd_session_key(message.from_user.id, message.chat.id)
+    if user_key not in yd_active_sessions:
+        await message.reply("ℹ️ У вас нет активной сессии Яндекс.Диска.")
+        return
+
     await yd_release(message.from_user.id, message.chat.id)
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     sessions.pop(session_key, None)
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
-
