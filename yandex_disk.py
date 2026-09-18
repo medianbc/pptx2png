@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (исправлен)
+# yandex_disk.py — клиент Яндекс.Диска (v1.1)
 # ==========================================
 
 import aiohttp
@@ -19,11 +19,11 @@ RUSSIAN_MONTHS = [
 
 
 # ==========================================
-# КЛИЕНТ
+# ИСКЛЮЧЕНИЯ
 # ==========================================
-# В начале файла
+
 class YandexDiskError(Exception):
-    """Ошибка обращения к API Яндекс.Диска."""
+    """Общая ошибка обращения к API Яндекс.Диска."""
     pass
 
 
@@ -31,6 +31,10 @@ class YandexDiskNotFoundError(YandexDiskError):
     """Ресурс не найден (404)."""
     pass
 
+
+# ==========================================
+# КЛИЕНТ
+# ==========================================
 
 class YandexDiskClient:
     """Асинхронный клиент для REST API Яндекс.Диска."""
@@ -42,6 +46,7 @@ class YandexDiskClient:
     # ---------- Проверка доступности ----------
 
     async def check_access(self) -> Tuple[bool, Optional[str]]:
+        """Проверяет доступность Диска. Возвращает (True, None) если ОК."""
         if not self.token:
             return False, "Токен не задан"
         url = f"{YANDEX_API_BASE}/"
@@ -63,7 +68,7 @@ class YandexDiskClient:
 
     # ---------- Метаданные ----------
 
-        async def get_resource(
+    async def get_resource(
         self,
         path: str,
         limit: int = 1000,
@@ -71,7 +76,6 @@ class YandexDiskClient:
     ) -> Dict[str, Any]:
         """
         Получить метаданные файла/папки.
-        Возвращает dict с данными.
         Бросает YandexDiskNotFoundError при 404.
         Бросает YandexDiskError при других ошибках.
         """
@@ -90,18 +94,16 @@ class YandexDiskClient:
                     if resp.status == 404:
                         raise YandexDiskNotFoundError(f"Не найдено: {path}")
                     if resp.status != 200:
-                        raise YandexDiskError(
-                            f"HTTP {resp.status} для {path}"
-                        )
+                        raise YandexDiskError(f"HTTP {resp.status} для {path}")
                     return await resp.json()
         except aiohttp.ClientError as e:
             raise YandexDiskError(f"Сеть: {e}")
         except (YandexDiskNotFoundError, YandexDiskError):
-            raise  # пробрасываем наши
+            raise
         except Exception as e:
             raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
-        async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
+    async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
         """
         Список содержимого папки с полной пагинацией.
         Бросает YandexDiskError при ошибке API.
@@ -131,7 +133,7 @@ class YandexDiskClient:
         return all_items
 
     async def folder_exists(self, path: str) -> bool:
-        """Проверяет, что папка существует. Возвращает False при 404, бросает при ошибке."""
+        """Проверяет, что папка существует. Бросает YandexDiskError при ошибке API."""
         try:
             resource = await self.get_resource(path)
         except YandexDiskNotFoundError:
@@ -145,6 +147,7 @@ class YandexDiskClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Найти дочернюю папку по предикату.
+        ⚠️ Предикат должен быть СИНХРОННЫМ (def, не async def).
         Бросает YandexDiskError при ошибке API.
         """
         items = await self.list_folder(parent_path)
@@ -158,29 +161,92 @@ class YandexDiskClient:
                 logging.error(f"Ошибка предиката для '{item['name']}': {e}")
         return None
 
-    async def folder_exists(self, path: str) -> bool:
-        resource = await self.get_resource(path)
-        return resource is not None and resource.get("type") == "dir"
+    # ---------- Скачивание / Загрузка ----------
 
-    async def find_child_folder(
-        self,
-        parent_path: str,
-        predicate: Callable[[str], bool],
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Найти дочернюю папку по предикату.
-        ⚠️ Предикат должен быть СИНХРОННЫМ (def, не async def).
-        """
-        items = await self.list_folder(parent_path)
-        for item in items:
-            if item.get("type") != "dir":
-                continue
-            try:
-                if predicate(item["name"]):
-                    return item
-            except Exception as e:
-                logging.error(f"Ошибка предиката для '{item['name']}': {e}")
-        return None
+    async def download_file(self, remote_path: str, destination: Path) -> bool:
+        """Скачивает файл с Диска в локальный файл."""
+        url = f"{YANDEX_API_BASE}/resources/download"
+        params = {"path": remote_path}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=self.headers, params=params, timeout=30
+                ) as resp:
+                    if resp.status != 200:
+                        logging.error(f"Yandex API download: HTTP {resp.status}")
+                        return False
+                    data = await resp.json()
+                    href = data.get("href")
+                    if not href:
+                        return False
+
+                async with session.get(href, timeout=600) as file_resp:
+                    if file_resp.status != 200:
+                        logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
+                        return False
+                    with open(destination, "wb") as f:
+                        f.write(await file_resp.read())
+                return True
+        except Exception as e:
+            logging.error(f"Ошибка download_file: {e}", exc_info=True)
+            return False
+
+    async def upload_file(self, local_path: Path, remote_path: str, overwrite: bool = True) -> bool:
+        """Загружает локальный файл на Диск."""
+        url = f"{YANDEX_API_BASE}/resources/upload"
+        params = {"path": remote_path, "overwrite": str(overwrite).lower()}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=self.headers, params=params, timeout=30
+                ) as resp:
+                    if resp.status != 200:
+                        logging.error(f"Yandex API upload URL: HTTP {resp.status}")
+                        return False
+                    data = await resp.json()
+                    href = data.get("href")
+                    if not href:
+                        return False
+
+                with open(local_path, "rb") as f:
+                    async with session.put(href, data=f, timeout=600) as upload_resp:
+                        if upload_resp.status not in (200, 201, 202):
+                            logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
+                            return False
+                return True
+        except Exception as e:
+            logging.error(f"Ошибка upload_file: {e}", exc_info=True)
+            return False
+
+    # ---------- Создание папок ----------
+
+    async def create_folder(self, path: str) -> bool:
+        """Создаёт папку. True если создана или уже существует."""
+        url = f"{YANDEX_API_BASE}/resources"
+        params = {"path": path}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    url, headers=self.headers, params=params, timeout=30
+                ) as resp:
+                    if resp.status in (201, 409):
+                        return True
+                    logging.error(f"Yandex API create_folder: HTTP {resp.status} для {path}")
+                    return False
+        except Exception as e:
+            logging.error(f"Ошибка create_folder: {e}")
+            return False
+
+    async def ensure_folder(self, path: str) -> bool:
+        """Создаёт папку и все родительские при необходимости."""
+        parts = [p for p in path.strip("/").split("/") if p]
+        current = ""
+        for part in parts:
+            current = f"{current}/{part}" if current else part
+            current = f"/{current}"
+            if not await self.create_folder(current):
+                return False
+        return True
 
 
 # ==========================================
@@ -252,10 +318,11 @@ async def resolve_sunday_paths(
     """
     Находит пути для указанного воскресенья.
     Возвращает словарь {month_folder, date_folder, source, target} или None.
+    Бросает YandexDiskError при ошибках API (кроме «не найдено»).
     """
     month_name = month_folder_name(sunday)
 
-    # ⚠️ ВАЖНО: предикат должен быть СИНХРОННЫМ (def, не async def)
+    # ⚠️ СИНХРОННЫЙ предикат
     def match_month(name: str) -> bool:
         return " ".join(name.upper().split()) == " ".join(month_name.upper().split())
 
@@ -289,13 +356,12 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
-    """Находит pptx в 'Служение'. Бросает YandexDiskError."""
-    try:
-        if not await client.folder_exists(source_path):
-            return []
-    except YandexDiskError as e:
-        logging.error(f"Ошибка доступа к {source_path}: {e}")
-        raise
+    """
+    Находит pptx в папке 'Служение' с датой воскресенья в имени.
+    Бросает YandexDiskError при ошибке API.
+    """
+    if not await client.folder_exists(source_path):
+        return []
 
     items = await client.list_folder(source_path)
     result = []
@@ -308,4 +374,3 @@ async def find_pptx_in_source(
         if pptx_matches_date(name, sunday):
             result.append(item)
     return result
-
