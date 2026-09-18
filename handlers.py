@@ -1207,9 +1207,13 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
             safe_delete_task_dir(task_dir)
 
 
+# ==========================================
+# КОМАНДА /sunday — полная версия
+# ==========================================
+
 @router.message(Command("sunday"))
 async def cmd_sunday(message: types.Message, check_access):
-    """Проверка Диска + вывод найденных pptx для ближайшего воскресенья."""
+    """Проверка Диска + вывод найденных pptx для ближайшего предстоящего воскресенья."""
     if not await check_access(message):
         return
 
@@ -1219,10 +1223,8 @@ async def cmd_sunday(message: types.Message, check_access):
         )
         return
 
-    user_key = yd_session_key(message.from_user.id, message.chat.id)
-
-    # Защита от параллельных сессий
-    if user_key in yd_active_sessions:
+    # ✅ Атомарная защита от параллельных сессий
+    if not await yd_try_acquire(message.from_user.id, message.chat.id):
         await message.reply(
             "⏳ У вас уже активна сессия подготовки трансляции.\n"
             "Дождитесь завершения или нажмите /cancel_yd."
@@ -1231,102 +1233,128 @@ async def cmd_sunday(message: types.Message, check_access):
 
     status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
 
-    # 1. Проверка доступности
-    ok, err = await yandex_client.check_access()
-    if not ok:
+    try:
+        # 1. Проверка доступности Диска
+        ok, err = await yandex_client.check_access()
+        if not ok:
+            await yd_release(message.from_user.id, message.chat.id)
+            await status_msg.edit_text(
+                f"❌ **Яндекс.Диск недоступен**\n\n"
+                f"Причина: `{err}`\n\n"
+                f"Проверьте токен в `config.ini`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # 2. Определяем ближайшее ПРЕДСТОЯЩЕЕ воскресенье
+        sunday = get_nearest_sunday()
+        sunday_str = sunday.strftime("%d.%m.%Y")
+        month_str = month_folder_name(sunday)
+
         await status_msg.edit_text(
-            f"❌ **Яндекс.Диск недоступен**\n\n"
-            f"Причина: `{err}`\n\n"
-            f"Проверьте токен в `config.ini`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # 2. Дата и путь
-    sunday = get_nearest_sunday()
-    sunday_str = sunday.strftime("%d.%m.%Y")
-    month_str = month_folder_name(sunday)
-
-    await status_msg.edit_text(
-        f"✅ Яндекс.Диск доступен\n"
-        f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
-        f"📁 Ожидаемая папка: `{month_str}/{sunday_str}`\n\n"
-        f"🔍 Проверяю структуру папок...",
-        parse_mode="Markdown",
-    )
-
-    # 3. Разрешение путей
-    paths = await resolve_sunday_paths(
-        yandex_client, yandex_base_path, sunday,
-        yandex_source_folder, yandex_target_folder,
-    )
-
-    if not paths:
-        await status_msg.edit_text(
-            f"❌ **Структура папок не найдена**\n\n"
-            f"Ожидалось:\n"
-            f"`{yandex_base_path}/`\n"
-            f"`  {month_str}/`\n"
-            f"`    {sunday_str}/`\n"
-            f"`      Служение/`\n"
-            f"`      Трансляция/`",
-            parse_mode="Markdown",
-        )
-        return
-
-    # 4. Поиск pptx
-    pptx_files = await find_pptx_in_source(
-        yandex_client, paths["source"], sunday
-    )
-
-    if not pptx_files:
-        await status_msg.edit_text(
+            f"✅ Яндекс.Диск доступен\n"
             f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
-            f"📍 Папка: `{paths['source']}`\n\n"
-            f"❌ **pptx-файлы не найдены.**\n\n"
-            f"Положите pptx с датой `{sunday:%d.%m.%y}` "
-            f"в папку `Служение` и попробуйте снова.",
+            f"📁 Ожидаемая папка: `{month_str}/{sunday_str}`\n\n"
+            f"🔍 Проверяю структуру папок...",
             parse_mode="Markdown",
         )
-        return
 
-    # 5. Список
-    lines = [
-        f"📅 Ближайшее воскресенье: **{sunday_str}**",
-        f"📍 Папка: `{paths['source']}`",
-        "",
-        f"📄 **Найдено файлов: {len(pptx_files)}**",
-        "",
-    ]
-    for idx, f in enumerate(pptx_files, start=1):
-        size_mb = f.get("size", 0) / (1024 * 1024)
-        lines.append(f"{idx}. `{f['name']}` — {size_mb:.1f} МБ")
+        # 3. Разрешение путей (месяц → дата → source/target)
+        paths = await resolve_sunday_paths(
+            yandex_client,
+            yandex_base_path,
+            sunday,
+            yandex_source_folder,
+            yandex_target_folder,
+        )
 
-    lines.append("")
-    lines.append("🎬 Выберите файл для обработки:")
+        if not paths:
+            await yd_release(message.from_user.id, message.chat.id)
+            await status_msg.edit_text(
+                f"❌ **Структура папок не найдена**\n\n"
+                f"Ожидалось:\n"
+                f"`{yandex_base_path}/`\n"
+                f"`  {month_str}/`\n"
+                f"`    {sunday_str}/`\n"
+                f"`      Служение/`\n"
+                f"`      Трансляция/`",
+                parse_mode="Markdown",
+            )
+            return
 
-    kb = InlineKeyboardBuilder()
-    for idx, f in enumerate(pptx_files):
-        prefix = "🎯" if "служение" in f["name"].lower() else "📄"
+        # 4. Поиск pptx в папке «Служение»
+        pptx_files = await find_pptx_in_source(
+            yandex_client,
+            paths["source"],
+            sunday,
+        )
+
+        if not pptx_files:
+            await yd_release(message.from_user.id, message.chat.id)
+            await status_msg.edit_text(
+                f"📅 Ближайшее воскресенье: **{sunday_str}**\n"
+                f"📍 Папка: `{paths['source']}`\n\n"
+                f"❌ **pptx-файлы не найдены.**\n\n"
+                f"Положите pptx с датой `{sunday:%d.%m.%y}` "
+                f"в папку `Служение` и попробуйте снова.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # 5. Формируем список файлов
+        lines = [
+            f"📅 Ближайшее воскресенье: **{sunday_str}**",
+            f"📍 Папка: `{paths['source']}`",
+            "",
+            f"📄 **Найдено файлов: {len(pptx_files)}**",
+            "",
+        ]
+        for idx, f in enumerate(pptx_files, start=1):
+            size_mb = f.get("size", 0) / (1024 * 1024)
+            lines.append(f"{idx}. `{f['name']}` — {size_mb:.1f} МБ")
+
+        lines.append("")
+        lines.append("🎬 Выберите файл для обработки:")
+
+        # 6. Формируем кнопки
+        kb = InlineKeyboardBuilder()
+        for idx, f in enumerate(pptx_files):
+            # 🎯 — файл со словом «служение», 📄 — остальные (объявления и т.п.)
+            prefix = "🎯" if "служение" in f["name"].lower() else "📄"
+            kb.row(InlineKeyboardButton(
+                text=f"{prefix} {f['name']}",
+                callback_data=f"yd_pick:{sunday_str}:{idx}",
+            ))
         kb.row(InlineKeyboardButton(
-            text=f"{prefix} {f['name']}",
-            callback_data=f"yd_pick:{sunday_str}:{idx}",
+            text="❌ Отмена",
+            callback_data="yd_cancel",
         ))
 
-    # Сохраняем в sessions
-    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
-    sessions[session_key] = {
-        "sunday": sunday,
-        "paths": paths,
-        "files": pptx_files,
-        "created_at": time.time(),
-    }
+        # 7. Сохраняем сессию для дальнейшей обработки
+        session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+        sessions[session_key] = {
+            "user_id": message.from_user.id,
+            "chat_id": message.chat.id,
+            "sunday": sunday,
+            "sunday_str": sunday_str,
+            "paths": paths,
+            "files": pptx_files,
+            "created_at": time.time(),
+        }
 
-    await status_msg.edit_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=kb.as_markup(),
-    )
+        await status_msg.edit_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=kb.as_markup(),
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
+        await yd_release(message.from_user.id, message.chat.id)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        except Exception:
+            pass
 
 @router.callback_query(F.data.startswith("yd_pick:"))
 async def yd_pick(callback: types.CallbackQuery):
