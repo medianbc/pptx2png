@@ -3,7 +3,7 @@ import logging
 import shutil
 import asyncio  # ✅ Добавлен импорт asyncio
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 from aiogram import Bot, types
 from pptx import Presentation
 from urllib.parse import urlencode
