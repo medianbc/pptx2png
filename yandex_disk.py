@@ -250,11 +250,13 @@ class YandexDiskClient:
             return False
 
     async def ensure_folder(self, path: str) -> bool:
+        """
+        Создаёт папку и все родительские при необходимости.
+        Собирает путь корректно: /a, /a/b, /a/b/c.
+        """
         parts = [p for p in path.strip("/").split("/") if p]
-        current = ""
-        for part in parts:
-            current = f"{current}/{part}" if current else part
-            current = f"/{current}"
+        for i in range(1, len(parts) + 1):
+            current = "/" + "/".join(parts[:i])
             if not await self.create_folder(current):
                 return False
         return True
