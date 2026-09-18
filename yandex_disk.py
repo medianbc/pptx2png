@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.1)
+# yandex_disk.py — клиент Яндекс.Диска (v1.2)
 # ==========================================
 
 import aiohttp
@@ -46,7 +46,6 @@ class YandexDiskClient:
     # ---------- Проверка доступности ----------
 
     async def check_access(self) -> Tuple[bool, Optional[str]]:
-        """Проверяет доступность Диска. Возвращает (True, None) если ОК."""
         if not self.token:
             return False, "Токен не задан"
         url = f"{YANDEX_API_BASE}/"
@@ -74,11 +73,6 @@ class YandexDiskClient:
         limit: int = 1000,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Получить метаданные файла/папки.
-        Бросает YandexDiskNotFoundError при 404.
-        Бросает YandexDiskError при других ошибках.
-        """
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
@@ -104,10 +98,6 @@ class YandexDiskClient:
             raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
     async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
-        """
-        Список содержимого папки с полной пагинацией.
-        Бросает YandexDiskError при ошибке API.
-        """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
@@ -133,7 +123,6 @@ class YandexDiskClient:
         return all_items
 
     async def folder_exists(self, path: str) -> bool:
-        """Проверяет, что папка существует. Бросает YandexDiskError при ошибке API."""
         try:
             resource = await self.get_resource(path)
         except YandexDiskNotFoundError:
@@ -145,11 +134,6 @@ class YandexDiskClient:
         parent_path: str,
         predicate: Callable[[str], bool],
     ) -> Optional[Dict[str, Any]]:
-        """
-        Найти дочернюю папку по предикату.
-        ⚠️ Предикат должен быть СИНХРОННЫМ (def, не async def).
-        Бросает YandexDiskError при ошибке API.
-        """
         items = await self.list_folder(parent_path)
         for item in items:
             if item.get("type") != "dir":
@@ -164,7 +148,10 @@ class YandexDiskClient:
     # ---------- Скачивание / Загрузка ----------
 
     async def download_file(self, remote_path: str, destination: Path) -> bool:
-        """Скачивает файл с Диска в локальный файл."""
+        """
+        Скачивает файл с Диска ПОТОКОВО (chunked),
+        не загружая весь файл в память.
+        """
         url = f"{YANDEX_API_BASE}/resources/download"
         params = {"path": remote_path}
         try:
@@ -184,15 +171,16 @@ class YandexDiskClient:
                     if file_resp.status != 200:
                         logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
                         return False
+                    # ✅ Потоковая запись блоками по 64 КБ
                     with open(destination, "wb") as f:
-                        f.write(await file_resp.read())
+                        async for chunk in file_resp.content.iter_chunked(64 * 1024):
+                            f.write(chunk)
                 return True
         except Exception as e:
             logging.error(f"Ошибка download_file: {e}", exc_info=True)
             return False
 
     async def upload_file(self, local_path: Path, remote_path: str, overwrite: bool = True) -> bool:
-        """Загружает локальный файл на Диск."""
         url = f"{YANDEX_API_BASE}/resources/upload"
         params = {"path": remote_path, "overwrite": str(overwrite).lower()}
         try:
@@ -221,7 +209,10 @@ class YandexDiskClient:
     # ---------- Создание папок ----------
 
     async def create_folder(self, path: str) -> bool:
-        """Создаёт папку. True если создана или уже существует."""
+        """
+        Создаёт папку. Возвращает True если создана или уже существует.
+        Разбирает 409 — отличает «уже существует» от других конфликтов.
+        """
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
         try:
@@ -229,16 +220,36 @@ class YandexDiskClient:
                 async with session.put(
                     url, headers=self.headers, params=params, timeout=30
                 ) as resp:
-                    if resp.status in (201, 409):
+                    if resp.status == 201:
                         return True
-                    logging.error(f"Yandex API create_folder: HTTP {resp.status} для {path}")
+                    if resp.status == 409:
+                        # ✅ Разбираем ошибку 409 — только "уже существует" = успех
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            logging.error(
+                                f"create_folder {path}: 409 без JSON"
+                            )
+                            return False
+                        err = data.get("error", "")
+                        if err in (
+                            "DiskPathAlreadyExistsError",
+                            "DiskResourceAlreadyExistsError",
+                        ):
+                            return True
+                        logging.error(
+                            f"create_folder {path}: 409 error={err}"
+                        )
+                        return False
+                    logging.error(
+                        f"create_folder {path}: HTTP {resp.status}"
+                    )
                     return False
         except Exception as e:
             logging.error(f"Ошибка create_folder: {e}")
             return False
 
     async def ensure_folder(self, path: str) -> bool:
-        """Создаёт папку и все родительские при необходимости."""
         parts = [p for p in path.strip("/").split("/") if p]
         current = ""
         for part in parts:
@@ -257,23 +268,19 @@ def get_nearest_sunday(reference_date: Optional[datetime] = None) -> datetime:
     """
     Ближайшее ПРЕДСТОЯЩЕЕ воскресенье.
     - Если сегодня воскресенье — возвращает сегодня.
-    - Иначе — следующее воскресенье (в будущем).
+    - Иначе — следующее воскресенье.
     """
     if reference_date is None:
         reference_date = datetime.now()
-
-    # weekday(): Пн=0, Вт=1, ..., Вс=6
     days_until_sunday = (6 - reference_date.weekday()) % 7
     return reference_date + timedelta(days=days_until_sunday)
 
 
 def month_folder_name(date: datetime) -> str:
-    """Имя месячной папки: '09 СЕНТЯБРЬ 2026'."""
     return f"{date.month:02d} {RUSSIAN_MONTHS[date.month]} {date.year}"
 
 
 def date_folder_variants(date: datetime) -> List[str]:
-    """Возможные имена папки даты (только цифровые форматы)."""
     return [
         date.strftime("%d.%m.%Y"),
         date.strftime("%d.%m.%y"),
@@ -315,14 +322,9 @@ async def resolve_sunday_paths(
     source_folder: str = "Служение",
     target_folder: str = "Трансляция",
 ) -> Optional[Dict[str, str]]:
-    """
-    Находит пути для указанного воскресенья.
-    Возвращает словарь {month_folder, date_folder, source, target} или None.
-    Бросает YandexDiskError при ошибках API (кроме «не найдено»).
-    """
+    """Находит пути для указанного воскресенья."""
     month_name = month_folder_name(sunday)
 
-    # ⚠️ СИНХРОННЫЙ предикат
     def match_month(name: str) -> bool:
         return " ".join(name.upper().split()) == " ".join(month_name.upper().split())
 
@@ -356,13 +358,8 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
-    """
-    Находит pptx в папке 'Служение' с датой воскресенья в имени.
-    Бросает YandexDiskError при ошибке API.
-    """
     if not await client.folder_exists(source_path):
         return []
-
     items = await client.list_folder(source_path)
     result = []
     for item in items:
