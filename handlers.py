@@ -1,5 +1,5 @@
-﻿# ==========================================
-# handlers.py — ОБРАБОТЧИКИ (ФИНАЛЬНАЯ ВЕРСИЯ, ИСПРАВЛЕННАЯ)
+# ==========================================
+# handlers.py — ОБРАБОТЧИКИ (v1.2, финальная версия)
 # ==========================================
 
 import os
@@ -10,19 +10,109 @@ import asyncio
 import zipfile
 import time
 from pathlib import Path
+import html as html_module
 from typing import Optional, Set, Dict, List, Tuple
 from aiogram import Router, F, types, Bot
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from utils import extract_text_from_pptx, check_spelling, download_file_by_url, download_yandex_disk, core_pipeline
+from utils import (
+    extract_text_from_pptx,
+    check_spelling,
+    download_file_by_url,
+    download_yandex_disk,
+    core_pipeline,
+)
 import converter_engine
 from converter_engine import make_dark_mode
 
+from yandex_disk import (
+    YandexDiskClient,
+    YandexDiskError,
+    YandexDiskNotFoundError,
+    get_nearest_sunday,
+    month_folder_name,
+    resolve_sunday_paths,
+    find_pptx_in_source,
+    pptx_matches_date,
+)
+
 
 # ==========================================
-# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (Яндекс.Диск)
+# ==========================================
+
+yandex_client: Optional[YandexDiskClient] = None
+yandex_base_path: str = ""
+yandex_source_folder: str = "Служение"
+yandex_target_folder: str = "Трансляция"
+yandex_pptx2png_folder: str = "pptx2png"
+yandex_sermon_folder: str = "проповедь - png"
+yandex_sermon_keyword: str = "проповед"
+yandex_template_file: str = "template.yaml"
+
+
+# ==========================================
+# БЛОКИРОВКА СЕССИЙ ЯНДЕКС.ДИСКА
+# ==========================================
+
+yd_session_lock = asyncio.Lock()
+# {user_id:chat_id -> nonce (generation)}
+yd_active_sessions: Dict[str, str] = {}
+
+
+def yd_session_key(user_id: int, chat_id: int) -> str:
+    return f"{user_id}:{chat_id}"
+
+
+async def yd_try_acquire(user_id: int, chat_id: int) -> Optional[str]:
+    """
+    Захватывает блокировку для сессии.
+    Возвращает nonce (generation) при успехе или None, если уже занято.
+    """
+    key = yd_session_key(user_id, chat_id)
+    nonce = secrets.token_hex(8)
+    async with yd_session_lock:
+        if key in yd_active_sessions:
+            return None
+        yd_active_sessions[key] = nonce
+        return nonce
+
+
+async def yd_release(user_id: int, chat_id: int, nonce: Optional[str] = None) -> bool:
+    """
+    Освобождает блокировку.
+    Если передан nonce — снимает только при совпадении (защита от отмены чужих сессий).
+    Возвращает True, если блокировка была снята (или уже отсутствовала с совпадающим nonce).
+    """
+    key = yd_session_key(user_id, chat_id)
+    async with yd_session_lock:
+        current = yd_active_sessions.get(key)
+        if current is None:
+            return True  # уже нет — нечего освобождать
+        if nonce is not None and current != nonce:
+            return False  # чужая сессия — не трогаем
+        yd_active_sessions.pop(key, None)
+        return True
+
+
+async def yd_is_active(user_id: int, chat_id: int, nonce: Optional[str] = None) -> bool:
+    """
+    Проверяет, активна ли сессия.
+    Если передан nonce — проверяет и совпадение.
+    """
+    key = yd_session_key(user_id, chat_id)
+    async with yd_session_lock:
+        current = yd_active_sessions.get(key)
+        if current is None:
+            return False
+        if nonce is not None and current != nonce:
+            return False
+        return True
+
+# ==========================================
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (общие)
 # ==========================================
 
 sessions: Dict[str, dict] = {}
@@ -35,38 +125,29 @@ converter_semaphore = asyncio.Semaphore(2)
 # ==========================================
 
 class TaskLockManager:
-    """
-    Менеджер блокировок для защиты от дублирующих операций.
-    Предотвращает одновременный запуск конвертации и спеллера для одной задачи.
-    """
-    
+    """Менеджер блокировок для защиты от дублирующих операций."""
+
     def __init__(self):
         self._locks: Dict[str, asyncio.Lock] = {}
         self._active: Set[str] = set()
         self._dict_lock = asyncio.Lock()
-    
+
     async def acquire(self, task_id: str) -> bool:
-        """
-        Пытается захватить блокировку для задачи.
-        Возвращает True если захват успешен, False если задача уже обрабатывается.
-        """
+        """Захватить блокировку. True — успешно, False — уже занято."""
         async with self._dict_lock:
             if task_id in self._active:
                 return False
-            
             if task_id not in self._locks:
                 self._locks[task_id] = asyncio.Lock()
-            
             lock = self._locks[task_id]
             if lock.locked():
                 return False
-            
             await lock.acquire()
             self._active.add(task_id)
             return True
-    
+
     async def release(self, task_id: str):
-        """Освобождает блокировку задачи."""
+        """Освободить блокировку."""
         async with self._dict_lock:
             self._active.discard(task_id)
             if task_id in self._locks:
@@ -75,9 +156,8 @@ class TaskLockManager:
                     lock.release()
                 self._locks.pop(task_id, None)
 
-
     async def is_active(self, task_id: str) -> bool:
-        """Проверяет, активна ли задача (есть ли активная блокировка)."""
+        """Проверить, активна ли задача."""
         async with self._dict_lock:
             return task_id in self._active
 
@@ -90,6 +170,7 @@ task_lock_manager = TaskLockManager()
 # ==========================================
 
 def safe_filename(filename: str) -> str:
+    """Приводит имя файла к безопасному виду."""
     import re
     safe_name = os.path.basename(filename)
     safe_name = re.sub(r'[^\w\s.-]', '', safe_name)
@@ -103,6 +184,7 @@ def safe_filename(filename: str) -> str:
 
 
 def validate_download_path(task_dir: Path, destination: Path) -> bool:
+    """Проверяет, что destination находится внутри task_dir."""
     try:
         return destination.resolve().parent == task_dir.resolve() or \
                destination.resolve().parent in task_dir.resolve().parents
@@ -111,10 +193,12 @@ def validate_download_path(task_dir: Path, destination: Path) -> bool:
 
 
 def generate_task_id(chat_id: int, user_id: int, message_id: int) -> str:
+    """Генерирует уникальный идентификатор задачи."""
     return f"task_{chat_id}_{user_id}_{message_id}_{secrets.token_hex(8)}"
 
 
 def parse_slides_ranges(input_text: str) -> List[Tuple[int, int]]:
+    """Парсит диапазоны слайдов из текста (1-3, 5, 7-10)."""
     ranges = []
     parts = input_text.replace(" ", "").split(",")
     for part in parts:
@@ -141,8 +225,9 @@ def parse_slides_ranges(input_text: str) -> List[Tuple[int, int]]:
     return ranges
 
 
-def reset_awaiting_for_user_chat(user_id: int, chat_id: int, exclude_task_id: Optional[str] = None):
-    """Сбрасывает флаг awaiting_selection у всех сессий пользователя в чате, кроме указанной."""
+def reset_awaiting_for_user_chat(user_id: int, chat_id: int,
+                                 exclude_task_id: Optional[str] = None):
+    """Сбрасывает awaiting_selection у всех сессий пары (user, chat)."""
     for tid, sess in sessions.items():
         if sess.get("user_id") == user_id and sess.get("chat_id") == chat_id:
             if exclude_task_id is None or tid != exclude_task_id:
@@ -150,7 +235,7 @@ def reset_awaiting_for_user_chat(user_id: int, chat_id: int, exclude_task_id: Op
 
 
 def get_disabled_keyboard() -> InlineKeyboardBuilder:
-    """Возвращает клавиатуру с заблокированной кнопкой."""
+    """Клавиатура с заблокированной кнопкой."""
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="⏳ Конвертация...", callback_data="disabled_placeholder"))
     return kb
@@ -159,7 +244,7 @@ def get_disabled_keyboard() -> InlineKeyboardBuilder:
 def touch_task(task_dir: Path):
     """
     Обновляет время модификации папки задачи.
-    Используется для того, чтобы очистка не удаляла активные задачи.
+    Нужно, чтобы очистка не удаляла активные задачи.
     """
     if task_dir and task_dir.exists():
         try:
@@ -174,7 +259,7 @@ def touch_task(task_dir: Path):
 
 def normalize_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """
-    Объединяет ТОЛЬКО перекрывающиеся диапазоны, но только если итоговый размер <= 1000.
+    Объединяет ТОЛЬКО перекрывающиеся диапазоны (размер <= 1000).
     Соседние (1-3, 4-6) остаются отдельными.
     Точные дубликаты удаляются.
     """
@@ -184,13 +269,13 @@ def normalize_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     unique_ranges = list(dict.fromkeys(ranges))
     if not unique_ranges:
         return []
-    
+
     sorted_ranges = sorted(unique_ranges, key=lambda r: r[0])
-    
+
     merged = []
     start, end = sorted_ranges[0]
     idx = 0
-    
+
     if end - start + 1 > 1000:
         logging.warning(f"Слишком большой диапазон {start}-{end}, игнорируем.")
         idx = 1
@@ -203,12 +288,12 @@ def normalize_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
             idx += 1
         else:
             return []
-    
-    for next_start, next_end in sorted_ranges[idx+1:]:
+
+    for next_start, next_end in sorted_ranges[idx + 1:]:
         if next_end - next_start + 1 > 1000:
             logging.warning(f"Слишком большой диапазон {next_start}-{next_end}, игнорируем.")
             continue
-        
+
         if next_start <= end:
             new_end = max(end, next_end)
             if new_end - start + 1 <= 1000:
@@ -219,14 +304,10 @@ def normalize_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         else:
             merged.append((start, end))
             start, end = next_start, next_end
-    
+
     merged.append((start, end))
     return merged
 
-
-# ==========================================
-# УДАЛЕНИЕ ПАПКИ ЗАДАЧИ
-# ==========================================
 
 def safe_delete_task_dir(task_dir: Path):
     """Безопасно удаляет папку задачи."""
@@ -243,7 +324,10 @@ def safe_delete_task_dir(task_dir: Path):
 # ==========================================
 
 class TaskContext:
-    def __init__(self, task_id: str, callback: types.CallbackQuery, SHM_DIR: str, operation: str = "conversion"):
+    """Контекстный менеджер задачи конвертации."""
+
+    def __init__(self, task_id: str, callback: types.CallbackQuery,
+                 SHM_DIR: str, operation: str = "conversion"):
         self.task_id = task_id
         self.callback = callback
         self.SHM_DIR = SHM_DIR
@@ -254,43 +338,37 @@ class TaskContext:
         self.lock_acquired = False
 
     async def __aenter__(self):
-        # ✅ 1. СНАЧАЛА проверяем сессию
+        # 1. Проверяем сессию
         self.session_data = sessions.get(self.task_id)
         if not self.session_data:
             await self.callback.message.edit_text("❌ Сессия была удалена.")
             raise ValueError("Session not found")
-        
-        # ✅ 2. Проверяем файлы ДО захвата блокировки
+
+        # 2. Проверяем файлы ДО блокировки
         self.task_dir = Path(self.SHM_DIR) / self.task_id
         if not self.task_dir.exists():
             await self.callback.message.edit_text("❌ Папка задачи удалена.")
             raise FileNotFoundError("Task directory not found")
-        
+
         self.pptx_path = self.session_data.get("file_path")
         if not self.pptx_path or not Path(self.pptx_path).exists():
             await self.callback.message.edit_text("❌ Файл презентации удален.")
             raise FileNotFoundError("Presentation file not found")
-        
-        # ✅ 3. ТОЛЬКО ПОСЛЕ ВСЕХ ПРОВЕРОК — захватываем блокировку
+
+        # 3. Захват блокировки
         if not await task_lock_manager.acquire(self.task_id):
             await self.callback.message.edit_text("⏳ Задача уже обрабатывается.")
             raise RuntimeError("Task already processing")
         self.lock_acquired = True
-        
-        # 4. Обновляем время активности
+
+        # 4. Обновляем mtime
         touch_task(self.task_dir)
-        
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Освобождаем блокировку
         if self.lock_acquired:
             await task_lock_manager.release(self.task_id)
-        
-        # Удаляем сессию в любом случае
         sessions.pop(self.task_id, None)
-        
-        # Удаляем папку задачи (безопасно)
         safe_delete_task_dir(self.task_dir)
 
 
@@ -307,60 +385,66 @@ async def run_conversion(
     all_slides: bool = True,
     ranges: List[Tuple[int, int]] = None
 ):
-    # --- 1. Первая валидация (до захвата ресурсов) ---
     session = sessions.get(task_id)
     if not session:
         await callback.message.edit_text("❌ Сессия истекла.")
         await callback.answer("❌ Сессия истекла.", show_alert=True)
         return
-    
-    if callback.from_user.id != session["user_id"] or callback.message.chat.id != session["chat_id"]:
+
+    if callback.from_user.id != session["user_id"] or \
+       callback.message.chat.id != session["chat_id"]:
         await callback.message.edit_text("❌ У вас нет доступа к этой задаче.")
         await callback.answer("❌ У вас нет доступа к этой задаче.", show_alert=True)
         return
 
-    # --- 2. Ожидание слота (семафор) и контекст с блокировкой ---
     async with converter_semaphore:
         try:
             async with TaskContext(task_id, callback, SHM_DIR, "conversion") as ctx:
-                
+
                 cfg = user_mgr.get_user_config(callback.from_user.id)
                 chat_id = callback.message.chat.id
                 user_id = callback.from_user.id
                 pptx_path = ctx.pptx_path
 
-                # Обновляем время активности перед началом длительных операций
                 touch_task(ctx.task_dir)
 
                 if all_slides:
-                    expected_zip, final_pdf_path = await core_pipeline(pptx_path, callback.message, user_id, user_mgr)
-                    
+                    expected_zip, final_pdf_path = await core_pipeline(
+                        pptx_path, callback.message, user_id, user_mgr
+                    )
+
                     if expected_zip and expected_zip.exists():
                         if expected_zip.stat().st_size > 45 * 1024 * 1024:
                             await callback.message.edit_text("⚠️ **Архив слишком большой (>45 МБ).**")
                             return
-                        
+
                         await callback.message.edit_text("📤 Отправляю готовые файлы...")
-                        await callback.bot.send_document(chat_id=chat_id, document=FSInputFile(expected_zip), caption="📦 ZIP со всеми слайдами готов!")
-                        
+                        await callback.bot.send_document(
+                            chat_id=chat_id,
+                            document=FSInputFile(expected_zip),
+                            caption="📦 ZIP со всеми слайдами готов!"
+                        )
+
                         if final_pdf_path and final_pdf_path.exists():
-                            await callback.bot.send_document(chat_id=chat_id, document=FSInputFile(final_pdf_path), caption="📄 PDF готов!")
-                            
+                            await callback.bot.send_document(
+                                chat_id=chat_id,
+                                document=FSInputFile(final_pdf_path),
+                                caption="📄 PDF готов!"
+                            )
+
                         await callback.message.delete()
                     else:
                         await callback.message.edit_text("❌ Ошибка конвертации всех слайдов.")
 
                 elif ranges:
                     final_ranges = normalize_ranges(ranges)
-                    
+
                     if not final_ranges:
                         await callback.message.edit_text("❌ Нет допустимых диапазонов для конвертации.")
                         return
-                    
+
                     temp_png_dir = ctx.task_dir / "temp_pngs"
                     temp_png_dir.mkdir(exist_ok=True)
-                    
-                    # Обновляем время перед конвертацией PNG
                     touch_task(ctx.task_dir)
 
                     all_pngs = await convert_all_pngs(pptx_path, temp_png_dir, cfg["quality"])
@@ -373,7 +457,9 @@ async def run_conversion(
 
                     for idx, (start, end) in enumerate(final_ranges):
                         if start > total_slides:
-                            await callback.message.edit_text(f"❌ Слайд {start} не существует (всего {total_slides}).")
+                            await callback.message.edit_text(
+                                f"❌ Слайд {start} не существует (всего {total_slides})."
+                            )
                             return
                         if end > total_slides:
                             end = total_slides
@@ -387,10 +473,8 @@ async def run_conversion(
 
                         range_name = f"slides_{start}-{end}" if start != end else f"slide_{start}"
                         zip_path = ctx.task_dir / f"{pptx_path.stem}_part{idx + 1}_{range_name}.zip"
-                        
+
                         create_zip_stream(selected, zip_path)
-                        
-                        # Обновляем время после создания каждого архива
                         touch_task(ctx.task_dir)
 
                         if zip_path.stat().st_size > 45 * 1024 * 1024:
@@ -417,8 +501,6 @@ async def run_conversion(
                                     caption=f"📦 {zip_path.name}"
                                 )
                                 zip_path.unlink()
-                                
-                                # Обновляем время после отправки каждого архива
                                 touch_task(ctx.task_dir)
                         await callback.message.delete()
                         await callback.bot.send_message(
@@ -431,24 +513,24 @@ async def run_conversion(
 
         except RuntimeError as e:
             if "already processing" in str(e):
-                logging.warning(f"Попытка повторного запуска конвертации для задачи {task_id}")
-                await callback.answer("⏳ Задача уже обрабатывается, пожалуйста, подождите...", show_alert=True)
+                logging.warning(f"Повторный запуск конвертации {task_id}")
+                await callback.answer("⏳ Задача уже обрабатывается...", show_alert=True)
             else:
-                logging.error(f"RuntimeError в run_conversion: {e}")
+                logging.error(f"RuntimeError run_conversion: {e}")
                 await callback.message.edit_text(f"❌ Ошибка: {str(e)[:100]}")
         except ValueError as e:
-            logging.error(f"Ошибка валидации в run_conversion: {e}")
+            logging.error(f"ValueError run_conversion: {e}")
             await callback.message.edit_text(f"❌ Ошибка данных: {str(e)[:100]}")
-            await callback.answer("❌ Ошибка данных, попробуйте заново.", show_alert=True)
+            await callback.answer("❌ Ошибка данных.", show_alert=True)
         except FileNotFoundError as e:
-            logging.error(f"Файл не найден: {e}")
-            await callback.message.edit_text("❌ Презентация была удалена или повреждена.")
+            logging.error(f"FileNotFound run_conversion: {e}")
+            await callback.message.edit_text("❌ Презентация удалена или повреждена.")
             await callback.answer("❌ Презентация не найдена.", show_alert=True)
         except Exception as e:
-            logging.error(f"Неожиданная ошибка в run_conversion: {e}", exc_info=True)
+            logging.error(f"Exception run_conversion: {e}", exc_info=True)
             try:
                 await callback.message.edit_text(f"❌ Произошла ошибка: {str(e)[:100]}")
-                await callback.answer("❌ Произошла ошибка, попробуйте заново.", show_alert=True)
+                await callback.answer("❌ Ошибка.", show_alert=True)
             except Exception:
                 pass
 
@@ -458,26 +540,28 @@ async def run_conversion(
 # ==========================================
 
 async def convert_all_pngs(pptx_path: Path, output_dir: Path, quality: str) -> List[Path]:
+    """Конвертирует PPTX → PNG в фоновом потоке."""
     def _sync_convert():
         if pptx_path.suffix.lower() == '.ppt':
             pptx_converted = converter_engine.ppt_to_pptx_crossplatform(pptx_path, output_dir)
         else:
             pptx_converted = pptx_path
-            
+
         temp_dark_pptx = output_dir / f"temp_dark_{pptx_converted.name}"
         make_dark_mode(pptx_converted, temp_dark_pptx)
-        
+
         pdf_path = converter_engine.pptx_to_pdf_crossplatform(temp_dark_pptx, output_dir)
         total_slides, png_paths = converter_engine.pdf_to_png_fast(pdf_path, output_dir, quality)
-        
+
         if pdf_path.exists():
             pdf_path.unlink()
         if temp_dark_pptx.exists():
             temp_dark_pptx.unlink()
         if pptx_converted != pptx_path and pptx_converted.exists():
             pptx_converted.unlink()
-            
+
         return png_paths
+
     return await asyncio.to_thread(_sync_convert)
 
 
@@ -486,11 +570,14 @@ async def convert_all_pngs(pptx_path: Path, output_dir: Path, quality: str) -> L
 # ==========================================
 
 def create_zip_stream(file_paths: List[Path], output_path: Path) -> Path:
+    """Создаёт ZIP-архив из списка файлов."""
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for fpath in file_paths:
             if fpath.exists():
                 zf.write(fpath, arcname=fpath.name)
     return output_path
+
+
 # ==========================================
 # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПРИВЕТСТВИЯ
 # ==========================================
@@ -500,31 +587,71 @@ async def send_welcome(message: types.Message, get_settings_keyboard):
     await message.reply(
         "👋 Привет!\n\n"
         "Для начала работы загрузите презентацию в формате **.pptx**, **.ppt** или **.zip**.\n"
-        "Также можно отправить google ссылку на файл (доступ на чтением всем).\n\n"
+        "Также можно отправить google ссылку на файл (доступ на чтение всем).\n\n"
         "⚙️ Настройки качества и PDF:",
         reply_markup=get_settings_keyboard(message.from_user.id)
     )
 
-# ==========================================
-# ХЕНДЛЕРЫ (ПОРЯДОК ВАЖЕН!)
-# ==========================================
 
 # ==========================================
-# 1. КОМАНДА СТАРТ (ДОЛЖНА БЫТЬ ПЕРВОЙ)
+# 1. КОМАНДА СТАРТ
 # ==========================================
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, check_access, get_settings_keyboard):
     if not await check_access(message):
         return
-    await send_welcome(message, get_settings_keyboard)
+
+    yd_status = "⚪ Не настроен"
+    sunday_line = ""
+
+    if yandex_client is not None:
+        ok, err = await yandex_client.check_access()
+        if ok:
+            yd_status = "✅ Доступен"
+            sunday = get_nearest_sunday()
+            try:
+                paths = await resolve_sunday_paths(
+                    yandex_client, yandex_base_path, sunday,
+                    yandex_source_folder, yandex_target_folder,
+                )
+                if paths:
+                    pptx_files = await find_pptx_in_source(
+                        yandex_client, paths["source"], sunday
+                    )
+                    if pptx_files:
+                        sunday_line = (
+                            f"\n📅 На **{sunday:%d.%m.%Y}** "
+                            f"найдено pptx: **{len(pptx_files)}**\n"
+                            f"→ /sunday для выбора"
+                        )
+                    else:
+                        sunday_line = f"\n📅 На **{sunday:%d.%m.%Y}** pptx пока нет."
+                else:
+                    sunday_line = f"\n📅 Структура для **{sunday:%d.%m.%Y}** не найдена."
+            except YandexDiskError as e:
+                logging.error(f"Ошибка Яндекс.Диска в /start: {e}")
+                yd_status = f"⚠️ {str(e)[:50]}"
+        else:
+            yd_status = f"❌ {err}"
+
+    await message.reply(
+        f"👋 Привет!\n\n"
+        f"🟢 Яндекс.Диск: {yd_status}"
+        f"{sunday_line}\n\n"
+        f"Загрузите презентацию, отправьте ссылку или используйте /sunday.\n\n"
+        f"⚙️ Настройки:",
+        reply_markup=get_settings_keyboard(message.from_user.id),
+    )
+
 
 # ==========================================
-# 2. ОБРАБОТЧИК ВЫБОРА СЛАЙДОВ (callback)
+# 2. ВЫБОР СЛАЙДОВ (callback)
 # ==========================================
 
 @router.callback_query(F.data.startswith("slides_all:"))
-async def handle_all_slides(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user, get_settings_keyboard):
+async def handle_all_slides(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str,
+                            user_mgr, check_access_by_user, get_settings_keyboard):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -532,16 +659,20 @@ async def handle_all_slides(callback: types.CallbackQuery, bot: Bot, SHM_DIR: st
     if task_id not in sessions:
         await callback.answer("❌ Сессия истекла.", show_alert=True)
         return
-    
-    # Блокируем кнопку
+
     try:
-        await callback.message.edit_reply_markup(reply_markup=get_disabled_keyboard().as_markup())
+        await callback.message.edit_reply_markup(
+            reply_markup=get_disabled_keyboard().as_markup()
+        )
     except Exception:
         pass
-    
+
     await callback.answer("⏳ Начинаю конвертацию...")
     await callback.message.edit_text("⚙️ Запускаю конвертацию всех слайдов...")
-    await run_conversion(callback, task_id, SHM_DIR, user_mgr, get_settings_keyboard, all_slides=True)
+    await run_conversion(
+        callback, task_id, SHM_DIR, user_mgr,
+        get_settings_keyboard, all_slides=True
+    )
 
 
 @router.callback_query(F.data.startswith("slides_select:"))
@@ -550,28 +681,28 @@ async def handle_select_slides(callback: types.CallbackQuery, bot: Bot):
     if task_id not in sessions:
         await callback.answer("❌ Сессия истекла.", show_alert=True)
         return
-    
+
     session = sessions[task_id]
-    
-    # ========== ИСПРАВЛЕНИЕ: проверка владельца ==========
-    if callback.from_user.id != session.get("user_id") or callback.message.chat.id != session.get("chat_id"):
+
+    if callback.from_user.id != session.get("user_id") or \
+       callback.message.chat.id != session.get("chat_id"):
         await callback.answer("❌ У вас нет доступа к этой задаче.", show_alert=True)
         return
-    # ====================================================
-    
-    # Проверка существования папки
+
     task_dir = Path(session.get("task_dir", ""))
     if not task_dir.exists():
         sessions.pop(task_id, None)
         await callback.answer("❌ Данные задачи устарели.", show_alert=True)
-        await callback.message.edit_text("❌ Данные задачи устарели. Пожалуйста, загрузите презентацию заново.")
+        await callback.message.edit_text(
+            "❌ Данные задачи устарели. Загрузите презентацию заново."
+        )
         return
-    
-    # Обновляем время активности
+
     touch_task(task_dir)
-    
-    reset_awaiting_for_user_chat(session["user_id"], session["chat_id"], exclude_task_id=task_id)
-    
+    reset_awaiting_for_user_chat(
+        session["user_id"], session["chat_id"], exclude_task_id=task_id
+    )
+
     sessions[task_id]["awaiting_selection"] = True
     await callback.message.edit_text(
         "📝 **Введите номера слайдов для конвертации.** \n\n"
@@ -579,14 +710,15 @@ async def handle_select_slides(callback: types.CallbackQuery, bot: Bot):
         "• Отдельные номера: `1, 3, 5, 7` \n"
         "• Диапазоны: `4-12, 15, 20-30` \n"
         "• Смешанный: `1, 3-5, 10, 15-20` \n\n"
-        "Если укажете несколько диапазонов, каждый будет упакован в отдельный архив.", 
+        "Если укажете несколько диапазонов, каждый будет упакован в отдельный архив.",
         parse_mode="Markdown"
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("slides_convert:"))
-async def handle_convert_selected(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user, get_settings_keyboard):
+async def handle_convert_selected(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str,
+                                  user_mgr, check_access_by_user, get_settings_keyboard):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -595,36 +727,40 @@ async def handle_convert_selected(callback: types.CallbackQuery, bot: Bot, SHM_D
     if not session:
         await callback.answer("❌ Сессия истекла.", show_alert=True)
         return
-    
-    # Проверка существования папки
+
     task_dir = Path(session.get("task_dir", ""))
     if not task_dir.exists():
         sessions.pop(task_id, None)
         await callback.answer("❌ Данные задачи устарели.", show_alert=True)
-        await callback.message.edit_text("❌ Данные задачи устарели. Пожалуйста, загрузите презентацию заново.")
+        await callback.message.edit_text(
+            "❌ Данные задачи устарели. Загрузите презентацию заново."
+        )
         return
-    
+
     ranges = session.get("ranges")
     if not ranges:
         await callback.answer("❌ Не выбраны слайды.", show_alert=True)
         return
-    
-    # Обновляем время активности
+
     touch_task(task_dir)
-    
-    # Блокируем кнопку
+
     try:
-        await callback.message.edit_reply_markup(reply_markup=get_disabled_keyboard().as_markup())
+        await callback.message.edit_reply_markup(
+            reply_markup=get_disabled_keyboard().as_markup()
+        )
     except Exception:
         pass
-    
+
     await callback.answer("⏳ Начинаю конвертацию...")
     await callback.message.edit_text(f"⚙️ Запускаю конвертацию {len(ranges)} диапазон(ов)...")
-    await run_conversion(callback, task_id, SHM_DIR, user_mgr, get_settings_keyboard, all_slides=False, ranges=ranges)
+    await run_conversion(
+        callback, task_id, SHM_DIR, user_mgr,
+        get_settings_keyboard, all_slides=False, ranges=ranges
+    )
 
 
 # ==========================================
-# 3. ОБРАБОТЧИК НАЖАТИЯ НА ЗАБЛОКИРОВАННУЮ КНОПКУ
+# 3. ЗАБЛОКИРОВАННАЯ КНОПКА
 # ==========================================
 
 @router.callback_query(F.data == "disabled_placeholder")
@@ -634,7 +770,7 @@ async def handle_disabled_button(callback: types.CallbackQuery):
 
 
 # ==========================================
-# 4. ОБРАБОТЧИК ТЕКСТА (ИСКЛЮЧАЕТ КОМАНДЫ)
+# 4. ОБРАБОТЧИК ТЕКСТА (ввод диапазонов)
 # ==========================================
 
 @router.message(F.text & ~F.text.contains("http://") & ~F.text.contains("https://") & ~F.text.startswith("/"))
@@ -646,7 +782,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
     active_session = None
     active_task_id = None
-    
+
     for tid, sess in sessions.items():
         if sess.get("user_id") == user_id and \
            sess.get("chat_id") == target_chat_id and \
@@ -656,10 +792,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             break
 
     if not active_session:
-        # Вместо ошибки отправляем приветственное сообщение,
-        # чтобы пользователь понял, что нужно загрузить файл.
         await send_welcome(message, get_settings_keyboard)
-
         return
 
     ranges = parse_slides_ranges(message.text.strip())
@@ -669,14 +802,15 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         )
         return
 
-    # Обновляем время активности
     task_dir = Path(active_session.get("task_dir", ""))
     touch_task(task_dir)
 
     active_session["ranges"] = ranges
     active_session["awaiting_selection"] = False
 
-    ranges_text = ", ".join([f"{r[0]}-{r[1]}" if r[0] != r[1] else str(r[0]) for r in ranges])
+    ranges_text = ", ".join(
+        [f"{r[0]}-{r[1]}" if r[0] != r[1] else str(r[0]) for r in ranges]
+    )
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="✅ Конвертировать", callback_data=f"slides_convert:{active_task_id}"),
@@ -689,36 +823,39 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
 
 # ==========================================
-# 5. ОБРАБОТЧИК СПЕЛЛЕРА (С БЛОКИРОВКОЙ)
+# 5. СПЕЛЛЕР (с блокировкой)
 # ==========================================
 
 @router.callback_query(F.data.startswith("chk_spell:"))
-async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, check_access_by_user):
+async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str,
+                               check_access_by_user):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
     task_id = callback.data.split(":")[-1]
-    
-    # ✅ Захватываем блокировку для спеллера
+
     if not await task_lock_manager.acquire(task_id):
         await callback.answer("⏳ Задача уже обрабатывается.", show_alert=True)
         return
-    
+
     try:
         task_dir, pptx_path = await _validate_task_ownership(callback, task_id, SHM_DIR)
         if not task_dir or not pptx_path:
             return
 
-        # Обновляем время активности
         touch_task(task_dir)
 
         disabled_kb = InlineKeyboardBuilder()
-        disabled_kb.row(InlineKeyboardButton(text="⏳ Обработка...", callback_data=f"disabled_{task_id}"))
+        disabled_kb.row(InlineKeyboardButton(
+            text="⏳ Обработка...",
+            callback_data=f"disabled_{task_id}"
+        ))
         await callback.message.edit_reply_markup(reply_markup=disabled_kb.as_markup())
         await callback.message.edit_text("🔍 Извлекаю текст и отправляю в Яндекс.Спеллер...")
 
-        from utils import extract_text_from_pptx, check_spelling
-        extract_success, slides_text = await asyncio.to_thread(extract_text_from_pptx, str(pptx_path))
+        extract_success, slides_text = await asyncio.to_thread(
+            extract_text_from_pptx, str(pptx_path)
+        )
 
         if not extract_success:
             await callback.message.edit_text(
@@ -727,7 +864,10 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
                 parse_mode="Markdown"
             )
             kb = InlineKeyboardBuilder()
-            kb.row(InlineKeyboardButton(text="⚙️ Конвертировать", callback_data=f"chk_conv:{task_id}"))
+            kb.row(InlineKeyboardButton(
+                text="⚙️ Конвертировать",
+                callback_data=f"chk_conv:{task_id}"
+            ))
             await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
             await callback.answer()
             return
@@ -735,7 +875,10 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
         check_success, spelling_result = await check_spelling(slides_text)
 
         kb = InlineKeyboardBuilder()
-        kb.row(InlineKeyboardButton(text="⚙️ Всё равно конвертировать", callback_data=f"chk_conv:{task_id}"))
+        kb.row(InlineKeyboardButton(
+            text="⚙️ Всё равно конвертировать",
+            callback_data=f"chk_conv:{task_id}"
+        ))
 
         if not check_success:
             await callback.message.edit_text(
@@ -743,24 +886,26 @@ async def callback_run_speller(callback: types.CallbackQuery, bot: Bot, SHM_DIR:
                 parse_mode="HTML", reply_markup=kb.as_markup()
             )
         else:
-            await callback.message.edit_text(spelling_result, parse_mode="HTML", reply_markup=kb.as_markup())
+            await callback.message.edit_text(
+                spelling_result, parse_mode="HTML", reply_markup=kb.as_markup()
+            )
 
         await callback.answer()
 
     except Exception as e:
-        logging.error(f"Ошибка в callback_run_speller: {e}", exc_info=True)
+        logging.error(f"Ошибка callback_run_speller: {e}", exc_info=True)
         await callback.answer("❌ Произошла ошибка при проверке.", show_alert=True)
     finally:
-        # ✅ Освобождаем блокировку после завершения
         await task_lock_manager.release(task_id)
 
 
 # ==========================================
-# 6. ОБРАБОТЧИК СТАРОЙ КОНВЕРТАЦИИ
+# 6. СТАРАЯ КОНВЕРТАЦИЯ (из спеллера)
 # ==========================================
 
 @router.callback_query(F.data.startswith("chk_conv:"))
-async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr, check_access_by_user, get_settings_keyboard):
+async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str,
+                                  user_mgr, check_access_by_user, get_settings_keyboard):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -768,28 +913,33 @@ async def callback_run_conversion(callback: types.CallbackQuery, bot: Bot, SHM_D
     if task_id not in sessions:
         await callback.answer("❌ Сессия истекла.", show_alert=True)
         return
-    
-    # Обновляем время активности
+
     session = sessions[task_id]
     task_dir = Path(session.get("task_dir", ""))
     touch_task(task_dir)
-    
-    # Блокируем кнопку
+
     try:
-        await callback.message.edit_reply_markup(reply_markup=get_disabled_keyboard().as_markup())
+        await callback.message.edit_reply_markup(
+            reply_markup=get_disabled_keyboard().as_markup()
+        )
     except Exception:
         pass
-    
+
     await callback.answer("⏳ Начинаю конвертацию...")
     await callback.message.edit_text("⚙️ Запускаю конвертацию...")
-    await run_conversion(callback, task_id, SHM_DIR, user_mgr, get_settings_keyboard, all_slides=True)
+    await run_conversion(
+        callback, task_id, SHM_DIR, user_mgr,
+        get_settings_keyboard, all_slides=True
+    )
 
 
 # ==========================================
 # 7. ПРОВЕРКА ВЛАДЕЛЬЦА ЗАДАЧИ
 # ==========================================
 
-async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, SHM_DIR: str) -> tuple:
+async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str,
+                                   SHM_DIR: str) -> tuple:
+    """Проверяет владельца задачи по файлу .owner."""
     task_dir = Path(SHM_DIR) / task_id
     ownership_file = task_dir / ".owner"
     if not task_dir.exists():
@@ -822,7 +972,8 @@ async def _validate_task_ownership(callback: types.CallbackQuery, task_id: str, 
 # ==========================================
 
 @router.callback_query(F.data.startswith("adm_"))
-async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bot, ADMIN_ID: int):
+async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bot,
+                                ADMIN_ID: int):
     if callback.from_user.id != ADMIN_ID:
         return
     data = callback.data.split("_")
@@ -848,7 +999,8 @@ async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bo
 # ==========================================
 
 @router.callback_query(F.data.startswith("set_q_"))
-async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
+async def handle_quality_settings(callback: types.CallbackQuery, user_mgr,
+                                  get_settings_keyboard, check_access_by_user, bot: Bot):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -864,7 +1016,8 @@ async def handle_quality_settings(callback: types.CallbackQuery, user_mgr, get_s
 
 
 @router.callback_query(F.data == "toggle_pdf")
-async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr, get_settings_keyboard, check_access_by_user, bot: Bot):
+async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr,
+                            get_settings_keyboard, check_access_by_user, bot: Bot):
     if not await check_access_by_user(callback.from_user, bot):
         await callback.answer("❌ Доступ запрещен.", show_alert=True)
         return
@@ -910,7 +1063,7 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
 
     status_msg = await message.reply("⏳ Скачиваю презентацию...")
     success = False
-    
+
     try:
         file_info = await bot.get_file(document.file_id)
         await bot.download_file(file_info.file_path, destination=file_path)
@@ -935,16 +1088,14 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
             parse_mode="Markdown", reply_markup=kb.as_markup()
         )
         success = True
-        # Обновляем время активности
         touch_task(task_dir)
-        
+
     except Exception as e:
         logging.error(f"Ошибка загрузки: {e}")
         try:
             await status_msg.edit_text("❌ Ошибка загрузки.")
         except Exception:
             pass
-        
         if task_id in sessions:
             sessions.pop(task_id, None)
         safe_delete_task_dir(task_dir)
@@ -957,7 +1108,8 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
 
 
 @router.message(F.document)
-async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_access, user_mgr, get_settings_keyboard):
+async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_access,
+                      user_mgr, get_settings_keyboard):
     if not await check_access(message):
         return
     safe_name = safe_filename(message.document.file_name)
@@ -980,20 +1132,20 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
 
     status_msg = await message.reply("📥 Загрузка...")
     success = False
-    
+
     try:
         file_info = await bot.get_file(message.document.file_id)
         await bot.download_file(file_info.file_path, destination=file_path)
 
         if not file_path.exists() or file_path.stat().st_size == 0:
             await status_msg.edit_text("❌ Пустой файл.")
-            return  # finally удалит папку
+            return
 
         if ext == '.zip':
             pptx_path = converter_engine.extract_zip_if_needed(file_path, task_dir)
             if not pptx_path:
                 await status_msg.edit_text("❌ В ZIP нет презентации.")
-                return  # finally удалит папку
+                return
             file_path = pptx_path
 
         reset_awaiting_for_user_chat(user_id, chat_id)
@@ -1016,16 +1168,14 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
             parse_mode="Markdown", reply_markup=kb.as_markup()
         )
         success = True
-        # Обновляем время активности
         touch_task(task_dir)
-        
+
     except Exception as e:
         logging.error(f"Ошибка загрузки ZIP: {e}")
         try:
             await status_msg.edit_text("❌ Ошибка обработки архива.")
         except Exception:
             pass
-        
         if task_id in sessions:
             sessions.pop(task_id, None)
         safe_delete_task_dir(task_dir)
@@ -1045,7 +1195,7 @@ async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_acce
 async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_access):
     if not await check_access(message):
         return
-    
+
     url = converter_engine.convert_to_direct_download(message.text.strip())
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -1057,21 +1207,18 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
     file_path = task_dir / "downloaded_presentation.pptx"
     status_msg = await message.reply("🌐 Скачивание ссылки...")
     success = False
-    
+
     try:
-        # ✅ Определяем тип ссылки
         if "disk.yandex" in url or "yadi.sk" in url:
-            # Яндекс.Диск
             await status_msg.edit_text("🌐 Скачивание с Яндекс.Диска...")
             download_success = await download_yandex_disk(url, file_path)
         else:
-            # Google Docs и другие — используем существующую логику
             direct_url = converter_engine.convert_to_direct_download(url)
             download_success = await download_file_by_url(direct_url, file_path, status_msg)
-            
+
         if not download_success:
             await status_msg.edit_text("❌ Не удалось скачать файл по ссылке.")
-            return  # finally удалит папку
+            return
 
         reset_awaiting_for_user_chat(user_id, chat_id)
         sessions[task_id] = {
@@ -1082,7 +1229,7 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
             "awaiting_selection": True,
             "ranges": []
         }
-        
+
         kb = InlineKeyboardBuilder()
         kb.row(
             InlineKeyboardButton(text="📊 Все слайды", callback_data=f"slides_all:{task_id}"),
@@ -1094,16 +1241,14 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
             reply_markup=kb.as_markup()
         )
         success = True
-        # Обновляем время активности
         touch_task(task_dir)
-        
+
     except Exception as e:
         logging.error(f"Ошибка в handle_links: {e}")
         try:
             await status_msg.edit_text(f"❌ Ошибка: {e}")
         except Exception:
             pass
-        
         if task_id in sessions:
             sessions.pop(task_id, None)
         safe_delete_task_dir(task_dir)
@@ -1113,3 +1258,312 @@ async def handle_links(message: types.Message, bot: Bot, SHM_DIR: str, check_acc
             sessions.pop(task_id, None)
         if not success:
             safe_delete_task_dir(task_dir)
+
+
+# ==========================================
+# 12. КОМАНДА /sunday — Яндекс.Диск
+# ==========================================
+
+@router.message(Command("sunday"))
+async def cmd_sunday(message: types.Message, check_access):
+    """Проверка Диска + вывод найденных pptx для ближайшего предстоящего воскресенья."""
+    import html as html_module
+
+    if not await check_access(message):
+        return
+
+    if yandex_client is None:
+        await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
+        return
+
+    nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
+    if nonce is None:
+        await message.reply(
+            "⏳ У вас уже активна сессия подготовки трансляции.\n"
+            "Дождитесь завершения или нажмите /cancel_yd."
+        )
+        return
+
+    status_msg = None
+    session_created = False
+
+    try:
+        status_msg = await message.reply("🔍 Проверяю Яндекс.Диск...")
+
+        # 1. Доступность
+        ok, err = await yandex_client.check_access()
+        if not ok:
+            await status_msg.edit_text(
+                f"❌ <b>Яндекс.Диск недоступен</b>\n\n"
+                f"Причина: <code>{html_module.escape(str(err))}</code>\n\n"
+                f"Проверьте токен в <code>config.ini</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        # 2. Дата
+        sunday = get_nearest_sunday()
+        sunday_str = sunday.strftime("%d.%m.%Y")
+        month_str = month_folder_name(sunday)
+
+        await status_msg.edit_text(
+            f"✅ Яндекс.Диск доступен\n"
+            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
+            f"📁 Ожидаемая папка: <code>{html_module.escape(f'{month_str}/{sunday_str}')}</code>\n\n"
+            f"🔍 Проверяю структуру папок...",
+            parse_mode="HTML",
+        )
+
+        # 3. Разрешение путей
+        paths = await resolve_sunday_paths(
+            yandex_client, yandex_base_path, sunday,
+            yandex_source_folder, yandex_target_folder,
+        )
+        if not paths:
+            src_esc = html_module.escape(yandex_source_folder)
+            tgt_esc = html_module.escape(yandex_target_folder)
+            await status_msg.edit_text(
+                f"❌ <b>Структура папок не найдена</b>\n\n"
+                f"Ожидалось:\n"
+                f"<code>{html_module.escape(yandex_base_path)}/</code>\n"
+                f"<code>  {html_module.escape(month_str)}/</code>\n"
+                f"<code>    {html_module.escape(sunday_str)}/</code>\n"
+                f"<code>      {src_esc}/</code>\n"
+                f"<code>      {tgt_esc}/</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        # 4. Поиск pptx
+        try:
+            pptx_files = await find_pptx_in_source(
+                yandex_client, paths["source"], sunday
+            )
+        except YandexDiskError as e:
+            logging.error(f"Ошибка доступа к источнику: {e}")
+            await status_msg.edit_text(
+                f"❌ <b>Ошибка обращения к Яндекс.Диску</b>\n\n"
+                f"<code>{html_module.escape(str(e))}</code>\n\n"
+                f"Попробуйте позже.",
+                parse_mode="HTML",
+            )
+            return
+        if not pptx_files:
+            src_esc = html_module.escape(yandex_source_folder)
+            await status_msg.edit_text(
+                f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
+                f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>\n\n"
+                f"❌ <b>pptx-файлы не найдены.</b>\n\n"
+                f"Положите pptx с датой <code>{sunday:%d.%m.%y}</code> "
+                f"в папку <code>{src_esc}</code> и попробуйте снова.",
+                parse_mode="HTML",
+            )
+            return
+
+        # 5. Список с экранированием и лимитом
+        MAX_LEN = 3500
+        header_lines = [
+            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>",
+            f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>",
+            "",
+            f"📄 <b>Найдено файлов: {len(pptx_files)}</b>",
+            "",
+        ]
+        body_lines = []
+        omitted = 0
+        for idx, f in enumerate(pptx_files, start=1):
+            size_mb = f.get("size", 0) / (1024 * 1024)
+            name_escaped = html_module.escape(f["name"])
+            line = f"{idx}. <code>{name_escaped}</code> — {size_mb:.1f} МБ"
+            candidate = "\n".join(header_lines + body_lines + [line])
+            if len(candidate) > MAX_LEN:
+                omitted = len(pptx_files) - idx + 1
+                break
+            body_lines.append(line)
+
+        if omitted > 0:
+            body_lines.append("")
+            body_lines.append(f"…и ещё <b>{omitted}</b> файл(ов) не показано.")
+
+        body_lines.append("")
+        body_lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
+
+        # 6. Сохраняем сессию — используем nonce из yd_try_acquire
+        session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+        # ⚠️ nonce уже получен выше из yd_try_acquire — НЕ пересоздаём!
+
+        sessions[session_key] = {
+            "user_id": message.from_user.id,
+            "chat_id": message.chat.id,
+            "sunday": sunday,
+            "sunday_str": sunday_str,
+            "paths": paths,
+            "files": pptx_files,
+            "nonce": nonce,  # ← тот же nonce, что и в yd_active_sessions
+            "created_at": time.time(),
+        }
+
+        # ✅ callback_data содержит nonce — старая кнопка не сработает на новой сессии
+        # Проверяем, что нас не отменили за время работы
+        if not await yd_is_active(message.from_user.id, message.chat.id, nonce):
+            logging.info(
+                f"Сессия {message.from_user.id}:{message.chat.id} "
+                f"была отменена во время выполнения"
+            )
+            try:
+                await status_msg.edit_text("❌ Операция отменена пользователем.")
+            except Exception:
+                pass
+            return
+
+        # ✅ Сохраняем сессию с nonce
+        session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+        sessions[session_key] = {
+            "user_id": message.from_user.id,
+            "chat_id": message.chat.id,
+            "sunday": sunday,
+            "sunday_str": sunday_str,
+            "paths": paths,
+            "files": pptx_files,
+            "nonce": nonce,
+            "created_at": time.time(),
+        }
+
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data=f"yd_cancel:{message.from_user.id}:{nonce}"
+        ))
+
+        await status_msg.edit_text(
+            "\n".join(header_lines + body_lines),
+            parse_mode="HTML",
+            reply_markup=kb.as_markup(),
+        )
+        session_created = True
+
+        # ✅ Снимаем блокировку сразу после успешного показа
+        # (сессия остаётся в sessions для возможного использования в будущем,
+        #  но новый /sunday уже можно запустить)
+        await yd_release(message.from_user.id, message.chat.id, nonce)
+        logging.info(
+            f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+            f"освобождена после показа списка (nonce={nonce})"
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
+        try:
+            if status_msg:
+                await status_msg.edit_text(
+                    f"❌ Ошибка: <code>{html_module.escape(str(e)[:200])}</code>",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.reply(f"❌ Ошибка: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        if not session_created:
+            # Освобождаем ТОЛЬКО наше поколение — чужие не трогаем
+            released = await yd_release(message.from_user.id, message.chat.id, nonce)
+            if released:
+                logging.info(
+                    f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+                    f"освобождена (неудачный запуск, nonce={nonce})"
+                )
+            else:
+                logging.info(
+                    f"ℹ️ Сессия {message.from_user.id}:{message.chat.id} "
+                    f"уже освобождена другим вызовом (nonce={nonce})"
+                )
+
+
+# ==========================================
+# 13. yd_pick — заглушка (до подшага 1.2)
+# ==========================================
+
+@router.callback_query(F.data.startswith("yd_pick:"))
+async def yd_pick(callback: types.CallbackQuery):
+    """Заглушка — обработка появится в следующем обновлении."""
+    await callback.answer(
+        "⏳ Обработка файла появится в следующем обновлении.",
+        show_alert=True,
+    )
+
+
+# ==========================================
+# 14. yd_cancel — кнопка отмены
+# ==========================================
+
+@router.callback_query(F.data.startswith("yd_cancel:"))
+async def yd_cancel_callback(callback: types.CallbackQuery):
+    """Отмена сессии — только её владельцем и только для активной сессии."""
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    try:
+        owner_user_id = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    callback_nonce = parts[2]
+
+    if callback.from_user.id != owner_user_id:
+        await callback.answer(
+            "❌ Только автор запроса может отменить операцию.",
+            show_alert=True
+        )
+        return
+
+    session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
+    session = sessions.get(session_key)
+
+    # Проверка nonce — кнопка принадлежит текущей сессии?
+    if session is None or session.get("nonce") != callback_nonce:
+        # Сессия уже завершена/отменена или кнопка от предыдущей сессии
+        await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
+        try:
+            await callback.message.edit_text("❌ Сессия уже неактивна.")
+        except Exception:
+            pass
+        await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
+        return
+
+    # ✅ Снимаем блокировку (если ещё висит) и удаляем сессию
+    await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
+    sessions.pop(session_key, None)
+
+    try:
+        await callback.message.edit_text("❌ Операция отменена.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+# ==========================================
+# 15. /cancel_yd — команда отмены
+# ==========================================
+
+@router.message(Command("cancel_yd"))
+async def cmd_cancel_yd(message: types.Message, check_access):
+    if not await check_access(message):
+        return
+
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    session = sessions.get(session_key)
+
+    # Освобождаем блокировку (если активна)
+    released = await yd_release(message.from_user.id, message.chat.id)
+
+    if session is None and released:
+        await message.reply("ℹ️ У вас нет активной сессии Яндекс.Диска.")
+        return
+
+    # Удаляем сессию (если была)
+    sessions.pop(session_key, None)
+
+    await message.reply("✅ Сессия Яндекс.Диска сброшена.")
