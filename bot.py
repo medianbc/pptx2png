@@ -300,17 +300,25 @@ def create_bot_and_dispatcher(bot_token: str, admin_id: int, shm_dir: Path, scri
 async def main():
     logging.info("🚀 Запуск PPTX2PNG Telegram Bot...")
 
-    script_dir, env_name, bot_token, admin_id, shm_dir, log_dir = setup_environment()
-    setup_logging(log_dir)
+    (script_dir, env_name, bot_token, admin_id, shm_dir, log_dir,
+     yandex_token, yandex_base_path, yandex_source_folder,
+     yandex_target_folder, yandex_pptx2png_folder,
+     yandex_sermon_folder, yandex_sermon_keyword,
+     yandex_template_file) = setup_environment()
 
+    setup_logging(log_dir)
     logging.info(f"📁 Окружение: {env_name}")
     logging.info(f"💾 RAM-диск: {shm_dir}")
     logging.info(f"📄 Логи: {log_dir}")
 
-    # ✅ Стартовая очистка УДАЛЕНА — теперь только периодическая.
-    # Это предотвращает удаление задач, обрабатываемых другим экземпляром.
+    cleanup_all_tasks(shm_dir)
 
-    bot, dp, user_mgr, http_session = create_bot_and_dispatcher(bot_token, admin_id, shm_dir, script_dir)
+    bot, dp, user_mgr, http_session = create_bot_and_dispatcher(
+        bot_token, admin_id, shm_dir, script_dir,
+        yandex_token, yandex_base_path, yandex_source_folder,
+        yandex_target_folder, yandex_pptx2png_folder,
+        yandex_sermon_folder, yandex_sermon_keyword, yandex_template_file,
+    )
 
     # ✅ Фоновый процесс очистки старых задач (каждые 5 минут, порог 2 часа)
     asyncio.create_task(cleanup_loop(shm_dir, interval=300, max_age=7200))
