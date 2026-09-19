@@ -1821,7 +1821,13 @@ async def yd_sermon_ok(callback: types.CallbackQuery, bot: Bot):
     idx = int(parts[2])
     pending["prepared"][idx]["confirmed"] = True
 
-    await callback.answer("✅ Диапазон подтверждён")
+    # ✅ К3: callback.answer в guarded-блоке
+    try:
+        await callback.answer("✅ Диапазон подтверждён")
+    except Exception as e:
+        logging.error(f"yd_sermon_ok: answer failed для {task_id}: {e}", exc_info=True)
+        # answer упал — состояние уже зафиксировано, продолжаем без уведомления
+        pass
 
     remaining = [
         p for p in pending["prepared"]
@@ -1860,7 +1866,12 @@ async def yd_sermon_skip(callback: types.CallbackQuery, bot: Bot):
     pending["prepared"][idx]["ranges"] = None
     pending["prepared"][idx]["confirmed"] = True
 
-    await callback.answer("⏭ Пропущено")
+    # ✅ К3: callback.answer в guarded-блоке
+    try:
+        await callback.answer("⏭ Пропущено")
+    except Exception as e:
+        logging.error(f"yd_sermon_skip: answer failed для {task_id}: {e}", exc_info=True)
+        pass
 
     remaining = [
         p for p in pending["prepared"]
@@ -1895,17 +1906,17 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
     idx = int(parts[2])
 
-    # ✅ К11(race): nonce заранее, но НЕ публикуем до edit_text
+    # ✅ К11(race): nonce заранее, но не публикуем до edit_text
     manual_nonce = secrets.token_hex(8)
 
     current = pending["prepared"][idx]
     total_slides = len(current["pngs_sorted"])
     file_name_esc = html_module.escape(current["file_name"])
 
-    await callback.answer()
-
-    # ✅ К2: оборачиваем edit_text — при ошибке Telegram чистим задачу
+    # ✅ К3: callback.answer() и edit_text в одном guarded-блоке
+    sent_msg = None
     try:
+        await callback.answer()
         sent_msg = await callback.message.edit_text(
             f"✏️ <b>Введите диапазон проповеди</b>\n\n"
             f"📄 Файл: <code>{file_name_esc}</code>\n"
@@ -1917,9 +1928,10 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         )
     except Exception as e:
         logging.error(
-            f"yd_sermon_edit: edit_text failed for {task_id}: {e}",
+            f"yd_sermon_edit: callback.answer или edit_text упал для {task_id}: {e}",
             exc_info=True,
         )
+        # ✅ К3: чистим задачу — иначе она останется без промпта и watchdog'а
         await _yd_cleanup_task(
             task_id,
             pending.get("session_key"),
@@ -1928,13 +1940,17 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             pending.get("chat_id"),
             pending.get("nonce"),
             bot=bot,
-            status_msg=callback.message,
-            error=e,
+            status_msg=None,   # edit_text мог упасть → не пытаемся редактировать
+            error=None,         # сообщение покажем отдельно, best-effort
         )
+        # ✅ К3: уведомляем пользователя — best-effort новым сообщением
         try:
-            await callback.answer(
-                "❌ Не удалось показать форму ввода. Задача сброшена.",
-                show_alert=True,
+            await bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=(
+                    "❌ Не удалось показать форму ввода (кнопка устарела "
+                    "или Telegram недоступен). Задача сброшена."
+                ),
             )
         except Exception:
             pass
