@@ -451,7 +451,13 @@ async def run_conversion(
                     temp_png_dir.mkdir(exist_ok=True)
                     touch_task(ctx.task_dir)
 
-                    all_pngs = await convert_all_pngs(pptx_path, temp_png_dir, cfg["quality"])
+                    all_pngs, _ = await convert_all_pngs(pptx_path, temp_png_dir, cfg["quality"])
+                    # также в конце удалить временный .pptx
+                    if _ != pptx_path and _.exists():
+                        try:
+                            _.unlink()
+                        except Exception:
+                            pass
                     if not all_pngs:
                         await callback.message.edit_text("❌ Не удалось конвертировать слайды в PNG.")
                         return
@@ -543,8 +549,12 @@ async def run_conversion(
 # КОНВЕРТАЦИЯ В PNG
 # ==========================================
 
-async def convert_all_pngs(pptx_path: Path, output_dir: Path, quality: str) -> List[Path]:
-    """Конвертирует PPTX → PNG в фоновом потоке."""
+async def convert_all_pngs(pptx_path: Path, output_dir: Path, quality: str) -> Tuple[List[Path], Path]:
+    """
+    Конвертирует PPTX → PNG.
+    Возвращает (список PNG, путь к .pptx, использованному для рендера).
+    Для .ppt — путь к временно сконвертированному .pptx (уже удалён).
+    """
     def _sync_convert():
         if pptx_path.suffix.lower() == '.ppt':
             pptx_converted = converter_engine.ppt_to_pptx_crossplatform(pptx_path, output_dir)
@@ -561,12 +571,13 @@ async def convert_all_pngs(pptx_path: Path, output_dir: Path, quality: str) -> L
             pdf_path.unlink()
         if temp_dark_pptx.exists():
             temp_dark_pptx.unlink()
-        if pptx_converted != pptx_path and pptx_converted.exists():
-            pptx_converted.unlink()
+        # ❌ НЕ удаляем pptx_converted здесь — он нам ещё нужен для заметок
+        # если это .ppt — удалим после заметок
 
-        return png_paths
+        return png_paths, pptx_converted
 
-    return await asyncio.to_thread(_sync_convert)
+    pngs, used_pptx = await asyncio.to_thread(_sync_convert)
+    return pngs, used_pptx
 
 
 # ==========================================
@@ -1683,10 +1694,10 @@ async def _yd_process_files(
             )
             return
 
-        # Создаём структуру папок в Трансляция/
-        await status_msg.edit_text("📁 Создаю структуру папок в Трансляция/...")
-        target_base = paths["target"]
-        ok = await create_structure(yandex_client, target_base, structure)
+        # ✅ Создаём структуру в папке даты — template.yaml содержит Служение и Трансляция
+        await status_msg.edit_text("📁 Создаю структуру папок...")
+        structure_base = paths["date_folder"]
+        ok = await create_structure(yandex_client, structure_base, structure)
         if not ok:
             await status_msg.edit_text(
                 "❌ <b>Не удалось создать структуру папок</b>\n\n"
@@ -1694,6 +1705,9 @@ async def _yd_process_files(
                 parse_mode="HTML"
             )
             return
+
+        # Дальше target_base используется только для upload-путей
+        target_base = paths["target"]
 
         total_uploaded = 0
         total_failed = 0
@@ -1723,7 +1737,7 @@ async def _yd_process_files(
             temp_png_dir.mkdir(exist_ok=True)
 
             try:
-                pngs = await convert_all_pngs(
+                pngs, used_pptx = await convert_all_pngs(
                     local_pptx, temp_png_dir,
                     user_mgr.get_user_config(owner_user_id)["quality"]
                 )
@@ -1741,9 +1755,9 @@ async def _yd_process_files(
             pngs_sorted = sorted(pngs, key=lambda p: p.name)
             total_slides = len(pngs_sorted)
 
-            # Извлекаем заметки
+            # ✅ Извлекаем заметки из .pptx (для .ppt — из временного .pptx)
             notes_ok, notes, incomplete = await asyncio.to_thread(
-                extract_speaker_notes, str(local_pptx)
+                extract_speaker_notes, str(used_pptx)
             )
             if not notes_ok:
                 notes = {}
@@ -1751,16 +1765,30 @@ async def _yd_process_files(
             elif incomplete:
                 logging.warning(f"Заметки {file_name} извлечены частично")
 
-            # ✅ Ищем проповедь — с учётом количества совпадений (баг #3)
-            start, end, matches = find_sermon_range(notes, yandex_sermon_keyword)
-
-            # ✅ Баг #3: если 1 совпадение — считаем, что проповеди нет (нужен ручной ввод)
-            if matches and len(matches) == 1:
-                logging.warning(
-                    f"{file_name}: найдено только 1 совпадение «проповедь» "
-                    f"(слайд {matches[0]}). Требуется ручной ввод диапазона."
+            # ✅ Не доверяем автоопределению при incomplete (баг #7 нового ревью)
+            if incomplete:
+                start, end, matches = None, None, []
+                incomplete_warning = (
+                    "⚠️ Заметки прочитаны частично, "
+                    "проповедь не определена автоматически."
                 )
-                start, end = None, None  # ← не файлим как проповедь
+            else:
+                start, end, matches = find_sermon_range(notes, yandex_sermon_keyword)
+                # Баг #3: 1 совпадение — не считаем проповедью (нужен ручной ввод)
+                if matches and len(matches) == 1:
+                    logging.warning(
+                        f"{file_name}: одно совпадение «проповедь» — "
+                        f"требуется ручной ввод диапазона."
+                    )
+                    start, end = None, None
+                incomplete_warning = None
+
+            # Удаляем временный .pptx после извлечения заметок
+            if used_pptx != local_pptx and used_pptx.exists():
+                try:
+                    used_pptx.unlink()
+                except Exception:
+                    pass
 
             await status_msg.edit_text(
                 f"📤 Загружаю PNG на Яндекс.Диск ({file_name_esc})...",
@@ -1837,11 +1865,14 @@ async def _yd_process_files(
                     + (f", {failed_other} ошибок" if failed_other else "")
                 )
 
-            report_lines.append(
+            entry = (
                 f"{f_idx}. 📄 <b>{file_name_esc}</b>\n"
                 f"   • {sermon_info}\n"
                 f"   • {other_info}"
             )
+            if incomplete_warning:
+                entry += f"\n   • {incomplete_warning}"
+            report_lines.append(entry)
 
             # Удаляем локальный pptx
             try:

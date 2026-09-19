@@ -20,7 +20,10 @@ def find_sermon_range(
     """
     if not notes:
         return None, None, []
-
+    if not keyword or not keyword.strip():
+        logging.error("find_sermon_range: пустой keyword — пропускаем поиск")
+        return None, None, []
+        
     keyword_lower = keyword.lower()
     matches = []
 
