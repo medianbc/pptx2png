@@ -13,6 +13,44 @@ from yandex_disk import YandexDiskClient, YandexDiskError
 
 
 # ==========================================
+# ВАЛИДАЦИЯ СТРУКТУРЫ
+# ==========================================
+
+def _validate_structure(node: Any, path: str = "structure") -> bool:
+    """
+    Рекурсивно проверяет структуру: dict[str, dict | None].
+    Возвращает True, если структура корректна.
+    """
+    if not isinstance(node, dict):
+        logging.error(
+            f"Ошибка в template.yaml: '{path}' должен быть словарём, "
+            f"получено {type(node).__name__}"
+        )
+        return False
+
+    for key, value in node.items():
+        if not isinstance(key, str):
+            logging.error(
+                f"Ошибка в template.yaml: ключ '{key}' в '{path}' должен быть строкой"
+            )
+            return False
+
+        if value is None:
+            continue
+
+        if isinstance(value, dict):
+            if not _validate_structure(value, f"{path}.{key}"):
+                return False
+        else:
+            logging.error(
+                f"Ошибка в template.yaml: значение '{path}.{key}' "
+                f"должно быть словарём или пустым, получено {type(value).__name__}"
+            )
+            return False
+    return True
+
+
+# ==========================================
 # ЗАГРУЗКА ШАБЛОНА
 # ==========================================
 
@@ -39,7 +77,14 @@ def load_template(path: Path) -> Optional[Dict[str, Any]]:
         logging.error(f"Неверный формат template.yaml: нет ключа 'structure'")
         return None
 
-    return data["structure"]
+    structure = data["structure"]
+
+    # ✅ Проверяем, что structure — словарь и все вложенные значения корректны
+    if not _validate_structure(structure):
+        logging.error("Неверная структура template.yaml — см. логи выше")
+        return None
+
+    return structure
 
 
 # ==========================================
@@ -58,18 +103,48 @@ async def create_structure(
     if not structure:
         return True
 
+    # ✅ Защита от невалидного входа
+    if not isinstance(structure, dict):
+        logging.error(
+            f"create_structure: structure должен быть словарём, "
+            f"получено {type(structure).__name__}"
+        )
+        return False
+
     async def _create_recursive(parent_path: str, node: Dict[str, Any]) -> bool:
+        if not isinstance(node, dict):
+            logging.error(
+                f"create_structure: узел '{parent_path}' должен быть словарём, "
+                f"получено {type(node).__name__}"
+            )
+            return False
+
         for name, children in node.items():
+            if not isinstance(name, str):
+                logging.error(
+                    f"create_structure: имя папки должно быть строкой, "
+                    f"получено {type(name).__name__}"
+                )
+                return False
+
             folder_path = f"{parent_path}/{name}"
             try:
                 ok = await client.ensure_folder(folder_path)
                 if not ok:
                     logging.error(f"Не удалось создать папку: {folder_path}")
                     return False
-                # Рекурсия в подпапки (если есть)
+
+                if children is None:
+                    continue
                 if isinstance(children, dict) and children:
                     if not await _create_recursive(folder_path, children):
                         return False
+                elif not isinstance(children, dict):
+                    logging.error(
+                        f"create_structure: '{folder_path}' содержит невалидное "
+                        f"значение {type(children).__name__}"
+                    )
+                    return False
             except YandexDiskError as e:
                 logging.error(f"Ошибка API при создании {folder_path}: {e}")
                 return False
