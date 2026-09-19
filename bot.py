@@ -164,7 +164,7 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     deleted = 0
 
     for item in shm_dir.iterdir():
-        if not item.is_dir() or not item.name.startswith("task_"):
+        if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
             continue
         task_id = item.name
         if await task_lock_manager.is_active(task_id):
