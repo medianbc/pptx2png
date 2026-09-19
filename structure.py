@@ -16,11 +16,14 @@ from yandex_disk import YandexDiskClient, YandexDiskError
 # ВАЛИДАЦИЯ СТРУКТУРЫ
 # ==========================================
 
-def _validate_structure(node: Any, path: str = "structure") -> bool:
+def _validate_structure(node: Any, path: str = "structure", visited: Optional[set] = None) -> bool:
     """
     Рекурсивно проверяет структуру: dict[str, dict | None].
-    Возвращает True, если структура корректна.
+    Защита от циклических ссылок (YAML anchors).
     """
+    if visited is None:
+        visited = set()
+
     if not isinstance(node, dict):
         logging.error(
             f"Ошибка в template.yaml: '{path}' должен быть словарём, "
@@ -28,26 +31,38 @@ def _validate_structure(node: Any, path: str = "structure") -> bool:
         )
         return False
 
-    for key, value in node.items():
-        if not isinstance(key, str):
-            logging.error(
-                f"Ошибка в template.yaml: ключ '{key}' в '{path}' должен быть строкой"
-            )
-            return False
+    # ✅ Защита от рекурсии
+    node_id = id(node)
+    if node_id in visited:
+        logging.error(
+            f"Ошибка в template.yaml: обнаружена циклическая ссылка в '{path}'"
+        )
+        return False
+    visited.add(node_id)
 
-        if value is None:
-            continue
-
-        if isinstance(value, dict):
-            if not _validate_structure(value, f"{path}.{key}"):
+    try:
+        for key, value in node.items():
+            if not isinstance(key, str):
+                logging.error(
+                    f"Ошибка в template.yaml: ключ '{key}' в '{path}' должен быть строкой"
+                )
                 return False
-        else:
-            logging.error(
-                f"Ошибка в template.yaml: значение '{path}.{key}' "
-                f"должно быть словарём или пустым, получено {type(value).__name__}"
-            )
-            return False
-    return True
+
+            if value is None:
+                continue
+
+            if isinstance(value, dict):
+                if not _validate_structure(value, f"{path}.{key}", visited):
+                    return False
+            else:
+                logging.error(
+                    f"Ошибка в template.yaml: значение '{path}.{key}' "
+                    f"должно быть словарём или пустым, получено {type(value).__name__}"
+                )
+                return False
+        return True
+    finally:
+        visited.discard(node_id)
 
 
 # ==========================================
