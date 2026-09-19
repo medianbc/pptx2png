@@ -1913,26 +1913,59 @@ async def _yd_process_files(
         if current_chunk:
             chunks.append("\n".join(current_chunk))
 
-        # Первая часть — редактируем status_msg
-        try:
-            await status_msg.edit_text(
-                chunks[0],
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logging.error(f"Ошибка отправки первой части отчёта: {e}")
-            # Fallback — короткое сообщение
+        # ✅ Счётчики доставки
+        delivered = 0
+        failed_chunks = []
+
+        # Первая часть — пытаемся редактировать status_msg
+        first_delivered = False
+        if chunks:
+            try:
+                await status_msg.edit_text(
+                    chunks[0],
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                delivered += 1
+                first_delivered = True
+            except Exception as e:
+                logging.error(
+                    f"Ошибка edit_text для первой части отчёта: {e}",
+                    exc_info=True,
+                )
+                # ✅ Пробуем отправить ПЕРВЫЙ chunk как новое сообщение
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=chunks[0],
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    delivered += 1
+                    first_delivered = True
+                except Exception as e2:
+                    logging.error(
+                        f"Не удалось отправить первую часть отчёта как новое сообщение: {e2}",
+                        exc_info=True,
+                    )
+                    failed_chunks.append(1)
+
+        # Если первая часть не ушла — пробуем короткий fallback,
+        # но НЕ считаем его полноценным отчётом
+        if not first_delivered:
             try:
                 fallback = (
-                    f"✅ Обработка завершена.\n"
+                    f"⚠️ Не удалось показать полный отчёт.\n"
                     f"📊 Загружено PNG: {total_uploaded}"
                 )
                 if total_failed:
                     fallback += f"\n❌ Ошибок: {total_failed}"
-                await status_msg.edit_text(fallback)
-            except Exception:
-                pass
+                await bot.send_message(chat_id=chat_id, text=fallback)
+            except Exception as e:
+                logging.error(
+                    f"Не удалось отправить fallback-сообщение: {e}",
+                    exc_info=True,
+                )
 
         # Остальные части — новыми сообщениями
         for i, chunk in enumerate(chunks[1:], start=2):
@@ -1943,8 +1976,27 @@ async def _yd_process_files(
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
+                delivered += 1
             except Exception as e:
-                logging.error(f"Ошибка отправки части {i} отчёта: {e}")
+                logging.error(
+                    f"Ошибка отправки части {i} отчёта: {e}",
+                    exc_info=True,
+                )
+                failed_chunks.append(i)
+
+        # ✅ Если какие-то части не ушли — явно предупредим пользователя
+        if failed_chunks and delivered > 0:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ Не удалось доставить {len(failed_chunks)} "
+                        f"из {len(chunks)} частей отчёта. "
+                        f"Проверьте Яндекс.Диск напрямую."
+                    ),
+                )
+            except Exception:
+                pass
 
     finally:
         # ✅ Баг #8: гарантированное удаление task_dir
@@ -1967,4 +2019,3 @@ async def _yd_process_files(
 
         # ✅ Освобождаем блокировку (тоже nonce-safe)
         await yd_release(owner_user_id, chat_id, nonce)
-
