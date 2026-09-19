@@ -1,9 +1,9 @@
 # ==========================================
-# handlers.py — ОБРАБОТЧИКИ (v1.4, исправленная версия)
+# handlers.py — ОБРАБОТЧИКИ (v1.5, исправленная версия)
 # ==========================================
 
 import os
-import re  # ✅ М2: вынесен наверх
+import re
 import shutil
 import logging
 import secrets
@@ -57,7 +57,6 @@ yandex_sermon_folder: str = "проповедь - png"
 yandex_sermon_keyword: str = "проповед"
 yandex_template_file: str = "template.yaml"
 
-# Таймаут ожидания ответа пользователя на промпт (в секундах)
 YD_PROMPT_TIMEOUT_SEC = 600  # 10 минут
 
 
@@ -67,6 +66,9 @@ YD_PROMPT_TIMEOUT_SEC = 600  # 10 минут
 
 yd_session_lock = asyncio.Lock()
 yd_active_sessions: Dict[str, str] = {}
+
+# ✅ К11: реестр активных Яндекс-задач (защита от cleaner)
+yd_active_tasks: Set[str] = set()
 
 
 def yd_session_key(user_id: int, chat_id: int) -> str:
@@ -160,7 +162,6 @@ task_lock_manager = TaskLockManager()
 # ==========================================
 
 def safe_filename(filename: str) -> str:
-    # ✅ М2: re импортирован в начале модуля
     safe_name = os.path.basename(filename)
     safe_name = re.sub(r'[^\w\s.-]', '', safe_name)
     safe_name = re.sub(r'\s+', ' ', safe_name).strip()
@@ -185,7 +186,6 @@ def generate_task_id(chat_id: int, user_id: int, message_id: int) -> str:
 
 
 def parse_slides_ranges(input_text: str) -> List[Tuple[int, int]]:
-    # ✅ М1: явная проверка пустого ввода
     if not input_text or not input_text.strip():
         return []
     ranges = []
@@ -339,7 +339,6 @@ class TaskContext:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.lock_acquired:
             await task_lock_manager.release(self.task_id)
-        # ✅ С4: удаляем только наши task_* сессии (yd_* не трогаем)
         if self.task_id.startswith("task_"):
             sessions.pop(self.task_id, None)
         safe_delete_task_dir(self.task_dir)
@@ -751,7 +750,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
     if not await check_access(message):
         return
 
-    # ✅ С2: матчим по bot-authored reply
     candidates = []
     for tid, sess in sessions.items():
         pending = sess.get("pending")
@@ -767,7 +765,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
     target = None
     if message.reply_to_message is not None and message.reply_to_message.from_user.is_bot:
-        # ✅ С2: reply должен быть на bot-сообщение
         reply_to_id = message.reply_to_message.message_id
         for tid, sess, pending in candidates:
             if pending.get("prompt_message_id") == reply_to_id:
@@ -784,7 +781,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
     if target is not None:
         tid, sess, pending = target
 
-        # ✅ С6: проверяем отмену
         if sess.get("cancelled"):
             await message.reply("❌ Задача была отменена.")
             return
@@ -793,8 +789,9 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         current = pending["prepared"][idx]
         total_slides = len(current["pngs_sorted"])
 
-        # ✅ С1: обработка "отмена"/"0" как Skip
         text_clean = message.text.strip().lower()
+
+        # ✅ С1: обработка "отмена"/"0" как Skip
         if text_clean in ("отмена", "cancel", "0"):
             current["start"] = None
             current["end"] = None
@@ -802,7 +799,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             current["confirmed"] = True
             pending.pop("awaiting_range_for_idx", None)
 
-            # ✅ К2: отменяем watchdog
+            # ✅ К2/К13: отменяем watchdog и обнуляем промпт
             timeout_task = pending.get("prompt_timeout_task")
             if timeout_task is not None and not timeout_task.done():
                 timeout_task.cancel()
@@ -841,6 +838,14 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         ranges = parse_slides_ranges(message.text.strip())
         if not ranges:
+            # ✅ К13: перезапускаем watchdog, даём шанс исправиться
+            old_timeout = pending.get("prompt_timeout_task")
+            if old_timeout is not None and not old_timeout.done():
+                old_timeout.cancel()
+            if pending.get("prompt_nonce") is not None:
+                pending["prompt_timeout_task"] = asyncio.create_task(
+                    _yd_prompt_timeout_watchdog(tid, YD_PROMPT_TIMEOUT_SEC, pending["prompt_nonce"])
+                )
             await message.reply(
                 "❌ **Неверный формат.** Пример: `5-30` или `5,7,10-15`"
             )
@@ -870,7 +875,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         current["confirmed"] = True
         pending.pop("awaiting_range_for_idx", None)
 
-        # ✅ К2: отменяем watchdog и обнуляем промпт
+        # ✅ К2/К13: отменяем watchdog и обнуляем промпт
         timeout_task = pending.get("prompt_timeout_task")
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
@@ -1540,7 +1545,7 @@ async def cmd_sunday(message: types.Message, check_access):
 
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
-        # ✅ К5: перед перезаписью помечаем старые задачи отменёнными
+        # ✅ К5: помечаем старые задачи отменёнными + сохраняем сессию под локом
         async with yd_session_lock:
             old_picker = sessions.get(session_key)
             if old_picker is not None:
@@ -1716,20 +1721,27 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
 
     session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
 
+    # ✅ К1: читаем состояние под локом, НЕ вызываем yd_release внутри
+    is_stale = False
     task_ids_to_cancel = []
     async with yd_session_lock:
         session = sessions.get(session_key)
         if session is None or session.get("nonce") != callback_nonce:
-            await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
-            try:
-                await callback.message.edit_text("❌ Сессия уже неактивна.")
-            except Exception:
-                pass
-            await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
-            return
-        session["cancelled"] = True
-        task_ids_to_cancel = list(session.get("task_ids", []))
-        sessions.pop(session_key, None)
+            is_stale = True
+        else:
+            session["cancelled"] = True
+            task_ids_to_cancel = list(session.get("task_ids", []))
+            sessions.pop(session_key, None)
+
+    # ✅ К1: yd_release и message-операции — вне лока
+    if is_stale:
+        await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
+        try:
+            await callback.message.edit_text("❌ Сессия уже неактивна.")
+        except Exception:
+            pass
+        await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
+        return
 
     for tid in task_ids_to_cancel:
         async with yd_session_lock:
@@ -1758,6 +1770,7 @@ async def cmd_cancel_yd(message: types.Message, check_access):
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
     task_ids_to_cancel = []
+    session = None
     async with yd_session_lock:
         session = sessions.get(session_key)
         if session is not None:
@@ -1880,6 +1893,11 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     idx = int(parts[2])
     pending["awaiting_range_for_idx"] = idx
 
+    # ✅ К13: новый nonce + prompt_idx для режима ручного ввода
+    pending["prompt_nonce"] = secrets.token_hex(8)
+    manual_nonce = pending["prompt_nonce"]
+    pending["prompt_idx"] = idx
+
     current = pending["prepared"][idx]
     total_slides = len(current["pngs_sorted"])
     file_name_esc = html_module.escape(current["file_name"])
@@ -1897,6 +1915,11 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     )
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
+
+    # ✅ К13: watchdog для режима ручного ввода
+    pending["prompt_timeout_task"] = asyncio.create_task(
+        _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, manual_nonce)
+    )
 
 
 # ==========================================
@@ -1963,12 +1986,10 @@ async def _yd_render_sermon_prompt(
         return
     pending = session["pending"]
 
-    # ✅ М3: один вызов .index()
     idx = pending["prepared"].index(item)
     pending["current_confirm_idx"] = idx
     pending["prompt_idx"] = idx
 
-    # ✅ К6: если nonce ещё активен — используем его, иначе создаём новый
     if pending.get("prompt_nonce") is None:
         pending["prompt_nonce"] = secrets.token_hex(8)
     prompt_nonce = pending["prompt_nonce"]
@@ -2017,7 +2038,6 @@ async def _yd_render_sermon_prompt(
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
 
-    # ✅ К3/К6: watchdog — только если его нет
     if pending.get("prompt_timeout_task") is None or pending["prompt_timeout_task"].done():
         pending["prompt_timeout_task"] = asyncio.create_task(
             _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
@@ -2025,7 +2045,6 @@ async def _yd_render_sermon_prompt(
 
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
-    # ✅ К3: watchdog проверяет свой nonce
     try:
         await asyncio.sleep(timeout_sec)
         session = sessions.get(task_id)
@@ -2075,7 +2094,7 @@ async def _yd_cleanup_task(
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
 
-    # ✅ К1/К4: убираем task_id из task_ids и сбрасываем processing
+    # 3. Сессии + реестр активных yd-задач
     async with yd_session_lock:
         picker = sessions.get(session_key)
         if picker is not None:
@@ -2084,12 +2103,14 @@ async def _yd_cleanup_task(
             if isinstance(task_ids, list) and task_id in task_ids:
                 task_ids.remove(task_id)
 
-        # Nonce-safe удаление всей picker-сессии
         current = sessions.get(session_key)
         if current is not None and current.get("nonce") == nonce:
             sessions.pop(session_key, None)
 
         sessions.pop(task_id, None)
+
+        # ✅ К11: снимаем регистрацию активной задачи
+        yd_active_tasks.discard(task_id)
 
     await yd_release(owner_user_id, chat_id, nonce)
 
@@ -2137,23 +2158,40 @@ async def _yd_prepare_files(
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
+    # ✅ К2: создаём минимальную task-сессию СРАЗУ + регистрируем в picker
     async with yd_session_lock:
         picker = sessions.get(session_key)
         if picker is None:
-            await status_msg.edit_text("❌ Сессия была отменена.")
             safe_delete_task_dir(task_dir)
+            try:
+                await status_msg.edit_text("❌ Сессия была отменена.")
+            except Exception:
+                pass
             return
         picker.setdefault("task_ids", []).append(task_id)
+        sessions[task_id] = {
+            "user_id": owner_user_id,
+            "chat_id": chat_id,
+            "pending": None,
+            "nonce": nonce,
+            "created_at": time.time(),
+            "cancelled": False,
+        }
+        # ✅ К11: регистрируем активную задачу
+        yd_active_tasks.add(task_id)
 
     try:
         template_path = Path(__file__).parent / yandex_template_file
         structure = load_template(template_path)
         if structure is None:
-            await status_msg.edit_text(
-                f"❌ <b>Ошибка загрузки template.yaml</b>\n\n"
-                f"Файл: <code>{html_module.escape(str(template_path))}</code>",
-                parse_mode="HTML"
-            )
+            try:
+                await status_msg.edit_text(
+                    f"❌ <b>Ошибка загрузки template.yaml</b>\n\n"
+                    f"Файл: <code>{html_module.escape(str(template_path))}</code>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
@@ -2161,15 +2199,21 @@ async def _yd_prepare_files(
             )
             return
 
-        await status_msg.edit_text("📁 Создаю структуру папок...")
+        try:
+            await status_msg.edit_text("📁 Создаю структуру папок...")
+        except Exception:
+            pass
         structure_base = paths["date_folder"]
         ok = await create_structure(yandex_client, structure_base, structure)
         if not ok:
-            await status_msg.edit_text(
-                "❌ <b>Не удалось создать структуру папок</b>\n\n"
-                "Проверьте права на Яндекс.Диске.",
-                parse_mode="HTML"
-            )
+            try:
+                await status_msg.edit_text(
+                    "❌ <b>Не удалось создать структуру папок</b>\n\n"
+                    "Проверьте права на Яндекс.Диске.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
@@ -2179,24 +2223,35 @@ async def _yd_prepare_files(
 
         target_base = paths["target"]
 
-        # ✅ С3: get_user_config один раз за подготовку
+        # ✅ С3: get_user_config один раз
         quality = user_mgr.get_user_config(owner_user_id)["quality"]
 
         prepared = []
 
         for f_idx, pptx_item in enumerate(files_to_process, start=1):
+            # ✅ К2/К11: touch перед проверкой
+            touch_task(task_dir)
+
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
                 logging.info(f"Задача {task_id} отменена — прерываем подготовку")
+                await _yd_cleanup_task(
+                    task_id, session_key, task_dir,
+                    owner_user_id, chat_id, nonce,
+                    bot=None, status_msg=None, error=None,
+                )
                 return
 
             file_name = pptx_item["name"]
             file_name_esc = html_module.escape(file_name)
 
-            await status_msg.edit_text(
-                f"📥 Скачиваю <code>{file_name_esc}</code>...",
-                parse_mode="HTML"
-            )
+            try:
+                await status_msg.edit_text(
+                    f"📥 Скачиваю <code>{file_name_esc}</code>...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
             local_pptx = task_dir / file_name
             ok = await yandex_client.download_file(pptx_item["path"], local_pptx)
@@ -2208,10 +2263,13 @@ async def _yd_prepare_files(
                 })
                 continue
 
-            await status_msg.edit_text(
-                f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
-                parse_mode="HTML"
-            )
+            try:
+                await status_msg.edit_text(
+                    f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
             temp_png_dir = task_dir / f"png_{f_idx}"
             temp_png_dir.mkdir(exist_ok=True)
 
@@ -2275,39 +2333,41 @@ async def _yd_prepare_files(
                 "confirmed": start is None,
             })
 
+        # ✅ К12: определяем cleanup_needed под локом, cleanup — вне лока
+        cleanup_needed = False
         async with yd_session_lock:
             picker = sessions.get(session_key)
             if picker is None or picker.get("cancelled"):
-                logging.info(f"Задача {task_id} отменена до сохранения pending")
-                await _yd_cleanup_task(
-                    task_id, session_key, task_dir,
-                    owner_user_id, chat_id, nonce,
-                    bot=None, status_msg=None, error=None,
-                )
-                return
+                cleanup_needed = True
+            else:
+                task_sess = sessions.get(task_id)
+                if task_sess is None or task_sess.get("cancelled"):
+                    cleanup_needed = True
+                else:
+                    pending = {
+                        "task_dir": task_dir,
+                        "target_base": target_base,
+                        "prepared": prepared,
+                        "owner_user_id": owner_user_id,
+                        "chat_id": chat_id,
+                        "session_key": session_key,
+                        "nonce": nonce,
+                        "bot": bot,
+                        "prompt_nonce": None,
+                        "prompt_idx": None,
+                        "prompt_message_id": None,
+                        "prompt_timeout_task": None,
+                    }
+                    task_sess["pending"] = pending
 
-            pending = {
-                "task_dir": task_dir,
-                "target_base": target_base,
-                "prepared": prepared,
-                "owner_user_id": owner_user_id,
-                "chat_id": chat_id,
-                "session_key": session_key,
-                "nonce": nonce,
-                "bot": bot,
-                "prompt_nonce": None,
-                "prompt_idx": None,
-                "prompt_message_id": None,
-                "prompt_timeout_task": None,
-            }
-            sessions[task_id] = {
-                "user_id": owner_user_id,
-                "chat_id": chat_id,
-                "pending": pending,
-                "nonce": nonce,
-                "created_at": time.time(),
-                "cancelled": False,
-            }
+        if cleanup_needed:
+            logging.info(f"Задача {task_id} отменена до сохранения pending")
+            await _yd_cleanup_task(
+                task_id, session_key, task_dir,
+                owner_user_id, chat_id, nonce,
+                bot=None, status_msg=None, error=None,
+            )
+            return
 
         needs_confirm = [
             p for p in prepared
@@ -2362,6 +2422,13 @@ async def _yd_upload_files(
         return
     if session.get("cancelled"):
         logging.info(f"Задача {task_id} отменена — upload пропущен")
+        await _yd_cleanup_task(
+            task_id, session.get("pending", {}).get("session_key"),
+            session.get("pending", {}).get("task_dir"),
+            session.get("pending", {}).get("owner_user_id"),
+            session.get("pending", {}).get("chat_id"),
+            session.get("pending", {}).get("nonce"),
+        )
         return
     pending = session["pending"]
     prepared = pending["prepared"]
@@ -2372,7 +2439,6 @@ async def _yd_upload_files(
     session_key = pending["session_key"]
     nonce = pending["nonce"]
 
-    # ✅ М5: избегаем двойного cleanup через флаг
     cleanup_done = False
 
     try:
@@ -2381,6 +2447,9 @@ async def _yd_upload_files(
         report_lines = [f"📁 Обработано файлов: <b>{len(prepared)}</b>\n"]
 
         for f_idx, item in enumerate(prepared, start=1):
+            # ✅ К11: touch перед итерацией
+            touch_task(task_dir)
+
             current_session = sessions.get(task_id)
             if current_session is None or current_session.get("cancelled"):
                 logging.info(f"Задача {task_id} отменена — прерываем upload")
@@ -2431,6 +2500,9 @@ async def _yd_upload_files(
             failed_other = 0
 
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
+                # ✅ К11: touch перед загрузкой каждого слайда
+                touch_task(task_dir)
+
                 current_session = sessions.get(task_id)
                 if current_session is None or current_session.get("cancelled"):
                     logging.info(f"Задача {task_id} отменена в середине upload")
@@ -2530,7 +2602,6 @@ async def _yd_upload_files(
         )
         return
     finally:
-        # ✅ М5: cleanup только если не был вызван в except
         if not cleanup_done:
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,
@@ -2598,7 +2669,6 @@ async def _yd_send_report(
                 fallback += f"\n❌ Ошибок: {total_failed}"
             await bot.send_message(chat_id=chat_id, text=fallback)
         except Exception as e:
-            # ✅ С5: логируем ошибку fallback-сообщения
             logging.error(f"Не удалось отправить fallback-отчёт: {e}", exc_info=True)
 
     for i, chunk in enumerate(chunks[1:], start=2):
