@@ -156,19 +156,35 @@ def setup_logging(log_dir: str):
 async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     """
     Удаляет старые НЕактивные папки задач.
-    Активные задачи (захваченные task_lock_manager) не удаляются.
+    Активные задачи (task_lock_manager + yd_active_tasks) не удаляются.
     """
     if not shm_dir.exists():
         return
+
+    # ✅ К11: импортируем реестр Яндекс-задач
+    from handlers import yd_active_tasks, yd_session_lock
+
     current_time = time.time()
     deleted = 0
 
+    # ✅ К11: снимок активных yd-задач под локом
+    async with yd_session_lock:
+        active_yd = set(yd_active_tasks)
+
     for item in shm_dir.iterdir():
-        if not item.is_dir() or not item.name.startswith("task_"):
+        # ✅ К11: теперь обрабатываем и task_*, и yd_task_*
+        if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
             continue
         task_id = item.name
+
+        # Проверка обычных задач
         if await task_lock_manager.is_active(task_id):
             continue
+
+        # ✅ К11: проверка Яндекс-задач
+        if task_id in active_yd:
+            continue
+
         try:
             mtime = item.stat().st_mtime
             age_seconds = current_time - mtime
@@ -178,6 +194,7 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
                 logging.info(f"🧹 Удалена старая папка {item.name} ({age_seconds/60:.1f} мин)")
         except Exception as e:
             logging.error(f"Ошибка обработки {item}: {e}")
+
     if deleted:
         logging.info(f"🧹 Очищено {deleted} старых папок")
 
