@@ -276,29 +276,46 @@ async def core_pipeline(
 # ИЗВЛЕЧЕНИЕ ЗАМЕТОК ДОКЛАДЧИКА
 # ==========================================
 
-def extract_speaker_notes(file_path: str) -> Tuple[bool, Dict[int, str]]:
+# ==========================================
+# ИЗВЛЕЧЕНИЕ ЗАМЕТОК ДОКЛАДЧИКА
+# ==========================================
+
+def extract_speaker_notes(file_path: str) -> Tuple[bool, Dict[int, str], bool]:
     """
     Извлекает заметки докладчика из pptx.
-    
+
     :param file_path: Путь к .pptx
-    :return: (успех, {номер_слайда: текст_заметок})
+    :return: Кортеж (успех, {номер_слайда: текст_заметок}, incomplete)
+             - (True, notes, False) — всё извлечено успешно
+             - (True, notes, True)  — частично (часть слайдов не прочитана)
+             - (False, {}, False)   — критическая ошибка
     """
     try:
         prs = Presentation(file_path)
         notes = {}
+        incomplete = False
 
         for idx, slide in enumerate(prs.slides, start=1):
-            if slide.has_notes_slide:
-                try:
-                    text = slide.notes_slide.notes_text_frame.text or ""
-                    if text.strip():
-                        notes[idx] = text
-                except Exception as e:
-                    logging.warning(f"Не удалось прочитать заметки слайда {idx}: {e}")
+            if not slide.has_notes_slide:
+                continue
+            try:
+                text = slide.notes_slide.notes_text_frame.text or ""
+                if text.strip():
+                    notes[idx] = text
+            except Exception as e:
+                logging.warning(f"Не удалось прочитать заметки слайда {idx}: {e}")
+                incomplete = True
 
-        logging.info(f"Извлечены заметки для {len(notes)} слайдов из {file_path}")
-        return True, notes
+        if incomplete:
+            logging.warning(
+                f"Заметки извлечены частично ({len(notes)} слайдов), "
+                f"некоторые слайды не прочитаны"
+            )
+        else:
+            logging.info(f"Извлечены заметки для {len(notes)} слайдов из {file_path}")
+
+        return True, notes, incomplete
 
     except Exception as e:
         logging.error(f"Ошибка извлечения заметок: {e}", exc_info=True)
-        return False, {}
+        return False, {}, False
