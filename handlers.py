@@ -23,7 +23,11 @@ from utils import (
     download_file_by_url,
     download_yandex_disk,
     core_pipeline,
+    extract_speaker_notes,
 )
+from structure import load_template, create_structure, safe_folder_name
+from sermon_detector import find_sermon_range, format_sermon_message
+
 import converter_engine
 from converter_engine import make_dark_mode
 
@@ -1386,7 +1390,7 @@ async def cmd_sunday(message: types.Message, check_access):
             body_lines.append(f"…и ещё <b>{omitted}</b> файл(ов) не показано.")
 
         body_lines.append("")
-        body_lines.append("⚠️ Обработка файлов появится в следующем обновлении.")
+        body_lines.append("🎬 Выберите файл для обработки:")
 
         # 6. Сохраняем сессию — используем nonce из yd_try_acquire
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
@@ -1430,6 +1434,17 @@ async def cmd_sunday(message: types.Message, check_access):
         }
 
         kb = InlineKeyboardBuilder()
+        for idx, f in enumerate(pptx_files):
+            prefix = "🎯" if "служение" in f["name"].lower() else "📄"
+            kb.row(InlineKeyboardButton(
+                text=f"{prefix} {f['name']}",
+                callback_data=f"yd_pick:{message.from_user.id}:{nonce}:{idx}"
+            ))
+        if len(pptx_files) > 1:
+            kb.row(InlineKeyboardButton(
+                text="📁 Все подряд",
+                callback_data=f"yd_pick:{message.from_user.id}:{nonce}:all"
+            ))
         kb.row(InlineKeyboardButton(
             text="❌ Отмена",
             callback_data=f"yd_cancel:{message.from_user.id}:{nonce}"
@@ -1484,13 +1499,64 @@ async def cmd_sunday(message: types.Message, check_access):
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_pick:"))
-async def yd_pick(callback: types.CallbackQuery):
-    """Заглушка — обработка появится в следующем обновлении."""
-    await callback.answer(
-        "⏳ Обработка файла появится в следующем обновлении.",
-        show_alert=True,
-    )
+async def yd_pick(callback: types.CallbackQuery, bot: Bot, SHM_DIR: str, user_mgr):
+    """Обработка выбранного файла: скачивание → конвертация → раскладка → загрузка."""
+    # Разбор: yd_pick:{user_id}:{nonce}:{idx|all}
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
 
+    try:
+        owner_user_id = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    callback_nonce = parts[2]
+    file_selector = parts[3]
+
+    if callback.from_user.id != owner_user_id:
+        await callback.answer("❌ Только автор запроса может выбрать файл.", show_alert=True)
+        return
+
+    session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
+    session = sessions.get(session_key)
+    if not session or session.get("nonce") != callback_nonce:
+        await callback.answer("❌ Сессия неактивна.", show_alert=True)
+        return
+
+    files = session["files"]
+    sunday = session["sunday"]
+    paths = session["paths"]
+
+    if file_selector == "all":
+        files_to_process = files
+        await callback.answer("⏳ Обрабатываю все файлы...")
+    else:
+        try:
+            idx = int(file_selector)
+            if idx < 0 or idx >= len(files):
+                await callback.answer("❌ Файл не найден.", show_alert=True)
+                return
+            files_to_process = [files[idx]]
+            await callback.answer("⏳ Начинаю обработку...")
+        except ValueError:
+            await callback.answer("❌ Некорректный выбор.", show_alert=True)
+            return
+
+    await _yd_process_files(
+        callback=callback,
+        bot=bot,
+        SHM_DIR=SHM_DIR,
+        user_mgr=user_mgr,
+        session=session,
+        files_to_process=files_to_process,
+        sunday=sunday,
+        paths=paths,
+        session_key=session_key,
+        nonce=callback_nonce,
+    )
 
 # ==========================================
 # 14. yd_cancel — кнопка отмены
@@ -1567,3 +1633,184 @@ async def cmd_cancel_yd(message: types.Message, check_access):
     sessions.pop(session_key, None)
 
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
+
+# ==========================================
+# ПАЙПЛАЙН ОБРАБОТКИ ФАЙЛОВ ЯНДЕКС.ДИСКА
+# ==========================================
+
+async def _yd_process_files(
+    callback: types.CallbackQuery,
+    bot: Bot,
+    SHM_DIR: str,
+    user_mgr,
+    session: dict,
+    files_to_process: list,
+    sunday,
+    paths: dict,
+    session_key: str,
+    nonce: str,
+):
+    """Полный пайплайн: скачивание → конвертация → раскладка → загрузка PNG."""
+    import html as html_module
+
+    status_msg = callback.message
+    owner_user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    task_id = f"yd_task_{owner_user_id}_{secrets.token_hex(4)}"
+    task_dir = Path(SHM_DIR) / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    # Загружаем шаблон структуры
+    template_path = Path(__file__).parent / yandex_template_file
+    structure = load_template(template_path)
+    if structure is None:
+        await status_msg.edit_text(
+            f"❌ <b>Ошибка загрузки template.yaml</b>\n\n"
+            f"Файл: <code>{html_module.escape(str(template_path))}</code>",
+            parse_mode="HTML"
+        )
+        sessions.pop(session_key, None)
+        await yd_release(owner_user_id, chat_id, nonce)
+        return
+
+    # Создаём структуру папок в Трансляция/
+    await status_msg.edit_text("📁 Создаю структуру папок в Трансляция/...")
+    target_base = paths["target"]
+    ok = await create_structure(yandex_client, target_base, structure)
+    if not ok:
+        await status_msg.edit_text(
+            "❌ <b>Не удалось создать структуру папок</b>\n\n"
+            "Проверьте права на Яндекс.Диске.",
+            parse_mode="HTML"
+        )
+        sessions.pop(session_key, None)
+        await yd_release(owner_user_id, chat_id, nonce)
+        return
+
+    total_uploaded = 0
+    report_lines = [f"📁 Обработано файлов: <b>{len(files_to_process)}</b>\n"]
+
+    for f_idx, pptx_item in enumerate(files_to_process, start=1):
+        file_name = pptx_item["name"]
+        file_name_esc = html_module.escape(file_name)
+
+        await status_msg.edit_text(
+            f"📥 Скачиваю <code>{file_name_esc}</code>...",
+            parse_mode="HTML"
+        )
+
+        local_pptx = task_dir / file_name
+        ok = await yandex_client.download_file(pptx_item["path"], local_pptx)
+        if not ok:
+            report_lines.append(f"❌ {file_name_esc} — ошибка скачивания")
+            continue
+
+        await status_msg.edit_text(
+            f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
+            parse_mode="HTML"
+        )
+        temp_png_dir = task_dir / f"png_{f_idx}"
+        temp_png_dir.mkdir(exist_ok=True)
+
+        try:
+            pngs = await convert_all_pngs(
+                local_pptx, temp_png_dir,
+                user_mgr.get_user_config(owner_user_id)["quality"]
+            )
+        except Exception as e:
+            logging.error(f"Ошибка конвертации {file_name}: {e}", exc_info=True)
+            report_lines.append(f"❌ {file_name_esc} — ошибка конвертации")
+            continue
+
+        if not pngs:
+            report_lines.append(f"❌ {file_name_esc} — нет PNG")
+            continue
+
+        pngs_sorted = sorted(pngs, key=lambda p: p.name)
+        total_slides = len(pngs_sorted)
+
+        # Извлекаем заметки докладчика
+        notes_ok, notes, incomplete = await asyncio.to_thread(
+            extract_speaker_notes, str(local_pptx)
+        )
+        if not notes_ok:
+            notes = {}
+            logging.warning(f"Не удалось извлечь заметки из {file_name}")
+        elif incomplete:
+            logging.warning(f"Заметки {file_name} извлечены частично")
+
+        # Ищем проповедь
+        start, end, matches = find_sermon_range(notes, yandex_sermon_keyword)
+
+        await status_msg.edit_text(
+            f"📤 Загружаю PNG на Яндекс.Диск ({file_name_esc})...",
+            parse_mode="HTML"
+        )
+
+        pptx2png_dir = f"{target_base}/{yandex_pptx2png_folder}/{safe_folder_name(file_name)}"
+        sermon_dir = f"{target_base}/{yandex_sermon_folder}"
+
+        await yandex_client.ensure_folder(pptx2png_dir)
+        await yandex_client.ensure_folder(sermon_dir)
+
+        uploaded_for_file = 0
+        for slide_idx, png_path in enumerate(pngs_sorted, start=1):
+            is_sermon = (
+                start is not None
+                and start <= slide_idx <= end
+            )
+            remote_dir = sermon_dir if is_sermon else pptx2png_dir
+            remote_path = f"{remote_dir}/{png_path.name}"
+
+            ok = await yandex_client.upload_file(png_path, remote_path)
+            if ok:
+                uploaded_for_file += 1
+            else:
+                logging.error(f"Не удалось загрузить {png_path.name}")
+
+        total_uploaded += uploaded_for_file
+
+        if start is not None:
+            sermon_count = end - start + 1
+            sermon_info = f"🎯 Проповедь (слайды {start}–{end}): {sermon_count} PNG"
+            other_count = total_slides - sermon_count
+            other_info = f"📄 Остальные ({other_count} PNG): {yandex_pptx2png_folder}/{safe_folder_name(file_name)}/"
+        else:
+            sermon_info = "🎯 Проповедь: не найдена"
+            other_info = f"📄 Все слайды: {yandex_pptx2png_folder}/{safe_folder_name(file_name)}/"
+
+        report_lines.append(
+            f"{f_idx}. 📄 <b>{file_name_esc}</b>\n"
+            f"   • {sermon_info}\n"
+            f"   • {other_info}"
+        )
+
+        try:
+            local_pptx.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    try:
+        shutil.rmtree(task_dir)
+    except Exception:
+        pass
+
+    report_lines.append(f"\n📊 Всего загружено PNG: <b>{total_uploaded}</b>")
+    report_lines.append(
+        f"\n🔗 <a href=\"https://disk.yandex.ru/client/disk"
+        f"{html_module.escape(paths['target'])}\">Открыть на Яндекс.Диске</a>"
+    )
+
+    try:
+        await status_msg.edit_text(
+            "\n".join(report_lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logging.error(f"Ошибка отправки отчёта: {e}")
+
+    sessions.pop(session_key, None)
+    await yd_release(owner_user_id, chat_id, nonce)
+
