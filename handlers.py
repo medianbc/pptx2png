@@ -1,5 +1,5 @@
 # ==========================================
-# handlers.py — ОБРАБОТЧИКИ (v1.5, исправленная версия)
+# handlers.py — ОБРАБОТЧИКИ (v1.6, исправленная версия)
 # ==========================================
 
 import os
@@ -804,6 +804,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             if timeout_task is not None and not timeout_task.done():
                 timeout_task.cancel()
             pending["prompt_timeout_task"] = None
+            pending["prompt_watchdog_nonce"] = None
             pending["prompt_nonce"] = None
             pending["prompt_idx"] = None
             pending["prompt_message_id"] = None
@@ -842,10 +843,14 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             old_timeout = pending.get("prompt_timeout_task")
             if old_timeout is not None and not old_timeout.done():
                 old_timeout.cancel()
+            pending["prompt_timeout_task"] = None
+            pending["prompt_watchdog_nonce"] = None
             if pending.get("prompt_nonce") is not None:
+                current_nonce = pending["prompt_nonce"]
                 pending["prompt_timeout_task"] = asyncio.create_task(
-                    _yd_prompt_timeout_watchdog(tid, YD_PROMPT_TIMEOUT_SEC, pending["prompt_nonce"])
+                    _yd_prompt_timeout_watchdog(tid, YD_PROMPT_TIMEOUT_SEC, current_nonce)
                 )
+                pending["prompt_watchdog_nonce"] = current_nonce
             await message.reply(
                 "❌ **Неверный формат.** Пример: `5-30` или `5,7,10-15`"
             )
@@ -880,6 +885,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
         pending["prompt_timeout_task"] = None
+        pending["prompt_watchdog_nonce"] = None
         pending["prompt_nonce"] = None
         pending["prompt_idx"] = None
         pending["prompt_message_id"] = None
@@ -1545,7 +1551,6 @@ async def cmd_sunday(message: types.Message, check_access):
 
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
-        # ✅ К5: помечаем старые задачи отменёнными + сохраняем сессию под локом
         async with yd_session_lock:
             old_picker = sessions.get(session_key)
             if old_picker is not None:
@@ -1721,7 +1726,6 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
 
     session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
 
-    # ✅ К1: читаем состояние под локом, НЕ вызываем yd_release внутри
     is_stale = False
     task_ids_to_cancel = []
     async with yd_session_lock:
@@ -1733,7 +1737,6 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
             task_ids_to_cancel = list(session.get("task_ids", []))
             sessions.pop(session_key, None)
 
-    # ✅ К1: yd_release и message-операции — вне лока
     if is_stale:
         await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
         try:
@@ -1891,12 +1894,9 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     idx = int(parts[2])
-    pending["awaiting_range_for_idx"] = idx
 
-    # ✅ К13: новый nonce + prompt_idx для режима ручного ввода
-    pending["prompt_nonce"] = secrets.token_hex(8)
-    manual_nonce = pending["prompt_nonce"]
-    pending["prompt_idx"] = idx
+    # ✅ К11(race): генерируем nonce заранее, но НЕ публикуем в pending
+    manual_nonce = secrets.token_hex(8)
 
     current = pending["prepared"][idx]
     total_slides = len(current["pngs_sorted"])
@@ -1904,6 +1904,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
     await callback.answer()
 
+    # ✅ К11(race): сначала редактируем сообщение — до публикации состояния
     sent_msg = await callback.message.edit_text(
         f"✏️ <b>Введите диапазон проповеди</b>\n\n"
         f"📄 Файл: <code>{file_name_esc}</code>\n"
@@ -1913,13 +1914,31 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         f"<i>Отправьте <code>отмена</code> или <code>0</code>, чтобы пропустить.</i>",
         parse_mode="HTML",
     )
+
+    # ✅ К11(race): теперь публикуем состояние ручного ввода
+    pending["awaiting_range_for_idx"] = idx
+    pending["prompt_nonce"] = manual_nonce
+    pending["prompt_idx"] = idx
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
 
-    # ✅ К13: watchdog для режима ручного ввода
+    # ✅ К11(race): проверяем, что никто не перебил наш nonce
+    if pending.get("prompt_nonce") != manual_nonce:
+        logging.info(
+            f"yd_sermon_edit: nonce изменён конкурентно для {task_id} — "
+            f"watchdog не создаём"
+        )
+        return
+
+    # ✅ К11(race): отменяем старый watchdog и создаём новый для нашего nonce
+    old_timeout = pending.get("prompt_timeout_task")
+    if old_timeout is not None and not old_timeout.done():
+        old_timeout.cancel()
+
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, manual_nonce)
     )
+    pending["prompt_watchdog_nonce"] = manual_nonce
 
 
 # ==========================================
@@ -1960,6 +1979,7 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     if timeout_task is not None and not timeout_task.done():
         timeout_task.cancel()
     pending["prompt_timeout_task"] = None
+    pending["prompt_watchdog_nonce"] = None
 
     pending["prompt_nonce"] = None
     pending["prompt_idx"] = None
@@ -2035,13 +2055,34 @@ async def _yd_render_sermon_prompt(
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
         sent_msg = status_msg
 
+    # ✅ К11(race): перед публикацией message_id проверяем, что nonce всё ещё наш
+    if pending.get("prompt_nonce") != prompt_nonce:
+        logging.info(
+            f"_yd_render_sermon_prompt: nonce изменён конкурентно для {task_id} — "
+            f"watchdog не создаём, message_id не публикуем"
+        )
+        return
+
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
 
-    if pending.get("prompt_timeout_task") is None or pending["prompt_timeout_task"].done():
-        pending["prompt_timeout_task"] = asyncio.create_task(
-            _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
-        )
+    # ✅ К11(race): не пересоздаём watchdog, если для текущего nonce он уже есть
+    existing_task = pending.get("prompt_timeout_task")
+    existing_nonce = pending.get("prompt_watchdog_nonce")
+
+    if existing_task is not None and not existing_task.done():
+        if existing_nonce == prompt_nonce:
+            # Актуальный watchdog уже стоит — не трогаем
+            return
+        # Чужой watchdog — отменяем
+        existing_task.cancel()
+        pending["prompt_timeout_task"] = None
+        pending["prompt_watchdog_nonce"] = None
+
+    pending["prompt_timeout_task"] = asyncio.create_task(
+        _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
+    )
+    pending["prompt_watchdog_nonce"] = prompt_nonce
 
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
@@ -2090,9 +2131,12 @@ async def _yd_cleanup_task(
     # 2. Отменяем watchdog
     session = sessions.get(task_id)
     if session is not None and "pending" in session:
-        timeout_task = session["pending"].get("prompt_timeout_task")
+        pending = session["pending"]
+        timeout_task = pending.get("prompt_timeout_task")
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
+        pending["prompt_timeout_task"] = None
+        pending["prompt_watchdog_nonce"] = None
 
     # 3. Сессии + реестр активных yd-задач
     async with yd_session_lock:
@@ -2109,7 +2153,6 @@ async def _yd_cleanup_task(
 
         sessions.pop(task_id, None)
 
-        # ✅ К11: снимаем регистрацию активной задачи
         yd_active_tasks.discard(task_id)
 
     await yd_release(owner_user_id, chat_id, nonce)
@@ -2158,7 +2201,6 @@ async def _yd_prepare_files(
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    # ✅ К2: создаём минимальную task-сессию СРАЗУ + регистрируем в picker
     async with yd_session_lock:
         picker = sessions.get(session_key)
         if picker is None:
@@ -2177,7 +2219,6 @@ async def _yd_prepare_files(
             "created_at": time.time(),
             "cancelled": False,
         }
-        # ✅ К11: регистрируем активную задачу
         yd_active_tasks.add(task_id)
 
     try:
@@ -2223,13 +2264,11 @@ async def _yd_prepare_files(
 
         target_base = paths["target"]
 
-        # ✅ С3: get_user_config один раз
         quality = user_mgr.get_user_config(owner_user_id)["quality"]
 
         prepared = []
 
         for f_idx, pptx_item in enumerate(files_to_process, start=1):
-            # ✅ К2/К11: touch перед проверкой
             touch_task(task_dir)
 
             task_sess = sessions.get(task_id)
@@ -2333,7 +2372,6 @@ async def _yd_prepare_files(
                 "confirmed": start is None,
             })
 
-        # ✅ К12: определяем cleanup_needed под локом, cleanup — вне лока
         cleanup_needed = False
         async with yd_session_lock:
             picker = sessions.get(session_key)
@@ -2357,6 +2395,7 @@ async def _yd_prepare_files(
                         "prompt_idx": None,
                         "prompt_message_id": None,
                         "prompt_timeout_task": None,
+                        "prompt_watchdog_nonce": None,
                     }
                     task_sess["pending"] = pending
 
@@ -2447,7 +2486,6 @@ async def _yd_upload_files(
         report_lines = [f"📁 Обработано файлов: <b>{len(prepared)}</b>\n"]
 
         for f_idx, item in enumerate(prepared, start=1):
-            # ✅ К11: touch перед итерацией
             touch_task(task_dir)
 
             current_session = sessions.get(task_id)
@@ -2500,7 +2538,6 @@ async def _yd_upload_files(
             failed_other = 0
 
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
-                # ✅ К11: touch перед загрузкой каждого слайда
                 touch_task(task_dir)
 
                 current_session = sessions.get(task_id)
