@@ -1894,14 +1894,57 @@ async def _yd_process_files(
             f"{html_module.escape(paths['target'])}\">Открыть на Яндекс.Диске</a>"
         )
 
+        # ✅ Разбиваем отчёт на части — Telegram лимит 4096 символов
+        MAX_MSG_LEN = 3500
+        chunks = []
+        current_chunk = []
+        current_len = 0
+
+        for line in report_lines:
+            line_len = len(line) + 1  # +1 на '\n'
+            if current_len + line_len > MAX_MSG_LEN and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = [line]
+                current_len = line_len
+            else:
+                current_chunk.append(line)
+                current_len += line_len
+
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+
+        # Первая часть — редактируем status_msg
         try:
             await status_msg.edit_text(
-                "\n".join(report_lines),
+                chunks[0],
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         except Exception as e:
-            logging.error(f"Ошибка отправки отчёта: {e}")
+            logging.error(f"Ошибка отправки первой части отчёта: {e}")
+            # Fallback — короткое сообщение
+            try:
+                fallback = (
+                    f"✅ Обработка завершена.\n"
+                    f"📊 Загружено PNG: {total_uploaded}"
+                )
+                if total_failed:
+                    fallback += f"\n❌ Ошибок: {total_failed}"
+                await status_msg.edit_text(fallback)
+            except Exception:
+                pass
+
+        # Остальные части — новыми сообщениями
+        for i, chunk in enumerate(chunks[1:], start=2):
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logging.error(f"Ошибка отправки части {i} отчёта: {e}")
 
     finally:
         # ✅ Баг #8: гарантированное удаление task_dir
