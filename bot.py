@@ -92,7 +92,7 @@ def setup_environment():
     yandex_target_folder = settings_config.get("YandexDisk", "target_folder", fallback="Трансляция").strip()
     yandex_pptx2png_folder = settings_config.get("YandexDisk", "pptx2png_folder", fallback="pptx2png").strip()
     yandex_sermon_folder = settings_config.get("YandexDisk", "sermon_folder", fallback="проповедь - png").strip()
-        yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
+    yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
     if not yandex_sermon_keyword:
         logging.warning(
             "⚠️ sermon_keyword пустой — использую значение по умолчанию 'проповед'"
