@@ -793,7 +793,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
     if not await check_access(message):
         return
     
-        # ✅ Проверка: не ждём ли мы ручной ввод диапазона проповеди?
+    # ✅ Проверка: не ждём ли мы ручной ввод диапазона проповеди?
     for tid, sess in sessions.items():
         pending = sess.get("pending")
         if not pending:
@@ -857,23 +857,51 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         fake_cb = _FakeCallback(message, message.from_user)
 
         if remaining:
-            # Показать следующее подтверждение — отправим новое сообщение
-            # Найдём session_key
-            await _yd_ask_sermon_confirmation_via_message(
-                message=message,
-                task_id=tid,
-                needs_confirm=remaining,
+            # Показать следующее подтверждение новым сообщением
+            next_item = remaining[0]
+            next_matches = next_item["matches"]
+            next_start = next_item["start"]
+            next_end = next_item["end"]
+            next_file = next_item["file_name"]
+
+            preview = ", ".join(str(n) for n in next_matches[:15])
+            if len(next_matches) > 15:
+                preview += f" …и ещё {len(next_matches) - 15}"
+
+            file_esc = html_module.escape(next_file)
+            text = (
+                f"🎯 <b>Следующий файл</b>\n\n"
+                f"📄 Файл: <code>{file_esc}</code>\n"
+                f"📌 Слайды с пометкой: <code>{preview}</code>\n\n"
+                f"📊 Предлагаемый диапазон: <b>{next_start}–{next_end}</b>\n\n"
+                f"Подтвердите или измените диапазон:"
             )
+            kb = InlineKeyboardBuilder()
+            kb.row(
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"yd_sermon_ok:{tid}"),
+                InlineKeyboardButton(text="✏️ Изменить", callback_data=f"yd_sermon_edit:{tid}"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"yd_sermon_skip:{tid}"),
+            )
+            await message.reply(text, parse_mode="HTML", reply_markup=kb.as_markup())
         else:
-            # Всё подтверждено — загружаем
-            # Нам нужен bot; получим из workflow_data? Или передадим через сессию
-            # Проще: сохраним bot в pending при первом запуске
+            # Всё подтверждено — загружаем.
+            # Нужен callback-подобный объект для _yd_upload_files
             bot = pending.get("bot")
             if bot:
-                await _yd_upload_files_via_message(
-                    message=message,
+                # _yd_upload_files ожидает callback.message = сообщение со статусом
+                # Используем исходное сообщение от пользователя
+                class _FakeCallback:
+                    def __init__(self, msg, user):
+                        self.message = msg
+                        self.from_user = user
+                        self.data = ""
+
+                fake_cb = _FakeCallback(message, message.from_user)
+                await _yd_upload_files(
+                    callback=fake_cb,
                     bot=bot,
                     task_id=tid,
+                    status_msg=message,
                 )
 
         return
