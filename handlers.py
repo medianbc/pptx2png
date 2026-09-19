@@ -1895,7 +1895,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
     idx = int(parts[2])
 
-    # ✅ К11(race): генерируем nonce заранее, но НЕ публикуем в pending
+    # ✅ К11(race): nonce заранее, но НЕ публикуем до edit_text
     manual_nonce = secrets.token_hex(8)
 
     current = pending["prepared"][idx]
@@ -1904,25 +1904,50 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
     await callback.answer()
 
-    # ✅ К11(race): сначала редактируем сообщение — до публикации состояния
-    sent_msg = await callback.message.edit_text(
-        f"✏️ <b>Введите диапазон проповеди</b>\n\n"
-        f"📄 Файл: <code>{file_name_esc}</code>\n"
-        f"📊 Всего слайдов: {total_slides}\n\n"
-        f"Пример: <code>5-30</code> или <code>5,7,10-15</code>\n"
-        f"Отправьте текстом в чат (ответом на это сообщение).\n"
-        f"<i>Отправьте <code>отмена</code> или <code>0</code>, чтобы пропустить.</i>",
-        parse_mode="HTML",
-    )
+    # ✅ К2: оборачиваем edit_text — при ошибке Telegram чистим задачу
+    try:
+        sent_msg = await callback.message.edit_text(
+            f"✏️ <b>Введите диапазон проповеди</b>\n\n"
+            f"📄 Файл: <code>{file_name_esc}</code>\n"
+            f"📊 Всего слайдов: {total_slides}\n\n"
+            f"Пример: <code>5-30</code> или <code>5,7,10-15</code>\n"
+            f"Отправьте текстом в чат (ответом на это сообщение).\n"
+            f"<i>Отправьте <code>отмена</code> или <code>0</code>, чтобы пропустить.</i>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error(
+            f"yd_sermon_edit: edit_text failed for {task_id}: {e}",
+            exc_info=True,
+        )
+        await _yd_cleanup_task(
+            task_id,
+            pending.get("session_key"),
+            pending.get("task_dir"),
+            pending.get("owner_user_id"),
+            pending.get("chat_id"),
+            pending.get("nonce"),
+            bot=bot,
+            status_msg=callback.message,
+            error=e,
+        )
+        try:
+            await callback.answer(
+                "❌ Не удалось показать форму ввода. Задача сброшена.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
 
-    # ✅ К11(race): теперь публикуем состояние ручного ввода
+    # ✅ К11(race): публикуем состояние ручного ввода
     pending["awaiting_range_for_idx"] = idx
     pending["prompt_nonce"] = manual_nonce
     pending["prompt_idx"] = idx
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
 
-    # ✅ К11(race): проверяем, что никто не перебил наш nonce
+    # ✅ К11(race): проверяем, что наш nonce не перебили
     if pending.get("prompt_nonce") != manual_nonce:
         logging.info(
             f"yd_sermon_edit: nonce изменён конкурентно для {task_id} — "
@@ -1930,7 +1955,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         )
         return
 
-    # ✅ К11(race): отменяем старый watchdog и создаём новый для нашего nonce
+    # ✅ К11(race): отменяем старый watchdog и создаём новый
     old_timeout = pending.get("prompt_timeout_task")
     if old_timeout is not None and not old_timeout.done():
         old_timeout.cancel()
@@ -2128,12 +2153,17 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
 
-    # 2. Отменяем watchdog
+    # ✅ К1: отменяем watchdog, только если он не текущая задача
     session = sessions.get(task_id)
     if session is not None and "pending" in session:
         pending = session["pending"]
         timeout_task = pending.get("prompt_timeout_task")
-        if timeout_task is not None and not timeout_task.done():
+        current_task = asyncio.current_task()
+        if (
+            timeout_task is not None
+            and not timeout_task.done()
+            and timeout_task is not current_task
+        ):
             timeout_task.cancel()
         pending["prompt_timeout_task"] = None
         pending["prompt_watchdog_nonce"] = None
@@ -2152,7 +2182,6 @@ async def _yd_cleanup_task(
             sessions.pop(session_key, None)
 
         sessions.pop(task_id, None)
-
         yd_active_tasks.discard(task_id)
 
     await yd_release(owner_user_id, chat_id, nonce)
