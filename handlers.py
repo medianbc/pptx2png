@@ -1,5 +1,5 @@
 # ==========================================
-# handlers.py — ОБРАБОТЧИКИ (v1.7, после рефакторинга)
+# handlers.py — ОБРАБОТЧИКИ (v1.8, после рефакторинга)
 # ==========================================
 
 import os
@@ -8,8 +8,6 @@ import shutil
 import logging
 import secrets
 import asyncio
-import zipfile
-import time
 from pathlib import Path
 import html as html_module
 from typing import Optional, Set, Dict, List, Tuple
@@ -40,7 +38,6 @@ from yandex_flow import (
 )
 
 import converter_engine
-from converter_engine import make_dark_mode
 from converter_engine import convert_all_pngs, create_zip_stream
 
 
@@ -51,7 +48,7 @@ from converter_engine import convert_all_pngs, create_zip_stream
 router = Router()
 converter_semaphore = asyncio.Semaphore(2)
 
-# ✅ Подключаем Yandex-роутер — все /sunday, yd_pick, yd_cancel, yd_sermon_* теперь живут там
+# ✅ Подключаем Yandex-роутер
 router.include_router(yandex_router)
 
 
@@ -60,36 +57,35 @@ router.include_router(yandex_router)
 # ==========================================
 
 class TaskLockManager:
+    """
+    Менеджер блокировок для защиты от дублирующих операций.
+    Упрощённый: единственный источник правды — lock.locked().
+    """
+
     def __init__(self):
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._active: Set[str] = set()
         self._dict_lock = asyncio.Lock()
 
     async def acquire(self, task_id: str) -> bool:
         async with self._dict_lock:
-            if task_id in self._active:
-                return False
             if task_id not in self._locks:
                 self._locks[task_id] = asyncio.Lock()
             lock = self._locks[task_id]
             if lock.locked():
                 return False
             await lock.acquire()
-            self._active.add(task_id)
             return True
 
     async def release(self, task_id: str):
         async with self._dict_lock:
-            self._active.discard(task_id)
-            if task_id in self._locks:
-                lock = self._locks[task_id]
-                if lock.locked():
-                    lock.release()
-                self._locks.pop(task_id, None)
+            lock = self._locks.get(task_id)
+            if lock is not None and lock.locked():
+                lock.release()
 
     async def is_active(self, task_id: str) -> bool:
         async with self._dict_lock:
-            return task_id in self._active
+            lock = self._locks.get(task_id)
+            return lock is not None and lock.locked()
 
 
 task_lock_manager = TaskLockManager()
@@ -644,7 +640,7 @@ async def handle_disabled_button(callback: types.CallbackQuery):
 
 
 # ==========================================
-# 4. ОБРАБОТЧИК ТЕКСТА (обычные диапазоны + Yandex-промпты)
+# 4. ОБРАБОТЧИК ТЕКСТА
 # ==========================================
 
 @router.message(F.text & ~F.text.contains("http://") & ~F.text.contains("https://") & ~F.text.startswith("/"))
