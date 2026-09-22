@@ -145,14 +145,15 @@ class YandexDiskClient:
     # ---------- Метаданные ----------
 
     async def resource_type(self, path: str) -> Optional[str]:
-        """Лёгкий запрос: только type, без _embedded."""
         path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path, "fields": "type"}
+        logging.debug(f"[YD-API] GET /resources?path={path!r}&fields=type")
         try:
             async with self.session.get(
                 url, headers=self.headers, params=params, timeout=15
             ) as resp:
+                logging.debug(f"[YD-API] → {resp.status} (GET {path!r})")
                 if resp.status == 404:
                     return None
                 if resp.status != 200:
@@ -181,10 +182,17 @@ class YandexDiskClient:
             "offset": offset,
             "fields": "name,path,type,size,created,modified,_embedded",
         }
+        logging.debug(
+            f"[YD-API] GET /resources?path={path!r}&limit={limit}&offset={offset}"
+        )
         try:
             async with self.session.get(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
+                logging.debug(
+                    f"[YD-API] → {resp.status} (GET {path!r}, "
+                    f"limit={limit}, offset={offset})"
+                )
                 if resp.status == 404:
                     raise YandexDiskNotFoundError(f"Не найдено: {path}")
                 if resp.status != 200:
@@ -257,12 +265,16 @@ class YandexDiskClient:
 
     async def download_file(self, remote_path: str, destination: Path) -> bool:
         remote_path = strip_disk_prefix(remote_path)
+        logging.debug(f"[YD-API] download {remote_path!r} → {destination.name}")
         url = f"{YANDEX_API_BASE}/resources/download"
         params = {"path": remote_path}
         try:
             async with self.session.get(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
+                logging.debug(
+                    f"[YD-API] download {remote_path!r} → {resp.status}"
+                )
                 if resp.status != 200:
                     logging.error(f"Yandex API download: HTTP {resp.status}")
                     return False
@@ -286,12 +298,19 @@ class YandexDiskClient:
     async def upload_file(self, local_path: Path, remote_path: str,
                           overwrite: bool = True) -> bool:
         remote_path = strip_disk_prefix(remote_path)
+        size = local_path.stat().st_size if local_path.exists() else 0
+        logging.debug(
+            f"[YD-API] upload {local_path.name} ({size} байт) → {remote_path!r}"
+        )
         url = f"{YANDEX_API_BASE}/resources/upload"
         params = {"path": remote_path, "overwrite": str(overwrite).lower()}
         try:
             async with self.session.get(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
+                logging.debug(
+                    f"[YD-API] upload URL → {resp.status} ({local_path.name})"
+                )
                 if resp.status != 200:
                     logging.error(f"Yandex API upload URL: HTTP {resp.status}")
                     return False
@@ -302,13 +321,19 @@ class YandexDiskClient:
 
             with open(local_path, "rb") as f:
                 async with self.session.put(href, data=f, timeout=600) as upload_resp:
+                    logging.debug(
+                        f"[YD-API] upload {local_path.name} → {upload_resp.status}"
+                    )
                     if upload_resp.status not in (200, 201, 202):
-                        logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
+                        logging.error(
+                            f"Ошибка загрузки на Диск: HTTP {upload_resp.status}"
+                        )
                         return False
             return True
         except Exception as e:
             logging.error(f"Ошибка upload_file: {e}", exc_info=True)
             return False
+
 
     # ---------- Создание папок ----------
 
@@ -324,10 +349,12 @@ class YandexDiskClient:
         path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
+        logging.debug(f"[YD-API] PUT /resources?path={path!r}")
         try:
             async with self.session.put(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
+                logging.debug(f"[YD-API] PUT /resources?path={path!r}")
                 if resp.status == 201:
                     return True
 

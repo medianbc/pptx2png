@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v1.9)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.0)
 # ==========================================
 
 import asyncio
@@ -9,6 +9,7 @@ import os
 import secrets
 import shutil
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +39,7 @@ from yandex_disk import (
 from structure import safe_folder_name
 from sermon_detector import find_sermon_range
 from utils import extract_speaker_notes
-from converter_engine import convert_all_pngs  # ✅ импортируем напрямую
+from converter_engine import convert_all_pngs, create_zip_stream
 
 
 router = Router()
@@ -77,6 +78,27 @@ def _is_sermon_slide(item: dict, slide_idx: int) -> bool:
     return start is not None and start <= slide_idx <= end
 
 
+def _yd_public_url(disk_path: str) -> str:
+    """
+    Строит корректный кликабельный URL Яндекс.Диска.
+    Путь полностью URL-encode'ится, '/' остаётся разделителем.
+    """
+    path = disk_path.lstrip("/")
+    encoded = urllib.parse.quote(path, safe="/")
+    return f"https://disk.yandex.ru/client/disk/{encoded}"
+
+
+def _format_size(num_bytes: int) -> str:
+    """Человекочитаемый размер файла."""
+    if num_bytes < 1024:
+        return f"{num_bytes} Б"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} КБ"
+    if num_bytes < 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} МБ"
+    return f"{num_bytes / (1024 * 1024 * 1024):.2f} ГБ"
+
+
 # ==========================================
 # ПАЙПЛАЙН ПОДГОТОВКИ
 # ==========================================
@@ -107,6 +129,10 @@ async def _yd_prepare_files(
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
+    logging.info(
+        f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
+    )
+
     # Создаём минимальную task-сессию СРАЗУ + регистрируем в picker
     async with yd_session_lock:
         picker = sessions.get(session_key)
@@ -129,8 +155,6 @@ async def _yd_prepare_files(
         yd_active_tasks.add(task_id)
 
     try:
-        # ✅ Целевые папки создаются в _yd_upload_files через ensure_folder.
-        # Полное дерево из template.yaml бот НЕ создаёт.
         target_base = paths["target"]
         quality = user_mgr.get_user_config(owner_user_id)["quality"]
 
@@ -141,7 +165,7 @@ async def _yd_prepare_files(
 
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
-                logging.info(f"Задача {task_id} отменена — прерываем подготовку")
+                logging.info(f"[YD-PREP] Задача {task_id} отменена — прерываем подготовку")
                 await _yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
@@ -150,6 +174,12 @@ async def _yd_prepare_files(
 
             file_name = pptx_item["name"]
             file_name_esc = html_module.escape(file_name)
+            file_size = pptx_item.get("size", 0)
+
+            logging.info(
+                f"[YD-PREP] Файл #{f_idx}/{len(files_to_process)}: "
+                f"{file_name!r} ({_format_size(file_size)})"
+            )
 
             try:
                 await status_msg.edit_text(
@@ -164,12 +194,18 @@ async def _yd_prepare_files(
                 pptx_item["path"], local_pptx
             )
             if not ok:
+                logging.error(f"[YD-PREP] {file_name}: скачивание провалилось")
                 prepared.append({
                     "file_name": file_name,
                     "file_slug": safe_folder_name(file_name),
                     "failed_at_stage": "download",
                 })
                 continue
+
+            logging.debug(
+                f"[YD-PREP] {file_name}: скачан, "
+                f"размер={_format_size(local_pptx.stat().st_size)}"
+            )
 
             try:
                 await status_msg.edit_text(
@@ -187,7 +223,7 @@ async def _yd_prepare_files(
                     local_pptx, temp_png_dir, quality
                 )
             except Exception as e:
-                logging.error(f"Ошибка конвертации {file_name}: {e}", exc_info=True)
+                logging.error(f"[YD-PREP] {file_name}: ошибка конвертации: {e}", exc_info=True)
                 prepared.append({
                     "file_name": file_name,
                     "file_slug": safe_folder_name(file_name),
@@ -196,6 +232,7 @@ async def _yd_prepare_files(
                 continue
 
             if not pngs:
+                logging.warning(f"[YD-PREP] {file_name}: не создано ни одного PNG")
                 prepared.append({
                     "file_name": file_name,
                     "file_slug": safe_folder_name(file_name),
@@ -204,36 +241,39 @@ async def _yd_prepare_files(
                 continue
 
             pngs_sorted = sorted(pngs, key=lambda p: p.name)
+            logging.debug(f"[YD-PREP] {file_name}: конвертировано {len(pngs_sorted)} PNG")
 
-            # ✅ Извлекаем заметки
+            # Извлекаем заметки
             notes_ok, notes, incomplete = await asyncio.to_thread(
                 extract_speaker_notes, str(used_pptx)
             )
 
-            # ✅ Bug #2: различаем три состояния заметок
+            # Различаем три состояния заметок
             if not notes_ok:
-                # Провал чтения — вообще не ищем
                 notes = {}
                 start, end, matches = None, None, []
                 incomplete_warning = (
                     "⚠️ Не удалось прочитать заметки докладчика."
                 )
             elif incomplete:
-                # Частичное чтение — тоже не доверяем
                 start, end, matches = None, None, []
                 incomplete_warning = (
                     "⚠️ Заметки прочитаны частично, "
                     "проповедь не определена автоматически."
                 )
             else:
-                # Полное чтение — ищем
                 start, end, matches = find_sermon_range(
                     notes, yandex_state.config.sermon_keyword
                 )
                 if matches and len(matches) == 1:
-                    # Одна пометка — не диапазон, оставляем как есть
                     start, end = None, None
                 incomplete_warning = None
+
+            logging.info(
+                f"[YD-PREP] {file_name}: заметок={len(notes)}, "
+                f"matches={len(matches)}, start={start}, end={end}, "
+                f"notes_ok={notes_ok}, incomplete={incomplete}"
+            )
 
             if used_pptx != local_pptx and used_pptx.exists():
                 try:
@@ -251,11 +291,9 @@ async def _yd_prepare_files(
                 "end": end,
                 "ranges": item_ranges,
                 "matches": matches,
-                # ✅ Bug #2: сохраняем состояние заметок для промпта
                 "notes_ok": notes_ok,
                 "incomplete": incomplete,
                 "incomplete_warning": incomplete_warning,
-                # ✅ Bug #1 + все случаи: всегда False, пользователь решает
                 "confirmed": False,
             })
 
@@ -287,18 +325,22 @@ async def _yd_prepare_files(
                     }
 
         if cleanup_needed:
-            logging.info(f"Задача {task_id} отменена до сохранения pending")
+            logging.info(f"[YD-PREP] Задача {task_id} отменена до сохранения pending")
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
             )
             return
 
-        # ✅ Показываем промпт для всех неподтверждённых файлов
         needs_confirm = [
             p for p in prepared
             if "pngs_sorted" in p and not p.get("confirmed")
         ]
+
+        logging.info(
+            f"[YD-PREP] Готово: prepared={len(prepared)}, "
+            f"needs_confirm={len(needs_confirm)}"
+        )
 
         if not needs_confirm:
             await _yd_upload_files(
@@ -317,7 +359,7 @@ async def _yd_prepare_files(
         )
 
     except Exception as e:
-        logging.error(f"Ошибка _yd_prepare_files: {e}", exc_info=True)
+        logging.error(f"[YD-PREP] Ошибка: {e}", exc_info=True)
         await _yd_cleanup_task(
             task_id, session_key, task_dir,
             owner_user_id, chat_id, nonce,
@@ -341,10 +383,6 @@ async def _yd_ask_sermon_confirmation(
 # ==========================================
 
 async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
-    """
-    Атомарно проверяет и 'потребляет' промпт.
-    Возвращает pending при успехе, иначе None.
-    """
     parts = callback.data.split(":")
     if len(parts) != 4:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
@@ -402,17 +440,6 @@ async def _yd_render_sermon_prompt(
     status_msg,
     reply_fn=None,
 ) -> None:
-    """
-    Единая точка отрисовки промпта подтверждения проповеди.
-
-    Логика:
-      - Диапазон валиден (matches + start/end) → «Найдена пометка», 3 кнопки.
-      - Иначе → «Диапазон не определён» с объяснением причины, 2 кнопки:
-        * не прочитаны заметки
-        * заметки прочитаны частично
-        * одна пометка (нет диапазона)
-        * заметок нет вообще
-    """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
@@ -437,7 +464,6 @@ async def _yd_render_sermon_prompt(
 
     kb = InlineKeyboardBuilder()
 
-    # ✅ Bug #1: авто-подтверждение только если диапазон валиден
     has_valid_range = (
         bool(matches)
         and start is not None
@@ -445,8 +471,13 @@ async def _yd_render_sermon_prompt(
         and start <= end
     )
 
+    logging.debug(
+        f"[YD-PROMPT] task_id={task_id}, idx={idx}, file={file_name!r}, "
+        f"matches={len(matches)}, start={start}, end={end}, "
+        f"has_valid_range={has_valid_range}"
+    )
+
     if has_valid_range:
-        # --- Проповедь найдена, диапазон валиден ---
         preview = ", ".join(str(n) for n in matches[:15])
         if len(matches) > 15:
             preview += f" …и ещё {len(matches) - 15}"
@@ -474,26 +505,22 @@ async def _yd_render_sermon_prompt(
             ),
         )
     else:
-        # --- Авто-диапазон не построен: объясняем причину ---
         notes_ok = item.get("notes_ok", True)
         incomplete = item.get("incomplete", False)
 
         if not notes_ok:
-            # ✅ Bug #2: провал чтения заметок
             reason = (
                 "⚠️ <b>Не удалось прочитать заметки докладчика.</b>\n"
                 "Возможно, файл повреждён или содержит только изображения.\n"
                 "Укажите диапазон вручную, если проповедь присутствует."
             )
         elif incomplete:
-            # ✅ Bug #2: частичное чтение
             reason = (
                 "⚠️ <b>Заметки прочитаны частично.</b>\n"
                 "Автоматически определить проповедь не удалось.\n"
                 "Укажите диапазон вручную, если проповедь присутствует."
             )
         elif matches:
-            # ✅ Bug #1: одна пометка — не диапазон
             match_str = ", ".join(str(n) for n in matches[:5])
             reason = (
                 f"📌 Найдена <b>одна</b> пометка «проповедь»: "
@@ -537,7 +564,6 @@ async def _yd_render_sermon_prompt(
         )
         return
 
-    # Проверяем, что nonce не перебили
     if pending.get("prompt_nonce") != prompt_nonce:
         logging.info(
             f"_yd_render_sermon_prompt: nonce изменён конкурентно для {task_id}"
@@ -564,7 +590,6 @@ async def _yd_render_sermon_prompt(
 
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
-    """Если пользователь не ответил на промпт — очищаем задачу."""
     try:
         await asyncio.sleep(timeout_sec)
         session = sessions.get(task_id)
@@ -575,7 +600,7 @@ async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_n
             return
         if pending.get("prompt_nonce") != expected_nonce:
             return
-        logging.info(f"⏰ Промпт {task_id} не подтверждён за {timeout_sec}s — очистка")
+        logging.info(f"[YD-PROMPT] ⏰ Промпт {task_id} не подтверждён за {timeout_sec}s — очистка")
         await _yd_cleanup_task(
             task_id,
             pending.get("session_key"),
@@ -605,9 +630,11 @@ async def _yd_cleanup_task(
     status_msg=None,
     error: Optional[Exception] = None,
 ):
-    """
-    Идемпотентная очистка. Безопасна к pending=None и к вызову из собственного watchdog'а.
-    """
+    logging.info(
+        f"[YD-CLEANUP] task_id={task_id}, session_key={session_key!r}, "
+        f"reason={'error' if error else 'normal'}"
+    )
+
     # 1. Папка задачи
     try:
         if task_dir and task_dir.exists():
@@ -616,7 +643,7 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
 
-    # 2. Watchdog — устойчиво к pending=None, не отменяем сами себя
+    # 2. Watchdog
     try:
         session = sessions.get(task_id)
         if session is not None:
@@ -635,7 +662,7 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True)
 
-    # 3. Сессии + реестр активных yd-задач
+    # 3. Сессии
     try:
         async with yd_session_lock:
             picker = sessions.get(session_key)
@@ -654,13 +681,13 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка очистки сессий для {task_id}: {e}", exc_info=True)
 
-    # 4. yd_release — best effort
+    # 4. yd_release
     try:
         await yd_release(owner_user_id, chat_id, nonce)
     except Exception as e:
         logging.error(f"Ошибка yd_release для {task_id}: {e}", exc_info=True)
 
-    # 5. Сообщение об ошибке — best effort
+    # 5. Сообщение об ошибке
     if error is not None and bot is not None and status_msg is not None:
         try:
             await status_msg.edit_text(
@@ -674,7 +701,7 @@ async def _yd_cleanup_task(
 
 
 # ==========================================
-# ЗАГРУЗКА НА ЯНДЕКС.ДИСК
+# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия)
 # ==========================================
 
 async def _yd_upload_files(
@@ -687,7 +714,7 @@ async def _yd_upload_files(
     if not session or "pending" not in session:
         return
     if session.get("cancelled"):
-        logging.info(f"Задача {task_id} отменена — upload пропущен")
+        logging.info(f"[YD-UP] Задача {task_id} отменена — upload пропущен")
         pending = session.get("pending")
         if isinstance(pending, dict):
             await _yd_cleanup_task(
@@ -714,22 +741,33 @@ async def _yd_upload_files(
 
     cleanup_done = False
 
+    logging.info(
+        f"[YD-UP] Старт: task_id={task_id}, файлов={len(prepared)}, "
+        f"target_base={target_base!r}"
+    )
+
     try:
-        total_uploaded = 0
+        total_uploaded_zip = 0
+        total_slides_packed = 0
         total_failed = 0
         report_lines = [f"📁 Обработано файлов: <b>{len(prepared)}</b>\n"]
+
+        # Собираем целевые папки для ссылок (уникальные)
+        links_by_folder: dict[str, str] = {}
 
         for f_idx, item in enumerate(prepared, start=1):
             _touch_task(task_dir)
 
             current_session = sessions.get(task_id)
             if current_session is None or current_session.get("cancelled"):
-                logging.info(f"Задача {task_id} отменена — прерываем upload")
+                logging.info(f"[YD-UP] Задача {task_id} отменена — прерываем upload")
                 return
 
             file_name = item["file_name"]
             file_name_esc = html_module.escape(file_name)
+            file_slug = item["file_slug"]
 
+            # Ошибки подготовки
             if item.get("failed_at_stage"):
                 stage = item["failed_at_stage"]
                 stage_text = {
@@ -739,135 +777,255 @@ async def _yd_upload_files(
                 }.get(stage, stage)
                 report_lines.append(f"❌ {file_name_esc} — {stage_text}")
                 total_failed += 1
+                logging.warning(f"[YD-UP] {file_name}: failed_at_stage={stage}")
                 continue
 
             pngs_sorted = item["pngs_sorted"]
-            file_slug = item["file_slug"]
             start = item.get("start")
             end = item.get("end")
             incomplete_warning = item.get("incomplete_warning")
+            ranges = item.get("ranges")
+
+            logging.info(
+                f"[YD-UP] Файл #{f_idx}: {file_name!r}, "
+                f"pngs={len(pngs_sorted)}, ranges={ranges}"
+            )
 
             try:
                 await status_msg.edit_text(
-                    f"📤 Загружаю PNG на Яндекс.Диск ({file_name_esc})...",
+                    f"📦 Готовлю архивы для <code>{file_name_esc}</code>...",
                     parse_mode="HTML",
                 )
-            except Exception as e:
-                logging.warning(f"Не удалось обновить status_msg: {e}")
+            except Exception:
+                pass
 
+            # Формируем целевые папки на Диске
             pptx2png_dir = (
                 f"{target_base}/{yandex_state.config.pptx2png_folder}/{file_slug}"
             )
             sermon_dir = f"{target_base}/{yandex_state.config.sermon_folder}"
 
             ok1 = await yandex_state.config.client.ensure_folder(pptx2png_dir)
-            ok2 = await yandex_state.config.client.ensure_folder(sermon_dir)
-            if not ok1 or not ok2:
-                logging.error(f"Не удалось создать папки: pptx2png={ok1}, sermon={ok2}")
+            if not ok1:
+                logging.error(f"[YD-UP] {file_name}: не удалось создать {pptx2png_dir!r}")
                 report_lines.append(f"❌ {file_name_esc} — не удалось создать папки")
                 total_failed += 1
                 continue
 
-            uploaded_sermon = 0
-            uploaded_other = 0
-            failed_sermon = 0
-            failed_other = 0
-
+            # Разделяем PNG на sermon / others
+            sermon_pngs = []
+            other_pngs = []
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
-                current_session = sessions.get(task_id)
-                if current_session is None or current_session.get("cancelled"):
-                    logging.info(f"Задача {task_id} отменена в середине upload")
-                    return
-
-                is_sermon = _is_sermon_slide(item, slide_idx)
-                if is_sermon:
-                    remote_path = f"{sermon_dir}/{file_slug}_{png_path.name}"
+                if _is_sermon_slide(item, slide_idx):
+                    sermon_pngs.append(png_path)
                 else:
-                    remote_path = f"{pptx2png_dir}/{png_path.name}"
+                    other_pngs.append(png_path)
+
+            # === Архив с проповедью (если есть) ===
+            if sermon_pngs:
+                ok2 = await yandex_state.config.client.ensure_folder(sermon_dir)
+                if not ok2:
+                    logging.error(
+                        f"[YD-UP] {file_name}: не удалось создать {sermon_dir!r}"
+                    )
+                    report_lines.append(
+                        f"❌ {file_name_esc} — не удалось создать папку проповеди"
+                    )
+                    total_failed += 1
+                    continue
+
+                sermon_zip_name = f"{file_slug}_проповедь.zip"
+                sermon_zip_path = task_dir / sermon_zip_name
+
+                try:
+                    await asyncio.to_thread(
+                        create_zip_stream, sermon_pngs, sermon_zip_path
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-UP] {file_name}: ошибка создания ZIP проповеди: {e}",
+                        exc_info=True,
+                    )
+                    report_lines.append(
+                        f"❌ {file_name_esc} — ошибка упаковки проповеди"
+                    )
+                    total_failed += 1
+                    continue
+
+                sermon_zip_size = sermon_zip_path.stat().st_size
+                remote_path = f"{sermon_dir}/{sermon_zip_name}"
+
+                logging.debug(
+                    f"[YD-UP] {file_name}: загружаю {sermon_zip_name!r} "
+                    f"({_format_size(sermon_zip_size)}) → {remote_path!r}"
+                )
+
+                try:
+                    await status_msg.edit_text(
+                        f"📤 Загружаю архив проповеди "
+                        f"(<code>{file_name_esc}</code>)...",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
                 ok = await yandex_state.config.client.upload_file(
-                    png_path, remote_path
+                    sermon_zip_path, remote_path
                 )
+
                 if ok:
-                    if is_sermon:
-                        uploaded_sermon += 1
-                    else:
-                        uploaded_other += 1
+                    total_uploaded_zip += 1
+                    total_slides_packed += len(sermon_pngs)
+                    links_by_folder[sermon_dir] = "🎯 Проповедь"
+                    sermon_info = (
+                        f"🎯 Проповедь ({start}–{end}): {len(sermon_pngs)} слайдов → "
+                        f"<code>{html_module.escape(yandex_state.config.sermon_folder)}/"
+                        f"{html_module.escape(sermon_zip_name)}</code> "
+                        f"({_format_size(sermon_zip_size)})"
+                    )
+                    logging.info(
+                        f"[YD-UP] {file_name}: sermon ZIP загружен "
+                        f"({len(sermon_pngs)} слайдов)"
+                    )
                 else:
-                    logging.error(f"Не удалось загрузить {png_path.name}")
-                    if is_sermon:
-                        failed_sermon += 1
-                    else:
-                        failed_other += 1
+                    total_failed += 1
+                    sermon_info = (
+                        f"❌ Проповедь ({start}–{end}): не удалось загрузить ZIP"
+                    )
+                    logging.error(f"[YD-UP] {file_name}: sermon ZIP upload failed")
 
-            total_uploaded += uploaded_sermon + uploaded_other
-            total_failed += failed_sermon + failed_other
-
-            ranges = item.get("ranges")
-            if ranges:
-                ranges_text = ", ".join(
-                    f"{s}–{e}" if s != e else str(s) for s, e in ranges
-                )
-                sermon_info = (
-                    f"🎯 Проповедь ({ranges_text}): "
-                    f"{uploaded_sermon} загружено"
-                    + (f", {failed_sermon} ошибок" if failed_sermon else "")
-                )
-                other_info = (
-                    f"📄 Остальные: {uploaded_other} загружено"
-                    + (f", {failed_other} ошибок" if failed_other else "")
-                )
-            elif start is not None:
-                sermon_info = (
-                    f"🎯 Проповедь ({start}–{end}): "
-                    f"{uploaded_sermon} загружено"
-                    + (f", {failed_sermon} ошибок" if failed_sermon else "")
-                )
-                other_info = (
-                    f"📄 Остальные: {uploaded_other} загружено"
-                    + (f", {failed_other} ошибок" if failed_other else "")
-                )
+                # Удаляем локальный ZIP сразу
+                try:
+                    sermon_zip_path.unlink()
+                except Exception:
+                    pass
             else:
-                sermon_info = "🎯 Проповедь: не найдена (все PNG в общую папку)"
-                other_info = (
-                    f"📄 Все слайды: {uploaded_other} загружено"
-                    + (f", {failed_other} ошибок" if failed_other else "")
+                sermon_info = None
+
+            # === Архив с остальными слайдами ===
+            if other_pngs:
+                other_zip_name = f"{file_slug}_слайды.zip"
+                other_zip_path = task_dir / other_zip_name
+
+                try:
+                    await asyncio.to_thread(
+                        create_zip_stream, other_pngs, other_zip_path
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-UP] {file_name}: ошибка создания ZIP слайдов: {e}",
+                        exc_info=True,
+                    )
+                    report_lines.append(
+                        f"❌ {file_name_esc} — ошибка упаковки слайдов"
+                    )
+                    total_failed += 1
+                    if sermon_info:
+                        report_lines.append(f"{f_idx}. 📄 <b>{file_name_esc}</b>")
+                        report_lines.append(f"   • {sermon_info}")
+                    continue
+
+                other_zip_size = other_zip_path.stat().st_size
+                remote_path = f"{pptx2png_dir}/{other_zip_name}"
+
+                logging.debug(
+                    f"[YD-UP] {file_name}: загружаю {other_zip_name!r} "
+                    f"({_format_size(other_zip_size)}) → {remote_path!r}"
                 )
 
-            entry = (
-                f"{f_idx}. 📄 <b>{file_name_esc}</b>\n"
-                f"   • {sermon_info}\n"
-                f"   • {other_info}"
-            )
-            if incomplete_warning:
-                entry += f"\n   • {incomplete_warning}"
-            report_lines.append(entry)
+                try:
+                    await status_msg.edit_text(
+                        f"📤 Загружаю архив слайдов "
+                        f"(<code>{file_name_esc}</code>)...",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
+                ok = await yandex_state.config.client.upload_file(
+                    other_zip_path, remote_path
+                )
+
+                other_folder_short = (
+                    f"{yandex_state.config.pptx2png_folder}/{file_slug}"
+                )
+
+                if ok:
+                    total_uploaded_zip += 1
+                    total_slides_packed += len(other_pngs)
+                    links_by_folder[pptx2png_dir] = "📄 Остальные слайды"
+                    other_info = (
+                        f"📄 Остальные: {len(other_pngs)} слайдов → "
+                        f"<code>{html_module.escape(other_folder_short)}/"
+                        f"{html_module.escape(other_zip_name)}</code> "
+                        f"({_format_size(other_zip_size)})"
+                    )
+                    logging.info(
+                        f"[YD-UP] {file_name}: slides ZIP загружен "
+                        f"({len(other_pngs)} слайдов)"
+                    )
+                else:
+                    total_failed += 1
+                    other_info = "❌ Остальные слайды: не удалось загрузить ZIP"
+                    logging.error(f"[YD-UP] {file_name}: slides ZIP upload failed")
+
+                try:
+                    other_zip_path.unlink()
+                except Exception:
+                    pass
+            else:
+                other_info = "📄 Остальные: нет слайдов вне проповеди"
+
+            # Формируем запись отчёта
+            entry_lines = [f"{f_idx}. 📄 <b>{file_name_esc}</b>"]
+            if sermon_info:
+                entry_lines.append(f"   • {sermon_info}")
+            entry_lines.append(f"   • {other_info}")
+            if incomplete_warning:
+                entry_lines.append(f"   • {incomplete_warning}")
+            report_lines.append("\n".join(entry_lines))
+
+        # Итог
         if total_failed > 0:
             report_lines.append(
-                f"\n⚠️ Всего загружено PNG: <b>{total_uploaded}</b>\n"
+                f"\n⚠️ Всего загружено архивов: <b>{total_uploaded_zip}</b>\n"
+                f"📊 Всего слайдов: <b>{total_slides_packed}</b>\n"
                 f"❌ Ошибок: <b>{total_failed}</b>"
             )
         else:
-            report_lines.append(f"\n📊 Всего загружено PNG: <b>{total_uploaded}</b>")
+            report_lines.append(
+                f"\n📊 Всего загружено архивов: <b>{total_uploaded_zip}</b>\n"
+                f"📊 Всего слайдов: <b>{total_slides_packed}</b>"
+            )
 
-        report_lines.append(
-            f"\n🔗 <a href=\"https://disk.yandex.ru/client/disk"
-            f"{html_module.escape(pending.get('target_base', ''))}\">"
-            f"Открыть на Яндекс.Диске</a>"
-        )
+        # Ссылки на Яндекс.Диск
+        if links_by_folder:
+            report_lines.append("\n🔗 <b>Ссылки на Яндекс.Диск:</b>")
+            for folder_path, label in links_by_folder.items():
+                url = _yd_public_url(folder_path)
+                folder_name = folder_path.rsplit("/", 1)[-1]
+                report_lines.append(
+                    f'   • {label}: <a href="{url}">'
+                    f'{html_module.escape(folder_name)}/</a>'
+                )
+                logging.debug(f"[YD-UP] ссылка на {label}: {url}")
 
         await _yd_send_report(
             bot=bot,
             chat_id=chat_id,
             status_msg=status_msg,
             report_lines=report_lines,
-            total_uploaded=total_uploaded,
+            total_uploaded=total_uploaded_zip,
             total_failed=total_failed,
         )
 
+        logging.info(
+            f"[YD-UP] Итог: zip={total_uploaded_zip}, "
+            f"slides={total_slides_packed}, failed={total_failed}"
+        )
+
     except Exception as e:
-        logging.error(f"Ошибка _yd_upload_files: {e}", exc_info=True)
+        logging.error(f"[YD-UP] Ошибка: {e}", exc_info=True)
         cleanup_done = True
         await _yd_cleanup_task(
             task_id, session_key, task_dir,
@@ -976,7 +1134,6 @@ async def _yd_send_report(
 
 @router.message(Command("sunday"))
 async def cmd_sunday(message: types.Message, check_access):
-    """Проверка Диска + вывод найденных pptx для ближайшего предстоящего воскресенья."""
     if not await check_access(message):
         return
 
@@ -987,6 +1144,11 @@ async def cmd_sunday(message: types.Message, check_access):
     if not yandex_state.config.base_path:
         await message.reply("❌ Не задан base_path Яндекс.Диска в settings.ini.")
         return
+
+    logging.info(
+        f"[YD] /sunday от user={message.from_user.id}, "
+        f"base_path={yandex_state.config.base_path!r}"
+    )
 
     nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
     if nonce is None:
@@ -1047,12 +1209,16 @@ async def cmd_sunday(message: types.Message, check_access):
             )
             return
 
+        logging.debug(
+            f"[YD] paths: source={paths['source']!r}, target={paths['target']!r}"
+        )
+
         try:
             pptx_files = await find_pptx_in_source(
                 yandex_state.config.client, paths["source"], sunday
             )
         except YandexDiskError as e:
-            logging.error(f"Ошибка доступа к источнику: {e}")
+            logging.error(f"[YD] Ошибка доступа к источнику: {e}")
             await status_msg.edit_text(
                 f"❌ <b>Ошибка обращения к Яндекс.Диску</b>\n\n"
                 f"<code>{html_module.escape(str(e))}</code>\n\n"
@@ -1060,6 +1226,13 @@ async def cmd_sunday(message: types.Message, check_access):
                 parse_mode="HTML",
             )
             return
+
+        logging.info(f"[YD] Найдено pptx: {len(pptx_files)}")
+        for f in pptx_files:
+            logging.debug(
+                f"[YD] - {f['name']!r} ({f.get('size', 0)} байт, "
+                f"path={f['path']!r})"
+            )
 
         if not pptx_files:
             src_esc = html_module.escape(yandex_state.config.source_folder)
@@ -1103,7 +1276,7 @@ async def cmd_sunday(message: types.Message, check_access):
 
         if not await yd_is_active(message.from_user.id, message.chat.id, nonce):
             logging.info(
-                f"Сессия {message.from_user.id}:{message.chat.id} "
+                f"[YD] Сессия {message.from_user.id}:{message.chat.id} "
                 f"была отменена во время выполнения"
             )
             try:
@@ -1161,12 +1334,12 @@ async def cmd_sunday(message: types.Message, check_access):
 
         await yd_release(message.from_user.id, message.chat.id, nonce)
         logging.info(
-            f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+            f"[YD] 🔓 Сессия {message.from_user.id}:{message.chat.id} "
             f"освобождена после показа списка (nonce={nonce[:8]}...)"
         )
 
     except Exception as e:
-        logging.error(f"Ошибка cmd_sunday: {e}", exc_info=True)
+        logging.error(f"[YD] Ошибка cmd_sunday: {e}", exc_info=True)
         try:
             if status_msg:
                 await status_msg.edit_text(
@@ -1182,7 +1355,7 @@ async def cmd_sunday(message: types.Message, check_access):
             released = await yd_release(message.from_user.id, message.chat.id, nonce)
             if released:
                 logging.info(
-                    f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
+                    f"[YD] 🔓 Сессия {message.from_user.id}:{message.chat.id} "
                     f"освобождена (неудачный запуск, nonce={nonce[:8]}...)"
                 )
 
@@ -1372,10 +1545,9 @@ async def yd_sermon_ok(callback: types.CallbackQuery, bot: Bot):
     idx = int(parts[2])
     item = pending["prepared"][idx]
 
-    # ✅ Bug #1: страховка — нельзя подтвердить невалидный диапазон
     if item.get("start") is None or item.get("end") is None:
         logging.warning(
-            f"yd_sermon_ok: попытка подтвердить пустой диапазон для "
+            f"[YD-PROMPT] yd_sermon_ok: пустой диапазон, "
             f"idx={idx}, task_id={task_id}"
         )
         await callback.answer(
@@ -1471,7 +1643,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     total_slides = len(current["pngs_sorted"])
     file_name_esc = html_module.escape(current["file_name"])
 
-    # Объединённый guarded-блок: callback.answer + edit_text
     sent_msg = None
     try:
         await callback.answer()
@@ -1538,7 +1709,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 # ==========================================
 # ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handlers.py
 # ==========================================
-# handle_text_input живёт в handlers.py, но обрабатывает Yandex-промпты.
 
 render_sermon_prompt = _yd_render_sermon_prompt
 upload_files = _yd_upload_files
