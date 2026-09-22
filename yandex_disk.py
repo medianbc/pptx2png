@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.5)
+# yandex_disk.py — клиент Яндекс.Диска (v1.7)
 # ==========================================
 
 import aiohttp
@@ -22,10 +22,6 @@ RUSSIAN_MONTHS = [
 # ==========================================
 # КОНСТАНТЫ ОШИБОК ЯНДЕКС API
 # ==========================================
-# HTTP 409 от Яндекс API используется для ДВУХ разных ситуаций:
-# 1. Папка/ресурс уже существует → это успех
-# 2. Родительская папка отсутствует → это провал
-# Различаем по полю `error` из тела ответа.
 
 YD_EXISTS_ERRORS = frozenset({
     "DiskPathAlreadyExistsError",
@@ -36,6 +32,62 @@ YD_EXISTS_ERRORS = frozenset({
 YD_PARENT_NOT_FOUND_ERRORS = frozenset({
     "DiskPathDoesntExistsError",
 })
+
+
+# ==========================================
+# УТИЛИТЫ ПУТЕЙ
+# ==========================================
+
+def strip_disk_prefix(path: str) -> str:
+    """
+    Убирает префикс 'disk:' из пути Яндекс.Диска.
+
+    API возвращает пути вида 'disk:/folder/sub' в ответах,
+    но НЕ принимает их в параметрах запросов — только '/folder/sub'.
+
+    Применяется ко всем путям, которые приходят из ответов API,
+    и защищает методы на входе, если пользователь случайно передал 'disk:'.
+    """
+    if isinstance(path, str) and path.startswith("disk:"):
+        return path[len("disk:"):]
+    return path
+
+
+def normalize_resource_paths(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Рекурсивно нормализует пути в объекте ресурса Яндекс.Диска:
+
+    - item["path"]                              → без 'disk:'
+    - item["_embedded"]["path"]                 → без 'disk:'
+    - item["_embedded"]["items"][*]["path"]     → без 'disk:' (рекурсивно)
+
+    API возвращает пути с префиксом 'disk:' в ответах на GET /resources,
+    но не принимает их в параметрах запросов. Эта функция приводит ответ
+    к каноническому виду, чтобы все методы клиента работали с одним
+    форматом путей.
+
+    Возвращает тот же объект (мутирует на месте для экономии памяти).
+    """
+    if not isinstance(item, dict):
+        return item
+
+    # 1. Собственный path
+    if "path" in item and isinstance(item["path"], str):
+        item["path"] = strip_disk_prefix(item["path"])
+
+    # 2. _embedded.path и _embedded.items[*]
+    embedded = item.get("_embedded")
+    if isinstance(embedded, dict):
+        if "path" in embedded and isinstance(embedded["path"], str):
+            embedded["path"] = strip_disk_prefix(embedded["path"])
+
+        # Рекурсивно нормализуем каждого ребёнка
+        items = embedded.get("items")
+        if isinstance(items, list):
+            for child in items:
+                normalize_resource_paths(child)
+
+    return item
 
 
 # ==========================================
@@ -59,8 +111,7 @@ class YandexDiskNotFoundError(YandexDiskError):
 class YandexDiskClient:
     """
     Асинхронный клиент для REST API Яндекс.Диска.
-    Использует ОБЩУЮ aiohttp.ClientSession (передаётся извне),
-    чтобы не открывать новое TCP-соединение при каждом запросе.
+    Использует ОБЩУЮ aiohttp.ClientSession (передаётся извне).
     """
 
     def __init__(self, token: str, http_session: aiohttp.ClientSession):
@@ -94,16 +145,10 @@ class YandexDiskClient:
     # ---------- Метаданные ----------
 
     async def resource_type(self, path: str) -> Optional[str]:
-        """
-        Лёгкий запрос метаданных: возвращает 'dir', 'file' или None (не существует).
-        Не тянет _embedded — экономит трафик и время для больших папок.
-        Бросает YandexDiskError при транзиентных сбоях (не 404).
-        """
+        """Лёгкий запрос: только type, без _embedded."""
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
-        params = {
-            "path": path,
-            "fields": "type",
-        }
+        params = {"path": path, "fields": "type"}
         try:
             async with self.session.get(
                 url, headers=self.headers, params=params, timeout=15
@@ -127,10 +172,8 @@ class YandexDiskClient:
         limit: int = 1000,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Полные метаданные ресурса с _embedded (список детей).
-        Используется, когда действительно нужен список содержимого.
-        """
+        """Полные метаданные с _embedded (для списка содержимого)."""
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
@@ -146,7 +189,10 @@ class YandexDiskClient:
                     raise YandexDiskNotFoundError(f"Не найдено: {path}")
                 if resp.status != 200:
                     raise YandexDiskError(f"HTTP {resp.status} для {path}")
-                return await resp.json()
+                data = await resp.json()
+                # ✅ Рекурсивная нормализация всех путей в ответе
+                normalize_resource_paths(data)
+                return data
         except aiohttp.ClientError as e:
             raise YandexDiskError(f"Сеть: {e}")
         except (YandexDiskNotFoundError, YandexDiskError):
@@ -155,6 +201,10 @@ class YandexDiskClient:
             raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
     async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
+        """
+        Возвращает список элементов папки.
+        Пути в каждом элементе уже нормализованы (без 'disk:').
+        """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
@@ -180,12 +230,7 @@ class YandexDiskClient:
         return all_items
 
     async def folder_exists(self, path: str) -> bool:
-        """
-        Проверяет существование папки через лёгкий resource_type.
-        404 → False. Иначе проверяет type == "dir".
-        При транзиентных сбоях (не 404) пробрасывает YandexDiskError,
-        чтобы вызывающий мог отличить «папки нет» от «не смог проверить».
-        """
+        """Проверяет существование папки. 404 → False."""
         t = await self.resource_type(path)
         return t == "dir"
 
@@ -200,6 +245,9 @@ class YandexDiskClient:
                 continue
             try:
                 if predicate(item["name"]):
+                    # Дополнительная страховка (нормализация уже сделана выше)
+                    if isinstance(item.get("path"), str):
+                        item["path"] = strip_disk_prefix(item["path"])
                     return item
             except Exception as e:
                 logging.error(f"Ошибка предиката для '{item['name']}': {e}")
@@ -208,10 +256,7 @@ class YandexDiskClient:
     # ---------- Скачивание / Загрузка ----------
 
     async def download_file(self, remote_path: str, destination: Path) -> bool:
-        """
-        Скачивает файл с Диска ПОТОКОВО (chunked),
-        не загружая весь файл в память.
-        """
+        remote_path = strip_disk_prefix(remote_path)
         url = f"{YANDEX_API_BASE}/resources/download"
         params = {"path": remote_path}
         try:
@@ -240,6 +285,7 @@ class YandexDiskClient:
 
     async def upload_file(self, local_path: Path, remote_path: str,
                           overwrite: bool = True) -> bool:
+        remote_path = strip_disk_prefix(remote_path)
         url = f"{YANDEX_API_BASE}/resources/upload"
         params = {"path": remote_path, "overwrite": str(overwrite).lower()}
         try:
@@ -270,26 +316,21 @@ class YandexDiskClient:
         """
         Создаёт одну папку (без родителей).
 
-        HTTP 409 от Яндекс API используется для ДВУХ разных ситуаций:
-        1. Папка/ресурс уже существует → это успех.
-        2. Родительская папка отсутствует → это провал.
-
-        Различаем по полю `error` в теле ответа:
-        - whitelist YD_EXISTS_ERRORS → True
-        - YD_PARENT_NOT_FOUND_ERRORS → False
-        - неизвестный 409 → fallback GET для подтверждения
+        HTTP 409:
+        - YD_EXISTS_ERRORS → True (папка уже есть)
+        - YD_PARENT_NOT_FOUND_ERRORS → False (родителя нет)
+        - неизвестный → fallback GET
         """
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
         try:
             async with self.session.put(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
-                # 201 = создано
                 if resp.status == 201:
                     return True
 
-                # 409 = конфликт. Различаем по error-коду.
                 if resp.status == 409:
                     error_code = ""
                     try:
@@ -307,11 +348,9 @@ class YandexDiskClient:
                             f"create_folder {path}: не удалось прочитать 409: {e}"
                         )
 
-                    # ✅ Папка/ресурс уже существует — успех
                     if error_code in YD_EXISTS_ERRORS:
                         return True
 
-                    # ❌ Родителя нет — провал (ensure_folder создаст родителя)
                     if error_code in YD_PARENT_NOT_FOUND_ERRORS:
                         logging.error(
                             f"create_folder {path}: 409 {error_code} — "
@@ -319,7 +358,6 @@ class YandexDiskClient:
                         )
                         return False
 
-                    # ⚠️ Неизвестный 409 — подтверждаем через GET
                     logging.warning(
                         f"create_folder {path}: неизвестный 409 "
                         f"error='{error_code}', проверяю через GET"
@@ -332,7 +370,6 @@ class YandexDiskClient:
                         )
                         return False
 
-                # Любая другая ошибка — логируем тело ответа
                 try:
                     body = await resp.text()
                 except Exception:
@@ -347,14 +384,10 @@ class YandexDiskClient:
 
     async def ensure_folder(self, path: str) -> bool:
         """
-        Создаёт папку и всех родителей при необходимости.
-        Сначала проверяет существование, только потом создаёт.
-
+        Создаёт папку и всех родителей.
         Для "/a/b/c" проверит/создаст /a, /a/b, /a/b/c.
-
-        Если проверка существования падает с YandexDiskError —
-        логируем и всё равно пробуем создать (не прерываем флоу).
         """
+        path = strip_disk_prefix(path)
         parts = [p for p in path.strip("/").split("/") if p]
         for i in range(1, len(parts) + 1):
             current = "/" + "/".join(parts[:i])
@@ -451,11 +484,15 @@ async def resolve_sunday_paths(
         logging.warning(f"Папка даты '{sunday:%d.%m.%Y}' не найдена в {month['path']}")
         return None
 
+    # Дополнительная страховка (нормализация уже сделана в get_resource)
+    month_path = strip_disk_prefix(month["path"])
+    date_path = strip_disk_prefix(date_folder["path"])
+
     return {
-        "month_folder": month["path"],
-        "date_folder": date_folder["path"],
-        "source": f"{date_folder['path']}/{source_folder}",
-        "target": f"{date_folder['path']}/{target_folder}",
+        "month_folder": month_path,
+        "date_folder": date_path,
+        "source": f"{date_path}/{source_folder}",
+        "target": f"{date_path}/{target_folder}",
     }
 
 
@@ -468,6 +505,7 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
+    source_path = strip_disk_prefix(source_path)
     if not await client.folder_exists(source_path):
         return []
     items = await client.list_folder(source_path)
