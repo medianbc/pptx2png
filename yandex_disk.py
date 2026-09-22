@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.6)
+# yandex_disk.py — клиент Яндекс.Диска (v1.7)
 # ==========================================
 
 import aiohttp
@@ -55,19 +55,37 @@ def strip_disk_prefix(path: str) -> str:
 
 def normalize_resource_paths(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Нормализует поле 'path' и '_embedded.path' в объекте ресурса.
-    Возвращает тот же объект (мутирует на месте для экономии).
+    Рекурсивно нормализует пути в объекте ресурса Яндекс.Диска:
+
+    - item["path"]                              → без 'disk:'
+    - item["_embedded"]["path"]                 → без 'disk:'
+    - item["_embedded"]["items"][*]["path"]     → без 'disk:' (рекурсивно)
+
+    API возвращает пути с префиксом 'disk:' в ответах на GET /resources,
+    но не принимает их в параметрах запросов. Эта функция приводит ответ
+    к каноническому виду, чтобы все методы клиента работали с одним
+    форматом путей.
+
+    Возвращает тот же объект (мутирует на месте для экономии памяти).
     """
     if not isinstance(item, dict):
         return item
 
+    # 1. Собственный path
     if "path" in item and isinstance(item["path"], str):
         item["path"] = strip_disk_prefix(item["path"])
 
+    # 2. _embedded.path и _embedded.items[*]
     embedded = item.get("_embedded")
     if isinstance(embedded, dict):
         if "path" in embedded and isinstance(embedded["path"], str):
             embedded["path"] = strip_disk_prefix(embedded["path"])
+
+        # Рекурсивно нормализуем каждого ребёнка
+        items = embedded.get("items")
+        if isinstance(items, list):
+            for child in items:
+                normalize_resource_paths(child)
 
     return item
 
@@ -128,7 +146,7 @@ class YandexDiskClient:
 
     async def resource_type(self, path: str) -> Optional[str]:
         """Лёгкий запрос: только type, без _embedded."""
-        path = strip_disk_prefix(path)   # ✅ защита
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path, "fields": "type"}
         try:
@@ -155,7 +173,7 @@ class YandexDiskClient:
         offset: int = 0,
     ) -> Dict[str, Any]:
         """Полные метаданные с _embedded (для списка содержимого)."""
-        path = strip_disk_prefix(path)   # ✅ защита
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
@@ -172,7 +190,7 @@ class YandexDiskClient:
                 if resp.status != 200:
                     raise YandexDiskError(f"HTTP {resp.status} для {path}")
                 data = await resp.json()
-                # ✅ Нормализуем пути во всём ответе
+                # ✅ Рекурсивная нормализация всех путей в ответе
                 normalize_resource_paths(data)
                 return data
         except aiohttp.ClientError as e:
@@ -183,6 +201,10 @@ class YandexDiskClient:
             raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
     async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
+        """
+        Возвращает список элементов папки.
+        Пути в каждом элементе уже нормализованы (без 'disk:').
+        """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
@@ -223,7 +245,7 @@ class YandexDiskClient:
                 continue
             try:
                 if predicate(item["name"]):
-                    # ✅ Гарантия: path без префикса disk:
+                    # Дополнительная страховка (нормализация уже сделана выше)
                     if isinstance(item.get("path"), str):
                         item["path"] = strip_disk_prefix(item["path"])
                     return item
@@ -234,7 +256,7 @@ class YandexDiskClient:
     # ---------- Скачивание / Загрузка ----------
 
     async def download_file(self, remote_path: str, destination: Path) -> bool:
-        remote_path = strip_disk_prefix(remote_path)   # ✅ защита
+        remote_path = strip_disk_prefix(remote_path)
         url = f"{YANDEX_API_BASE}/resources/download"
         params = {"path": remote_path}
         try:
@@ -263,7 +285,7 @@ class YandexDiskClient:
 
     async def upload_file(self, local_path: Path, remote_path: str,
                           overwrite: bool = True) -> bool:
-        remote_path = strip_disk_prefix(remote_path)   # ✅ защита
+        remote_path = strip_disk_prefix(remote_path)
         url = f"{YANDEX_API_BASE}/resources/upload"
         params = {"path": remote_path, "overwrite": str(overwrite).lower()}
         try:
@@ -299,7 +321,7 @@ class YandexDiskClient:
         - YD_PARENT_NOT_FOUND_ERRORS → False (родителя нет)
         - неизвестный → fallback GET
         """
-        path = strip_disk_prefix(path)   # ✅ защита
+        path = strip_disk_prefix(path)
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
         try:
@@ -365,7 +387,7 @@ class YandexDiskClient:
         Создаёт папку и всех родителей.
         Для "/a/b/c" проверит/создаст /a, /a/b, /a/b/c.
         """
-        path = strip_disk_prefix(path)   # ✅ защита
+        path = strip_disk_prefix(path)
         parts = [p for p in path.strip("/").split("/") if p]
         for i in range(1, len(parts) + 1):
             current = "/" + "/".join(parts[:i])
@@ -462,7 +484,7 @@ async def resolve_sunday_paths(
         logging.warning(f"Папка даты '{sunday:%d.%m.%Y}' не найдена в {month['path']}")
         return None
 
-    # ✅ Дополнительная страховка: strip_disk_prefix на итоговых путях
+    # Дополнительная страховка (нормализация уже сделана в get_resource)
     month_path = strip_disk_prefix(month["path"])
     date_path = strip_disk_prefix(date_folder["path"])
 
@@ -483,7 +505,7 @@ async def find_pptx_in_source(
     source_path: str,
     sunday: datetime,
 ) -> List[Dict[str, Any]]:
-    source_path = strip_disk_prefix(source_path)   # ✅ защита
+    source_path = strip_disk_prefix(source_path)
     if not await client.folder_exists(source_path):
         return []
     items = await client.list_folder(source_path)
