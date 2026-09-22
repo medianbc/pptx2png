@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.0)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.1)
 # ==========================================
 
 import asyncio
@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import shutil
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -66,6 +67,49 @@ def _safe_delete_task_dir(task_dir: Path):
             logging.info(f"🧹 Удалена папка задачи: {task_dir}")
         except Exception as e:
             logging.error(f"Ошибка удаления папки {task_dir}: {e}")
+
+
+def _safe_unlink(path: Path):
+    """Безопасно удаляет файл, логирует ошибку при неудаче."""
+    if path is None:
+        return
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        logging.warning(f"Не удалось удалить {path}: {e}")
+
+
+async def _safe_edit(msg, text: str, **kwargs) -> bool:
+    """
+    Безопасный edit_text с логированием ошибок.
+    Раньше падения edit_text глотались через 'pass' — теперь логируются.
+    """
+    if msg is None:
+        return False
+    try:
+        await msg.edit_text(text, **kwargs)
+        return True
+    except Exception as e:
+        logging.warning(f"Не удалось обновить статус-сообщение: {e}", exc_info=True)
+        return False
+
+
+def _format_ranges_text(ranges, start=None, end=None) -> str:
+    """
+    Форматирует список диапазонов в '1–2, 8–9'.
+    Если ranges пустой, но есть start/end — использует их.
+    Пример: [(1,2), (8,9)] → '1–2, 8–9'.
+    """
+    if ranges:
+        return ", ".join(
+            f"{s}–{e}" if s != e else str(s) for s, e in ranges
+        )
+    if start is not None and end is not None:
+        if start != end:
+            return f"{start}–{end}"
+        return str(start)
+    return "—"
 
 
 def _is_sermon_slide(item: dict, slide_idx: int) -> bool:
@@ -138,10 +182,7 @@ async def _yd_prepare_files(
         picker = sessions.get(session_key)
         if picker is None:
             _safe_delete_task_dir(task_dir)
-            try:
-                await status_msg.edit_text("❌ Сессия была отменена.")
-            except Exception:
-                pass
+            await _safe_edit(status_msg, "❌ Сессия была отменена.")
             return
         picker.setdefault("task_ids", []).append(task_id)
         sessions[task_id] = {
@@ -181,13 +222,11 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
-            try:
-                await status_msg.edit_text(
-                    f"📥 Скачиваю <code>{file_name_esc}</code>...",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+            await _safe_edit(
+                status_msg,
+                f"📥 Скачиваю <code>{file_name_esc}</code>...",
+                parse_mode="HTML",
+            )
 
             local_pptx = task_dir / file_name
             ok = await yandex_state.config.client.download_file(
@@ -207,13 +246,11 @@ async def _yd_prepare_files(
                 f"размер={_format_size(local_pptx.stat().st_size)}"
             )
 
-            try:
-                await status_msg.edit_text(
-                    f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+            await _safe_edit(
+                status_msg,
+                f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
+                parse_mode="HTML",
+            )
 
             temp_png_dir = task_dir / f"png_{f_idx}"
             temp_png_dir.mkdir(exist_ok=True)
@@ -276,10 +313,7 @@ async def _yd_prepare_files(
             )
 
             if used_pptx != local_pptx and used_pptx.exists():
-                try:
-                    used_pptx.unlink()
-                except Exception:
-                    pass
+                _safe_unlink(used_pptx)
 
             item_ranges = [(start, end)] if start is not None else None
 
@@ -701,7 +735,7 @@ async def _yd_cleanup_task(
 
 
 # ==========================================
-# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия)
+# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия, v2.1)
 # ==========================================
 
 async def _yd_upload_files(
@@ -713,7 +747,12 @@ async def _yd_upload_files(
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
-    if session.get("cancelled"):
+
+    def _is_cancelled() -> bool:
+        s = sessions.get(task_id)
+        return s is None or s.get("cancelled", False)
+
+    if _is_cancelled():
         logging.info(f"[YD-UP] Задача {task_id} отменена — upload пропущен")
         pending = session.get("pending")
         if isinstance(pending, dict):
@@ -739,11 +778,14 @@ async def _yd_upload_files(
     session_key = pending["session_key"]
     nonce = pending["nonce"]
 
+    # ZIP создаются в disk-backed tempdir, не в /dev/shm.
+    zip_tmp_dir = Path(tempfile.mkdtemp(prefix=f"pptx2png_{task_id}_"))
+
     cleanup_done = False
 
     logging.info(
         f"[YD-UP] Старт: task_id={task_id}, файлов={len(prepared)}, "
-        f"target_base={target_base!r}"
+        f"target_base={target_base!r}, zip_tmp_dir={zip_tmp_dir}"
     )
 
     try:
@@ -751,23 +793,20 @@ async def _yd_upload_files(
         total_slides_packed = 0
         total_failed = 0
         report_lines = [f"📁 Обработано файлов: <b>{len(prepared)}</b>\n"]
-
-        # Собираем целевые папки для ссылок (уникальные)
         links_by_folder: dict[str, str] = {}
 
         for f_idx, item in enumerate(prepared, start=1):
             _touch_task(task_dir)
 
-            current_session = sessions.get(task_id)
-            if current_session is None or current_session.get("cancelled"):
-                logging.info(f"[YD-UP] Задача {task_id} отменена — прерываем upload")
+            # Отмена в начале обработки файла
+            if _is_cancelled():
+                logging.info(f"[YD-UP] Отмена перед файлом #{f_idx}")
                 return
 
             file_name = item["file_name"]
             file_name_esc = html_module.escape(file_name)
             file_slug = item["file_slug"]
 
-            # Ошибки подготовки
             if item.get("failed_at_stage"):
                 stage = item["failed_at_stage"]
                 stage_text = {
@@ -783,23 +822,20 @@ async def _yd_upload_files(
             pngs_sorted = item["pngs_sorted"]
             start = item.get("start")
             end = item.get("end")
-            incomplete_warning = item.get("incomplete_warning")
             ranges = item.get("ranges")
+            incomplete_warning = item.get("incomplete_warning")
 
             logging.info(
                 f"[YD-UP] Файл #{f_idx}: {file_name!r}, "
                 f"pngs={len(pngs_sorted)}, ranges={ranges}"
             )
 
-            try:
-                await status_msg.edit_text(
-                    f"📦 Готовлю архивы для <code>{file_name_esc}</code>...",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+            await _safe_edit(
+                status_msg,
+                f"📦 Готовлю архивы для <code>{file_name_esc}</code>...",
+                parse_mode="HTML",
+            )
 
-            # Формируем целевые папки на Диске
             pptx2png_dir = (
                 f"{target_base}/{yandex_state.config.pptx2png_folder}/{file_slug}"
             )
@@ -821,13 +857,19 @@ async def _yd_upload_files(
                 else:
                     other_pngs.append(png_path)
 
-            # === Архив с проповедью (если есть) ===
+            # Диапазоны как '1–2, 8–9', а не '1–9'
+            ranges_text = _format_ranges_text(ranges, start, end)
+
+            # === Архив с проповедью ===
+            sermon_info = None
             if sermon_pngs:
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед папкой проповеди")
+                    return
+
                 ok2 = await yandex_state.config.client.ensure_folder(sermon_dir)
                 if not ok2:
-                    logging.error(
-                        f"[YD-UP] {file_name}: не удалось создать {sermon_dir!r}"
-                    )
+                    logging.error(f"[YD-UP] {file_name}: не удалось создать {sermon_dir!r}")
                     report_lines.append(
                         f"❌ {file_name_esc} — не удалось создать папку проповеди"
                     )
@@ -835,7 +877,7 @@ async def _yd_upload_files(
                     continue
 
                 sermon_zip_name = f"{file_slug}_проповедь.zip"
-                sermon_zip_path = task_dir / sermon_zip_name
+                sermon_zip_path = zip_tmp_dir / sermon_zip_name
 
                 try:
                     await asyncio.to_thread(
@@ -852,6 +894,11 @@ async def _yd_upload_files(
                     total_failed += 1
                     continue
 
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена после создания ZIP проповеди")
+                    _safe_unlink(sermon_zip_path)
+                    return
+
                 sermon_zip_size = sermon_zip_path.stat().st_size
                 remote_path = f"{sermon_dir}/{sermon_zip_name}"
 
@@ -860,14 +907,16 @@ async def _yd_upload_files(
                     f"({_format_size(sermon_zip_size)}) → {remote_path!r}"
                 )
 
-                try:
-                    await status_msg.edit_text(
-                        f"📤 Загружаю архив проповеди "
-                        f"(<code>{file_name_esc}</code>)...",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                await _safe_edit(
+                    status_msg,
+                    f"📤 Загружаю архив проповеди (<code>{file_name_esc}</code>)...",
+                    parse_mode="HTML",
+                )
+
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед upload ZIP проповеди")
+                    _safe_unlink(sermon_zip_path)
+                    return
 
                 ok = await yandex_state.config.client.upload_file(
                     sermon_zip_path, remote_path
@@ -878,7 +927,7 @@ async def _yd_upload_files(
                     total_slides_packed += len(sermon_pngs)
                     links_by_folder[sermon_dir] = "🎯 Проповедь"
                     sermon_info = (
-                        f"🎯 Проповедь ({start}–{end}): {len(sermon_pngs)} слайдов → "
+                        f"🎯 Проповедь ({ranges_text}): {len(sermon_pngs)} слайдов → "
                         f"<code>{html_module.escape(yandex_state.config.sermon_folder)}/"
                         f"{html_module.escape(sermon_zip_name)}</code> "
                         f"({_format_size(sermon_zip_size)})"
@@ -890,22 +939,24 @@ async def _yd_upload_files(
                 else:
                     total_failed += 1
                     sermon_info = (
-                        f"❌ Проповедь ({start}–{end}): не удалось загрузить ZIP"
+                        f"❌ Проповедь ({ranges_text}): не удалось загрузить ZIP"
                     )
                     logging.error(f"[YD-UP] {file_name}: sermon ZIP upload failed")
 
-                # Удаляем локальный ZIP сразу
-                try:
-                    sermon_zip_path.unlink()
-                except Exception:
-                    pass
-            else:
-                sermon_info = None
+                # Удаляем ZIP и PNG после упаковки
+                _safe_unlink(sermon_zip_path)
+                for png in sermon_pngs:
+                    _safe_unlink(png)
 
             # === Архив с остальными слайдами ===
+            other_info = "📄 Остальные: нет слайдов вне проповеди"
             if other_pngs:
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед ZIP слайдов")
+                    return
+
                 other_zip_name = f"{file_slug}_слайды.zip"
-                other_zip_path = task_dir / other_zip_name
+                other_zip_path = zip_tmp_dir / other_zip_name
 
                 try:
                     await asyncio.to_thread(
@@ -925,6 +976,11 @@ async def _yd_upload_files(
                         report_lines.append(f"   • {sermon_info}")
                     continue
 
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена после создания ZIP слайдов")
+                    _safe_unlink(other_zip_path)
+                    return
+
                 other_zip_size = other_zip_path.stat().st_size
                 remote_path = f"{pptx2png_dir}/{other_zip_name}"
 
@@ -933,14 +989,16 @@ async def _yd_upload_files(
                     f"({_format_size(other_zip_size)}) → {remote_path!r}"
                 )
 
-                try:
-                    await status_msg.edit_text(
-                        f"📤 Загружаю архив слайдов "
-                        f"(<code>{file_name_esc}</code>)...",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                await _safe_edit(
+                    status_msg,
+                    f"📤 Загружаю архив слайдов (<code>{file_name_esc}</code>)...",
+                    parse_mode="HTML",
+                )
+
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед upload ZIP слайдов")
+                    _safe_unlink(other_zip_path)
+                    return
 
                 ok = await yandex_state.config.client.upload_file(
                     other_zip_path, remote_path
@@ -969,12 +1027,10 @@ async def _yd_upload_files(
                     other_info = "❌ Остальные слайды: не удалось загрузить ZIP"
                     logging.error(f"[YD-UP] {file_name}: slides ZIP upload failed")
 
-                try:
-                    other_zip_path.unlink()
-                except Exception:
-                    pass
-            else:
-                other_info = "📄 Остальные: нет слайдов вне проповеди"
+                # Удаляем ZIP и PNG после упаковки
+                _safe_unlink(other_zip_path)
+                for png in other_pngs:
+                    _safe_unlink(png)
 
             # Формируем запись отчёта
             entry_lines = [f"{f_idx}. 📄 <b>{file_name_esc}</b>"]
@@ -984,6 +1040,11 @@ async def _yd_upload_files(
             if incomplete_warning:
                 entry_lines.append(f"   • {incomplete_warning}")
             report_lines.append("\n".join(entry_lines))
+
+        # Отмена перед отправкой отчёта
+        if _is_cancelled():
+            logging.info(f"[YD-UP] Отмена перед отправкой отчёта")
+            return
 
         # Итог
         if total_failed > 0:
@@ -998,7 +1059,6 @@ async def _yd_upload_files(
                 f"📊 Всего слайдов: <b>{total_slides_packed}</b>"
             )
 
-        # Ссылки на Яндекс.Диск
         if links_by_folder:
             report_lines.append("\n🔗 <b>Ссылки на Яндекс.Диск:</b>")
             for folder_path, label in links_by_folder.items():
@@ -1034,6 +1094,14 @@ async def _yd_upload_files(
         )
         return
     finally:
+        # Удаляем temp-директорию с ZIP (вне /dev/shm)
+        if zip_tmp_dir and zip_tmp_dir.exists():
+            try:
+                shutil.rmtree(zip_tmp_dir, ignore_errors=True)
+                logging.debug(f"[YD-UP] Удалена временная папка {zip_tmp_dir}")
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {zip_tmp_dir}: {e}")
+
         if not cleanup_done:
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,

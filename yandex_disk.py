@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.7)
+# yandex_disk.py — клиент Яндекс.Диска (v1.8)
 # ==========================================
 
 import aiohttp
@@ -61,27 +61,19 @@ def normalize_resource_paths(item: Dict[str, Any]) -> Dict[str, Any]:
     - item["_embedded"]["path"]                 → без 'disk:'
     - item["_embedded"]["items"][*]["path"]     → без 'disk:' (рекурсивно)
 
-    API возвращает пути с префиксом 'disk:' в ответах на GET /resources,
-    но не принимает их в параметрах запросов. Эта функция приводит ответ
-    к каноническому виду, чтобы все методы клиента работали с одним
-    форматом путей.
-
     Возвращает тот же объект (мутирует на месте для экономии памяти).
     """
     if not isinstance(item, dict):
         return item
 
-    # 1. Собственный path
     if "path" in item and isinstance(item["path"], str):
         item["path"] = strip_disk_prefix(item["path"])
 
-    # 2. _embedded.path и _embedded.items[*]
     embedded = item.get("_embedded")
     if isinstance(embedded, dict):
         if "path" in embedded and isinstance(embedded["path"], str):
             embedded["path"] = strip_disk_prefix(embedded["path"])
 
-        # Рекурсивно нормализуем каждого ребёнка
         items = embedded.get("items")
         if isinstance(items, list):
             for child in items:
@@ -198,7 +190,6 @@ class YandexDiskClient:
                 if resp.status != 200:
                     raise YandexDiskError(f"HTTP {resp.status} для {path}")
                 data = await resp.json()
-                # ✅ Рекурсивная нормализация всех путей в ответе
                 normalize_resource_paths(data)
                 return data
         except aiohttp.ClientError as e:
@@ -209,10 +200,6 @@ class YandexDiskClient:
             raise YandexDiskError(f"Неизвестная ошибка: {e}")
 
     async def list_folder(self, path: str, page_size: int = 200) -> List[Dict[str, Any]]:
-        """
-        Возвращает список элементов папки.
-        Пути в каждом элементе уже нормализованы (без 'disk:').
-        """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
@@ -253,7 +240,6 @@ class YandexDiskClient:
                 continue
             try:
                 if predicate(item["name"]):
-                    # Дополнительная страховка (нормализация уже сделана выше)
                     if isinstance(item.get("path"), str):
                         item["path"] = strip_disk_prefix(item["path"])
                     return item
@@ -334,7 +320,6 @@ class YandexDiskClient:
             logging.error(f"Ошибка upload_file: {e}", exc_info=True)
             return False
 
-
     # ---------- Создание папок ----------
 
     async def create_folder(self, path: str) -> bool:
@@ -354,7 +339,7 @@ class YandexDiskClient:
             async with self.session.put(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
-                logging.debug(f"[YD-API] PUT /resources?path={path!r}")
+                logging.debug(f"[YD-API] PUT → {resp.status} ({path!r})")
                 if resp.status == 201:
                     return True
 
@@ -511,7 +496,6 @@ async def resolve_sunday_paths(
         logging.warning(f"Папка даты '{sunday:%d.%m.%Y}' не найдена в {month['path']}")
         return None
 
-    # Дополнительная страховка (нормализация уже сделана в get_resource)
     month_path = strip_disk_prefix(month["path"])
     date_path = strip_disk_prefix(date_folder["path"])
 
