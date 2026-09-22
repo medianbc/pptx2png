@@ -10,7 +10,7 @@ import secrets
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional
 
 from aiogram import Router, F, types, Bot
 from aiogram.filters import Command
@@ -21,9 +21,7 @@ import yandex_state
 from yandex_state import (
     sessions,
     yd_session_lock,
-    yd_active_sessions,
     yd_active_tasks,
-    yd_session_key,
     yd_try_acquire,
     yd_release,
     yd_is_active,
@@ -37,7 +35,7 @@ from yandex_disk import (
     resolve_sunday_paths,
     find_pptx_in_source,
 )
-from structure import load_template, create_structure, safe_folder_name
+from structure import safe_folder_name
 from sermon_detector import find_sermon_range
 from utils import extract_speaker_notes
 from converter_engine import convert_all_pngs  # ✅ импортируем напрямую
@@ -97,6 +95,9 @@ async def _yd_prepare_files(
     """
     Первая фаза: скачивание + конвертация всех файлов.
     Сохраняет результат в sessions[task_id]["pending"].
+
+    Не создаёт никаких папок на Яндекс.Диске — целевые папки будут
+    созданы по требованию в _yd_upload_files через ensure_folder.
     """
     status_msg = callback.message
     owner_user_id = callback.from_user.id
@@ -128,49 +129,8 @@ async def _yd_prepare_files(
         yd_active_tasks.add(task_id)
 
     try:
-        # Загружаем шаблон
-        template_path = Path(__file__).parent / yandex_state.config.template_file
-        structure = load_template(template_path)
-        if structure is None:
-            try:
-                await status_msg.edit_text(
-                    f"❌ <b>Ошибка загрузки template.yaml</b>\n\n"
-                    f"Файл: <code>{html_module.escape(str(template_path))}</code>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            await _yd_cleanup_task(
-                task_id, session_key, task_dir,
-                owner_user_id, chat_id, nonce,
-            )
-            return
-
-        # Создаём структуру
-        try:
-            await status_msg.edit_text("📁 Создаю структуру папок...")
-        except Exception:
-            pass
-
-        structure_base = paths["date_folder"]
-        ok = await create_structure(
-            yandex_state.config.client, structure_base, structure
-        )
-        if not ok:
-            try:
-                await status_msg.edit_text(
-                    "❌ <b>Не удалось создать структуру папок</b>\n\n"
-                    "Проверьте права на Яндекс.Диске.",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            await _yd_cleanup_task(
-                task_id, session_key, task_dir,
-                owner_user_id, chat_id, nonce,
-            )
-            return
-
+        # ✅ Целевые папки создаются в _yd_upload_files через ensure_folder.
+        # Полное дерево из template.yaml бот НЕ создаёт.
         target_base = paths["target"]
         quality = user_mgr.get_user_config(owner_user_id)["quality"]
 
@@ -223,7 +183,6 @@ async def _yd_prepare_files(
             temp_png_dir.mkdir(exist_ok=True)
 
             try:
-                # ✅ Прямой вызов без converter
                 pngs, used_pptx = await convert_all_pngs(
                     local_pptx, temp_png_dir, quality
                 )
@@ -282,7 +241,9 @@ async def _yd_prepare_files(
                 "ranges": item_ranges,
                 "matches": matches,
                 "incomplete_warning": incomplete_warning,
-                "confirmed": start is None,
+                # ✅ Всегда False: пользователь подтверждает даже если
+                # проповедь не найдена (указывает вручную или пропускает).
+                "confirmed": False,
             })
 
         # Публикуем pending под локом
@@ -320,9 +281,10 @@ async def _yd_prepare_files(
             )
             return
 
+        # ✅ Показываем промпт для всех неподтверждённых файлов
         needs_confirm = [
             p for p in prepared
-            if "pngs_sorted" in p and p.get("start") is not None and not p.get("confirmed")
+            if "pngs_sorted" in p and not p.get("confirmed")
         ]
 
         if not needs_confirm:
@@ -429,7 +391,9 @@ async def _yd_render_sermon_prompt(
 ) -> None:
     """
     Единая точка отрисовки промпта подтверждения проповеди.
-    Обновляет prompt_idx/prompt_nonce под текущий item.
+    Два варианта:
+      - проповедь найдена → «Найдена пометка», 3 кнопки (Ok/Edit/Skip)
+      - не найдена → «Не найдена», 2 кнопки (Edit/Skip)
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -441,7 +405,7 @@ async def _yd_render_sermon_prompt(
         return
 
     idx = pending["prepared"].index(item)
-    pending["prompt_idx"] = idx   # ✅ убран current_confirm_idx
+    pending["prompt_idx"] = idx
 
     if pending.get("prompt_nonce") is None:
         pending["prompt_nonce"] = secrets.token_hex(8)
@@ -451,37 +415,59 @@ async def _yd_render_sermon_prompt(
     start = item.get("start")
     end = item.get("end")
     file_name = item.get("file_name", "")
-
-    preview = ", ".join(str(n) for n in matches[:15])
-    if len(matches) > 15:
-        preview += f" …и ещё {len(matches) - 15}"
-
     file_esc = html_module.escape(file_name)
-    text = (
-        f"🎯 <b>Найдена пометка «проповедь»</b>\n\n"
-        f"📄 Файл: <code>{file_esc}</code>\n"
-        f"📌 Слайды с пометкой: <code>{preview}</code>\n\n"
-        f"📊 Предлагаемый диапазон: <b>{start}–{end}</b>\n\n"
-        f"Подтвердите или измените диапазон:"
-    )
 
     kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(
-            text="✅ Подтвердить",
-            callback_data=f"yd_sermon_ok:{task_id}:{idx}:{prompt_nonce}",
-        ),
-        InlineKeyboardButton(
-            text="✏️ Изменить",
-            callback_data=f"yd_sermon_edit:{task_id}:{idx}:{prompt_nonce}",
-        ),
-        InlineKeyboardButton(
-            text="⏭ Пропустить",
-            callback_data=f"yd_sermon_skip:{task_id}:{idx}:{prompt_nonce}",
-        ),
-    )
 
-    # ✅ Защита от reply_fn=None AND status_msg=None
+    if matches:
+        # --- Проповедь найдена автоматически ---
+        preview = ", ".join(str(n) for n in matches[:15])
+        if len(matches) > 15:
+            preview += f" …и ещё {len(matches) - 15}"
+
+        text = (
+            f"🎯 <b>Найдена пометка «проповедь»</b>\n\n"
+            f"📄 Файл: <code>{file_esc}</code>\n"
+            f"📌 Слайды с пометкой: <code>{preview}</code>\n\n"
+            f"📊 Предлагаемый диапазон: <b>{start}–{end}</b>\n\n"
+            f"Подтвердите или измените диапазон:"
+        )
+
+        kb.row(
+            InlineKeyboardButton(
+                text="✅ Подтвердить",
+                callback_data=f"yd_sermon_ok:{task_id}:{idx}:{prompt_nonce}",
+            ),
+            InlineKeyboardButton(
+                text="✏️ Изменить",
+                callback_data=f"yd_sermon_edit:{task_id}:{idx}:{prompt_nonce}",
+            ),
+            InlineKeyboardButton(
+                text="⏭ Пропустить",
+                callback_data=f"yd_sermon_skip:{task_id}:{idx}:{prompt_nonce}",
+            ),
+        )
+    else:
+        # --- Проповедь не найдена: спрашиваем ---
+        text = (
+            f"🤔 <b>Пометка «проповедь» не найдена</b>\n\n"
+            f"📄 Файл: <code>{file_esc}</code>\n\n"
+            f"В заметках докладчика нет слова «проповедь».\n"
+            f"Вы можете указать диапазон слайдов вручную или залить всё в общую папку.\n\n"
+            f"<i>Если проповеди нет — нажмите «Пропустить».</i>"
+        )
+
+        kb.row(
+            InlineKeyboardButton(
+                text="✏️ Указать диапазон",
+                callback_data=f"yd_sermon_edit:{task_id}:{idx}:{prompt_nonce}",
+            ),
+            InlineKeyboardButton(
+                text="⏭ Пропустить",
+                callback_data=f"yd_sermon_skip:{task_id}:{idx}:{prompt_nonce}",
+            ),
+        )
+
     sent_msg = None
     if reply_fn is not None:
         sent_msg = await reply_fn(text, parse_mode="HTML", reply_markup=kb.as_markup())
@@ -504,7 +490,6 @@ async def _yd_render_sermon_prompt(
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
         pending["prompt_message_id"] = sent_msg.message_id
 
-    # Не пересоздаём watchdog, если он уже стоит для текущего nonce
     existing_task = pending.get("prompt_timeout_task")
     existing_nonce = pending.get("prompt_watchdog_nonce")
 
@@ -519,7 +504,6 @@ async def _yd_render_sermon_prompt(
         _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
     )
     pending["prompt_watchdog_nonce"] = prompt_nonce
-
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
     """Если пользователь не ответил на промпт — очищаем задачу."""
@@ -1337,7 +1321,7 @@ async def yd_sermon_ok(callback: types.CallbackQuery, bot: Bot):
 
     remaining = [
         p for p in pending["prepared"]
-        if "pngs_sorted" in p and p.get("start") is not None and not p.get("confirmed")
+        if "pngs_sorted" in p and not p.get("confirmed")
     ]
 
     if remaining:
@@ -1379,7 +1363,7 @@ async def yd_sermon_skip(callback: types.CallbackQuery, bot: Bot):
 
     remaining = [
         p for p in pending["prepared"]
-        if "pngs_sorted" in p and p.get("start") is not None and not p.get("confirmed")
+        if "pngs_sorted" in p and not p.get("confirmed")
     ]
 
     if remaining:
