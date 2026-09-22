@@ -1,10 +1,11 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v1.8)
 # ==========================================
 
 import asyncio
 import html as html_module
 import logging
+import os
 import secrets
 import shutil
 import time
@@ -39,7 +40,7 @@ from yandex_disk import (
 from structure import load_template, create_structure, safe_folder_name
 from sermon_detector import find_sermon_range
 from utils import extract_speaker_notes
-from converter_engine import pptx_to_png_conversion  # ← предполагаемая функция
+from converter_engine import convert_all_pngs  # ✅ импортируем напрямую
 
 
 router = Router()
@@ -53,7 +54,6 @@ def _touch_task(task_dir: Path):
     """Обновляет mtime папки — чтобы cleaner не удалял активную задачу."""
     if task_dir and task_dir.exists():
         try:
-            import os
             os.utime(task_dir, None)
         except Exception as e:
             logging.error(f"Ошибка touch для {task_dir}: {e}")
@@ -88,7 +88,6 @@ async def _yd_prepare_files(
     bot: Bot,
     SHM_DIR: str,
     user_mgr,
-    converter,
     files_to_process: list,
     sunday,
     paths: dict,
@@ -224,7 +223,8 @@ async def _yd_prepare_files(
             temp_png_dir.mkdir(exist_ok=True)
 
             try:
-                pngs, used_pptx = await converter.convert_all_pngs(
+                # ✅ Прямой вызов без converter
+                pngs, used_pptx = await convert_all_pngs(
                     local_pptx, temp_png_dir, quality
                 )
             except Exception as e:
@@ -441,8 +441,7 @@ async def _yd_render_sermon_prompt(
         return
 
     idx = pending["prepared"].index(item)
-    pending["current_confirm_idx"] = idx
-    pending["prompt_idx"] = idx
+    pending["prompt_idx"] = idx   # ✅ убран current_confirm_idx
 
     if pending.get("prompt_nonce") is None:
         pending["prompt_nonce"] = secrets.token_hex(8)
@@ -482,12 +481,18 @@ async def _yd_render_sermon_prompt(
         ),
     )
 
+    # ✅ Защита от reply_fn=None AND status_msg=None
     sent_msg = None
     if reply_fn is not None:
         sent_msg = await reply_fn(text, parse_mode="HTML", reply_markup=kb.as_markup())
-    else:
+    elif status_msg is not None:
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
         sent_msg = status_msg
+    else:
+        logging.warning(
+            f"_yd_render_sermon_prompt: нет ни reply_fn, ни status_msg для {task_id}"
+        )
+        return
 
     # Проверяем, что nonce не перебили
     if pending.get("prompt_nonce") != prompt_nonce:
@@ -727,8 +732,6 @@ async def _yd_upload_files(
             failed_other = 0
 
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
-                _touch_task(task_dir)
-
                 current_session = sessions.get(task_id)
                 if current_session is None or current_session.get("cancelled"):
                     logging.info(f"Задача {task_id} отменена в середине upload")
@@ -939,6 +942,10 @@ async def cmd_sunday(message: types.Message, check_access):
         await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
         return
 
+    if not yandex_state.config.base_path:
+        await message.reply("❌ Не задан base_path Яндекс.Диска в settings.ini.")
+        return
+
     nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
     if nonce is None:
         await message.reply(
@@ -1113,7 +1120,7 @@ async def cmd_sunday(message: types.Message, check_access):
         await yd_release(message.from_user.id, message.chat.id, nonce)
         logging.info(
             f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
-            f"освобождена после показа списка (nonce={nonce})"
+            f"освобождена после показа списка (nonce={nonce[:8]}...)"
         )
 
     except Exception as e:
@@ -1134,7 +1141,7 @@ async def cmd_sunday(message: types.Message, check_access):
             if released:
                 logging.info(
                     f"🔓 Сессия {message.from_user.id}:{message.chat.id} "
-                    f"освобождена (неудачный запуск, nonce={nonce})"
+                    f"освобождена (неудачный запуск, nonce={nonce[:8]}...)"
                 )
 
 
@@ -1144,7 +1151,6 @@ async def yd_pick(
     bot: Bot,
     SHM_DIR: str,
     user_mgr,
-    converter,
 ):
     parts = callback.data.split(":")
     if len(parts) != 4:
@@ -1206,7 +1212,6 @@ async def yd_pick(
         bot=bot,
         SHM_DIR=SHM_DIR,
         user_mgr=user_mgr,
-        converter=converter,
         files_to_process=files_to_process,
         sunday=sunday,
         paths=paths,
@@ -1475,13 +1480,13 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
 
 # ==========================================
-# ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handle_text_input
+# ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handlers.py
 # ==========================================
 # handle_text_input живёт в handlers.py, но обрабатывает Yandex-промпты.
-# Экспортируем нужные функции через эти псевдонимы, чтобы handlers.py не лез в приватные.
 
 render_sermon_prompt = _yd_render_sermon_prompt
 upload_files = _yd_upload_files
 cleanup_task = _yd_cleanup_task
 is_sermon_slide = _is_sermon_slide
 claim_prompt = _yd_claim_prompt
+prompt_timeout_watchdog = _yd_prompt_timeout_watchdog   # ✅ добавлено
