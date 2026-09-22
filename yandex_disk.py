@@ -1,8 +1,9 @@
 # ==========================================
-# yandex_disk.py — клиент Яндекс.Диска (v1.4)
+# yandex_disk.py — клиент Яндекс.Диска (v1.5)
 # ==========================================
 
 import aiohttp
+import json
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Callable
@@ -16,6 +17,25 @@ RUSSIAN_MONTHS = [
     "", "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
     "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"
 ]
+
+
+# ==========================================
+# КОНСТАНТЫ ОШИБОК ЯНДЕКС API
+# ==========================================
+# HTTP 409 от Яндекс API используется для ДВУХ разных ситуаций:
+# 1. Папка/ресурс уже существует → это успех
+# 2. Родительская папка отсутствует → это провал
+# Различаем по полю `error` из тела ответа.
+
+YD_EXISTS_ERRORS = frozenset({
+    "DiskPathAlreadyExistsError",
+    "DiskResourceAlreadyExistsError",
+    "DiskPathPointsToExistentDirectoryError",
+})
+
+YD_PARENT_NOT_FOUND_ERRORS = frozenset({
+    "DiskPathDoesntExistsError",
+})
 
 
 # ==========================================
@@ -75,15 +95,14 @@ class YandexDiskClient:
 
     async def resource_type(self, path: str) -> Optional[str]:
         """
-        ✅ FIX (Bug #2): Лёгкий запрос метаданных.
-        Возвращает 'dir', 'file' или None (не существует).
+        Лёгкий запрос метаданных: возвращает 'dir', 'file' или None (не существует).
         Не тянет _embedded — экономит трафик и время для больших папок.
         Бросает YandexDiskError при транзиентных сбоях (не 404).
         """
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
-            "fields": "type",  # только type — без _embedded
+            "fields": "type",
         }
         try:
             async with self.session.get(
@@ -162,14 +181,88 @@ class YandexDiskClient:
 
     async def folder_exists(self, path: str) -> bool:
         """
-        ✅ FIX (Bug #2): использует лёгкий resource_type.
-        ✅ FIX (Bug #1): пробрасывает YandexDiskError при транзиентных сбоях,
-        чтобы вызывающий мог отличить «папки нет» (False) от «не смог проверить» (raise).
-
+        Проверяет существование папки через лёгкий resource_type.
         404 → False. Иначе проверяет type == "dir".
+        При транзиентных сбоях (не 404) пробрасывает YandexDiskError,
+        чтобы вызывающий мог отличить «папки нет» от «не смог проверить».
         """
         t = await self.resource_type(path)
         return t == "dir"
+
+    async def find_child_folder(
+        self,
+        parent_path: str,
+        predicate: Callable[[str], bool],
+    ) -> Optional[Dict[str, Any]]:
+        items = await self.list_folder(parent_path)
+        for item in items:
+            if item.get("type") != "dir":
+                continue
+            try:
+                if predicate(item["name"]):
+                    return item
+            except Exception as e:
+                logging.error(f"Ошибка предиката для '{item['name']}': {e}")
+        return None
+
+    # ---------- Скачивание / Загрузка ----------
+
+    async def download_file(self, remote_path: str, destination: Path) -> bool:
+        """
+        Скачивает файл с Диска ПОТОКОВО (chunked),
+        не загружая весь файл в память.
+        """
+        url = f"{YANDEX_API_BASE}/resources/download"
+        params = {"path": remote_path}
+        try:
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Yandex API download: HTTP {resp.status}")
+                    return False
+                data = await resp.json()
+                href = data.get("href")
+                if not href:
+                    return False
+
+            async with self.session.get(href, timeout=600) as file_resp:
+                if file_resp.status != 200:
+                    logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
+                    return False
+                with open(destination, "wb") as f:
+                    async for chunk in file_resp.content.iter_chunked(64 * 1024):
+                        f.write(chunk)
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка download_file: {e}", exc_info=True)
+            return False
+
+    async def upload_file(self, local_path: Path, remote_path: str,
+                          overwrite: bool = True) -> bool:
+        url = f"{YANDEX_API_BASE}/resources/upload"
+        params = {"path": remote_path, "overwrite": str(overwrite).lower()}
+        try:
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Yandex API upload URL: HTTP {resp.status}")
+                    return False
+                data = await resp.json()
+                href = data.get("href")
+                if not href:
+                    return False
+
+            with open(local_path, "rb") as f:
+                async with self.session.put(href, data=f, timeout=600) as upload_resp:
+                    if upload_resp.status not in (200, 201, 202):
+                        logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
+                        return False
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка upload_file: {e}", exc_info=True)
+            return False
 
     # ---------- Создание папок ----------
 
@@ -177,14 +270,14 @@ class YandexDiskClient:
         """
         Создаёт одну папку (без родителей).
 
-        ✅ FIX (Bug #1): при 409 доверяем статусу — это надёжный сигнал
-        «уже существует». Fallback GET используется только для логов
-        и НЕ может превратить успех в неудачу при временной ошибке сети.
+        HTTP 409 от Яндекс API используется для ДВУХ разных ситуаций:
+        1. Папка/ресурс уже существует → это успех.
+        2. Родительская папка отсутствует → это провал.
 
-        409 от Яндекс API может означать:
-        - DiskPathAlreadyExistsError
-        - DiskResourceAlreadyExistsError
-        - DiskPathPointsToExistentDirectoryError
+        Различаем по полю `error` в теле ответа:
+        - whitelist YD_EXISTS_ERRORS → True
+        - YD_PARENT_NOT_FOUND_ERRORS → False
+        - неизвестный 409 → fallback GET для подтверждения
         """
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
@@ -196,32 +289,48 @@ class YandexDiskClient:
                 if resp.status == 201:
                     return True
 
-                # 409 = «уже существует». Доверяем статусу.
+                # 409 = конфликт. Различаем по error-коду.
                 if resp.status == 409:
+                    error_code = ""
                     try:
                         body = await resp.text()
                         logging.info(
-                            f"create_folder {path}: 409 (already exists). "
-                            f"body={body[:200]}"
+                            f"create_folder {path}: 409 body={body[:300]}"
                         )
-                    except Exception:
-                        pass
-
-                    # ✅ Fallback GET — только для логов и редкой диагностики.
-                    # Что бы ни вернул/бросил GET — при 409 считаем папку существующей.
-                    try:
-                        exists = await self.folder_exists(path)
-                        if not exists:
-                            logging.warning(
-                                f"create_folder {path}: PUT=409, но GET говорит 'нет'. "
-                                f"Доверяем PUT — считаем папку существующей."
-                            )
+                        try:
+                            data = json.loads(body)
+                            error_code = data.get("error", "")
+                        except json.JSONDecodeError:
+                            pass
                     except Exception as e:
                         logging.warning(
-                            f"create_folder {path}: PUT=409, fallback GET упал ({e}). "
-                            f"Доверяем PUT — считаем папку существующей."
+                            f"create_folder {path}: не удалось прочитать 409: {e}"
                         )
-                    return True
+
+                    # ✅ Папка/ресурс уже существует — успех
+                    if error_code in YD_EXISTS_ERRORS:
+                        return True
+
+                    # ❌ Родителя нет — провал (ensure_folder создаст родителя)
+                    if error_code in YD_PARENT_NOT_FOUND_ERRORS:
+                        logging.error(
+                            f"create_folder {path}: 409 {error_code} — "
+                            f"родительская папка отсутствует"
+                        )
+                        return False
+
+                    # ⚠️ Неизвестный 409 — подтверждаем через GET
+                    logging.warning(
+                        f"create_folder {path}: неизвестный 409 "
+                        f"error='{error_code}', проверяю через GET"
+                    )
+                    try:
+                        return await self.folder_exists(path)
+                    except Exception as e:
+                        logging.error(
+                            f"create_folder {path}: fallback GET failed: {e}"
+                        )
+                        return False
 
                 # Любая другая ошибка — логируем тело ответа
                 try:
@@ -241,7 +350,9 @@ class YandexDiskClient:
         Создаёт папку и всех родителей при необходимости.
         Сначала проверяет существование, только потом создаёт.
 
-        ✅ FIX (Bug #1): если проверка существования падает с YandexDiskError —
+        Для "/a/b/c" проверит/создаст /a, /a/b, /a/b/c.
+
+        Если проверка существования падает с YandexDiskError —
         логируем и всё равно пробуем создать (не прерываем флоу).
         """
         parts = [p for p in path.strip("/").split("/") if p]
