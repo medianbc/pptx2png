@@ -225,7 +225,7 @@ def create_bot_and_dispatcher(cfg: dict):
     if cfg["yandex_token"] and cfg["yandex_base_path"]:
         yandex_state.config.client = YandexDiskClient(
             cfg["yandex_token"],
-            http_session,  # ✅ используем общую сессию
+            http_session,
         )
         yandex_state.config.base_path = cfg["yandex_base_path"]
         yandex_state.config.source_folder = cfg["yandex_source_folder"]
@@ -293,7 +293,7 @@ def create_bot_and_dispatcher(cfg: dict):
         "ADMIN_ID": cfg["admin_id"],
     })
 
-    dp.include_router(router)   # handlers.py уже включает yandex_router
+    dp.include_router(router)
     return bot, dp, user_mgr, http_session
 
 
