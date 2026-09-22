@@ -1,5 +1,5 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.2)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.3)
 # ==========================================
 
 import sys
@@ -19,7 +19,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiohttp
 
 from user_manager import UserManager
-from handlers import router, sessions, task_lock_manager
+from handlers import router, task_lock_manager
+
+# ✅ Yandex-подсистема: конфиг и состояние
+import yandex_state
+from yandex_disk import YandexDiskClient
+from yandex_state import yd_active_tasks, yd_session_lock
 
 
 # ==========================================
@@ -161,18 +166,15 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     if not shm_dir.exists():
         return
 
-    # ✅ К11: импортируем реестр Яндекс-задач
-    from handlers import yd_active_tasks, yd_session_lock
-
     current_time = time.time()
     deleted = 0
 
-    # ✅ К11: снимок активных yd-задач под локом
+    # ✅ Снимок активных Yandex-задач под локом
     async with yd_session_lock:
         active_yd = set(yd_active_tasks)
 
     for item in shm_dir.iterdir():
-        # ✅ К11: теперь обрабатываем и task_*, и yd_task_*
+        # ✅ Обрабатываем и task_*, и yd_task_*
         if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
             continue
         task_id = item.name
@@ -181,7 +183,7 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
         if await task_lock_manager.is_active(task_id):
             continue
 
-        # ✅ К11: проверка Яндекс-задач
+        # Проверка Yandex-задач
         if task_id in active_yd:
             continue
 
@@ -220,21 +222,18 @@ def create_bot_and_dispatcher(cfg: dict):
     http_session = aiohttp.ClientSession()
 
     # ──── Инициализация Яндекс.Диска ────
-    import handlers
-    from yandex_disk import YandexDiskClient
-
     if cfg["yandex_token"] and cfg["yandex_base_path"]:
-        handlers.yandex_client = YandexDiskClient(
+        yandex_state.config.client = YandexDiskClient(
             cfg["yandex_token"],
-            http_session,  # ✅ используем общую сессию
+            http_session,
         )
-        handlers.yandex_base_path = cfg["yandex_base_path"]
-        handlers.yandex_source_folder = cfg["yandex_source_folder"]
-        handlers.yandex_target_folder = cfg["yandex_target_folder"]
-        handlers.yandex_pptx2png_folder = cfg["yandex_pptx2png_folder"]
-        handlers.yandex_sermon_folder = cfg["yandex_sermon_folder"]
-        handlers.yandex_sermon_keyword = cfg["yandex_sermon_keyword"]
-        handlers.yandex_template_file = cfg["yandex_template_file"]
+        yandex_state.config.base_path = cfg["yandex_base_path"]
+        yandex_state.config.source_folder = cfg["yandex_source_folder"]
+        yandex_state.config.target_folder = cfg["yandex_target_folder"]
+        yandex_state.config.pptx2png_folder = cfg["yandex_pptx2png_folder"]
+        yandex_state.config.sermon_folder = cfg["yandex_sermon_folder"]
+        yandex_state.config.sermon_keyword = cfg["yandex_sermon_keyword"]
+        yandex_state.config.template_file = cfg["yandex_template_file"]
         logging.info(f"✅ Яндекс.Диск инициализирован: {cfg['yandex_base_path']}")
     else:
         logging.warning("⚠️ Яндекс.Диск не настроен — /sunday будет недоступна")
@@ -311,9 +310,6 @@ async def main():
     logging.info(f"📁 Окружение: {cfg['env_name']}")
     logging.info(f"💾 RAM-диск: {cfg['shm_dir']}")
     logging.info(f"📄 Логи: {cfg['log_dir']}")
-
-    # ✅ Стартовая очистка НЕ вызывается (multi-instance safety).
-    # Активные задачи будут очищены по возрасту через cleanup_loop.
 
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
