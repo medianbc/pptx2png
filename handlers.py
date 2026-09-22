@@ -10,7 +10,7 @@ import secrets
 import asyncio
 from pathlib import Path
 import html as html_module
-from typing import Optional, Set, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple
 
 from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart, Command
@@ -28,6 +28,7 @@ from utils import (
 # ✅ Yandex-подсистема
 import yandex_state
 from yandex_state import sessions, yd_session_lock, yd_active_tasks, YD_PROMPT_TIMEOUT_SEC
+from yandex_disk import YandexDiskError
 from yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
@@ -36,7 +37,6 @@ from yandex_flow import (
     is_sermon_slide,
     prompt_timeout_watchdog,
 )
-from yandex_disk import YandexDiskError
 
 import converter_engine
 from converter_engine import convert_all_pngs, create_zip_stream
@@ -719,7 +719,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
             remaining = [
                 p for p in pending["prepared"]
-                if "pngs_sorted" in p and p.get("start") is not None and not p.get("confirmed")
+                if "pngs_sorted" in p and not p.get("confirmed")
             ]
             if remaining:
                 await render_sermon_prompt(
@@ -812,7 +812,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         remaining = [
             p for p in pending["prepared"]
-            if "pngs_sorted" in p and p.get("start") is not None and not p.get("confirmed")
+            if "pngs_sorted" in p and not p.get("confirmed")
         ]
 
         if remaining:
