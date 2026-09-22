@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v1.8)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v1.9)
 # ==========================================
 
 import asyncio
@@ -205,30 +205,41 @@ async def _yd_prepare_files(
 
             pngs_sorted = sorted(pngs, key=lambda p: p.name)
 
+            # ✅ Извлекаем заметки
             notes_ok, notes, incomplete = await asyncio.to_thread(
                 extract_speaker_notes, str(used_pptx)
             )
-            if not notes_ok:
-                notes = {}
-            if used_pptx != local_pptx and used_pptx.exists():
-                try:
-                    used_pptx.unlink()
-                except Exception:
-                    pass
 
-            if incomplete:
+            # ✅ Bug #2: различаем три состояния заметок
+            if not notes_ok:
+                # Провал чтения — вообще не ищем
+                notes = {}
+                start, end, matches = None, None, []
+                incomplete_warning = (
+                    "⚠️ Не удалось прочитать заметки докладчика."
+                )
+            elif incomplete:
+                # Частичное чтение — тоже не доверяем
                 start, end, matches = None, None, []
                 incomplete_warning = (
                     "⚠️ Заметки прочитаны частично, "
                     "проповедь не определена автоматически."
                 )
             else:
+                # Полное чтение — ищем
                 start, end, matches = find_sermon_range(
                     notes, yandex_state.config.sermon_keyword
                 )
                 if matches and len(matches) == 1:
+                    # Одна пометка — не диапазон, оставляем как есть
                     start, end = None, None
                 incomplete_warning = None
+
+            if used_pptx != local_pptx and used_pptx.exists():
+                try:
+                    used_pptx.unlink()
+                except Exception:
+                    pass
 
             item_ranges = [(start, end)] if start is not None else None
 
@@ -240,9 +251,11 @@ async def _yd_prepare_files(
                 "end": end,
                 "ranges": item_ranges,
                 "matches": matches,
+                # ✅ Bug #2: сохраняем состояние заметок для промпта
+                "notes_ok": notes_ok,
+                "incomplete": incomplete,
                 "incomplete_warning": incomplete_warning,
-                # ✅ Всегда False: пользователь подтверждает даже если
-                # проповедь не найдена (указывает вручную или пропускает).
+                # ✅ Bug #1 + все случаи: всегда False, пользователь решает
                 "confirmed": False,
             })
 
@@ -391,9 +404,14 @@ async def _yd_render_sermon_prompt(
 ) -> None:
     """
     Единая точка отрисовки промпта подтверждения проповеди.
-    Два варианта:
-      - проповедь найдена → «Найдена пометка», 3 кнопки (Ok/Edit/Skip)
-      - не найдена → «Не найдена», 2 кнопки (Edit/Skip)
+
+    Логика:
+      - Диапазон валиден (matches + start/end) → «Найдена пометка», 3 кнопки.
+      - Иначе → «Диапазон не определён» с объяснением причины, 2 кнопки:
+        * не прочитаны заметки
+        * заметки прочитаны частично
+        * одна пометка (нет диапазона)
+        * заметок нет вообще
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -419,8 +437,16 @@ async def _yd_render_sermon_prompt(
 
     kb = InlineKeyboardBuilder()
 
-    if matches:
-        # --- Проповедь найдена автоматически ---
+    # ✅ Bug #1: авто-подтверждение только если диапазон валиден
+    has_valid_range = (
+        bool(matches)
+        and start is not None
+        and end is not None
+        and start <= end
+    )
+
+    if has_valid_range:
+        # --- Проповедь найдена, диапазон валиден ---
         preview = ", ".join(str(n) for n in matches[:15])
         if len(matches) > 15:
             preview += f" …и ещё {len(matches) - 15}"
@@ -448,12 +474,43 @@ async def _yd_render_sermon_prompt(
             ),
         )
     else:
-        # --- Проповедь не найдена: спрашиваем ---
+        # --- Авто-диапазон не построен: объясняем причину ---
+        notes_ok = item.get("notes_ok", True)
+        incomplete = item.get("incomplete", False)
+
+        if not notes_ok:
+            # ✅ Bug #2: провал чтения заметок
+            reason = (
+                "⚠️ <b>Не удалось прочитать заметки докладчика.</b>\n"
+                "Возможно, файл повреждён или содержит только изображения.\n"
+                "Укажите диапазон вручную, если проповедь присутствует."
+            )
+        elif incomplete:
+            # ✅ Bug #2: частичное чтение
+            reason = (
+                "⚠️ <b>Заметки прочитаны частично.</b>\n"
+                "Автоматически определить проповедь не удалось.\n"
+                "Укажите диапазон вручную, если проповедь присутствует."
+            )
+        elif matches:
+            # ✅ Bug #1: одна пометка — не диапазон
+            match_str = ", ".join(str(n) for n in matches[:5])
+            reason = (
+                f"📌 Найдена <b>одна</b> пометка «проповедь»: "
+                f"слайд <code>{match_str}</code>\n"
+                f"Для одной пометки авто-диапазон не строится — "
+                f"укажите диапазон вручную."
+            )
+        else:
+            reason = (
+                "В заметках докладчика нет слова «проповедь».\n"
+                "Вы можете указать диапазон слайдов вручную или залить всё в общую папку."
+            )
+
         text = (
-            f"🤔 <b>Пометка «проповедь» не найдена</b>\n\n"
+            f"🤔 <b>Диапазон проповеди не определён</b>\n\n"
             f"📄 Файл: <code>{file_esc}</code>\n\n"
-            f"В заметках докладчика нет слова «проповедь».\n"
-            f"Вы можете указать диапазон слайдов вручную или залить всё в общую папку.\n\n"
+            f"{reason}\n\n"
             f"<i>Если проповеди нет — нажмите «Пропустить».</i>"
         )
 
@@ -504,6 +561,7 @@ async def _yd_render_sermon_prompt(
         _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
     )
     pending["prompt_watchdog_nonce"] = prompt_nonce
+
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
     """Если пользователь не ответил на промпт — очищаем задачу."""
@@ -1312,7 +1370,21 @@ async def yd_sermon_ok(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     idx = int(parts[2])
-    pending["prepared"][idx]["confirmed"] = True
+    item = pending["prepared"][idx]
+
+    # ✅ Bug #1: страховка — нельзя подтвердить невалидный диапазон
+    if item.get("start") is None or item.get("end") is None:
+        logging.warning(
+            f"yd_sermon_ok: попытка подтвердить пустой диапазон для "
+            f"idx={idx}, task_id={task_id}"
+        )
+        await callback.answer(
+            "❌ Диапазон не задан. Укажите его вручную.",
+            show_alert=True,
+        )
+        return
+
+    item["confirmed"] = True
 
     try:
         await callback.answer("✅ Диапазон подтверждён")
@@ -1473,4 +1545,4 @@ upload_files = _yd_upload_files
 cleanup_task = _yd_cleanup_task
 is_sermon_slide = _is_sermon_slide
 claim_prompt = _yd_claim_prompt
-prompt_timeout_watchdog = _yd_prompt_timeout_watchdog   # ✅ добавлено
+prompt_timeout_watchdog = _yd_prompt_timeout_watchdog
