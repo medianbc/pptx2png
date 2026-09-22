@@ -36,6 +36,7 @@ from yandex_flow import (
     is_sermon_slide,
     prompt_timeout_watchdog,
 )
+from yandex_disk import YandexDiskError
 
 import converter_engine
 from converter_engine import convert_all_pngs, create_zip_stream
@@ -59,7 +60,8 @@ router.include_router(yandex_router)
 class TaskLockManager:
     """
     Менеджер блокировок для защиты от дублирующих операций.
-    Упрощённый: единственный источник правды — lock.locked().
+    Единственный источник правды — lock.locked().
+    Записи удаляются при release(), чтобы не копить мёртвые локи.
     """
 
     def __init__(self):
@@ -81,15 +83,15 @@ class TaskLockManager:
             lock = self._locks.get(task_id)
             if lock is not None and lock.locked():
                 lock.release()
+            # ✅ Bug #2: удаляем запись — не копим мёртвые локи
+            self._locks.pop(task_id, None)
 
     async def is_active(self, task_id: str) -> bool:
         async with self._dict_lock:
             lock = self._locks.get(task_id)
             return lock is not None and lock.locked()
 
-
 task_lock_manager = TaskLockManager()
-
 
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -455,7 +457,6 @@ async def send_welcome(message: types.Message, get_settings_keyboard):
         reply_markup=get_settings_keyboard(message.from_user.id)
     )
 
-
 # ==========================================
 # 1. КОМАНДА СТАРТ
 # ==========================================
@@ -500,9 +501,17 @@ async def cmd_start(message: types.Message, check_access, get_settings_keyboard)
                         sunday_line = f"\n📅 На **{sunday:%d.%m.%Y}** pptx пока нет."
                 else:
                     sunday_line = f"\n📅 Структура для **{sunday:%d.%m.%Y}** не найдена."
-            except Exception as e:
-                logging.error(f"Ошибка Яндекс.Диска в /start: {e}")
+
+            # ✅ Bug #1: разделяем ожидаемые и неожиданные ошибки
+            except YandexDiskError as e:
+                logging.warning(f"Ошибка Яндекс.Диска в /start: {e}")
                 yd_status = f"⚠️ {str(e)[:50]}"
+            except Exception as e:
+                logging.exception(
+                    f"Неожиданная ошибка в /start (Yandex): {e}"
+                )
+                yd_status = "⚠️ Внутренняя ошибка"
+
         else:
             yd_status = f"❌ {err}"
 
@@ -514,7 +523,6 @@ async def cmd_start(message: types.Message, check_access, get_settings_keyboard)
         f"⚙️ Настройки:",
         reply_markup=get_settings_keyboard(message.from_user.id),
     )
-
 
 # ==========================================
 # 2. ВЫБОР СЛАЙДОВ
