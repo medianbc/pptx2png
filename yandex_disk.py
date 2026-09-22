@@ -73,12 +73,45 @@ class YandexDiskClient:
 
     # ---------- Метаданные ----------
 
+    async def resource_type(self, path: str) -> Optional[str]:
+        """
+        ✅ FIX (Bug #2): Лёгкий запрос метаданных.
+        Возвращает 'dir', 'file' или None (не существует).
+        Не тянет _embedded — экономит трафик и время для больших папок.
+        Бросает YandexDiskError при транзиентных сбоях (не 404).
+        """
+        url = f"{YANDEX_API_BASE}/resources"
+        params = {
+            "path": path,
+            "fields": "type",  # только type — без _embedded
+        }
+        try:
+            async with self.session.get(
+                url, headers=self.headers, params=params, timeout=15
+            ) as resp:
+                if resp.status == 404:
+                    return None
+                if resp.status != 200:
+                    raise YandexDiskError(f"HTTP {resp.status} для {path}")
+                data = await resp.json()
+                return data.get("type")
+        except aiohttp.ClientError as e:
+            raise YandexDiskError(f"Сеть: {e}")
+        except YandexDiskError:
+            raise
+        except Exception as e:
+            raise YandexDiskError(f"Неизвестная ошибка: {e}")
+
     async def get_resource(
         self,
         path: str,
         limit: int = 1000,
         offset: int = 0,
     ) -> Dict[str, Any]:
+        """
+        Полные метаданные ресурса с _embedded (список детей).
+        Используется, когда действительно нужен список содержимого.
+        """
         url = f"{YANDEX_API_BASE}/resources"
         params = {
             "path": path,
@@ -129,100 +162,29 @@ class YandexDiskClient:
 
     async def folder_exists(self, path: str) -> bool:
         """
-        Проверяет существование папки через GET.
+        ✅ FIX (Bug #2): использует лёгкий resource_type.
+        ✅ FIX (Bug #1): пробрасывает YandexDiskError при транзиентных сбоях,
+        чтобы вызывающий мог отличить «папки нет» (False) от «не смог проверить» (raise).
+
         404 → False. Иначе проверяет type == "dir".
         """
-        try:
-            resource = await self.get_resource(path)
-        except YandexDiskNotFoundError:
-            return False
-        return resource.get("type") == "dir"
-
-    async def find_child_folder(
-        self,
-        parent_path: str,
-        predicate: Callable[[str], bool],
-    ) -> Optional[Dict[str, Any]]:
-        items = await self.list_folder(parent_path)
-        for item in items:
-            if item.get("type") != "dir":
-                continue
-            try:
-                if predicate(item["name"]):
-                    return item
-            except Exception as e:
-                logging.error(f"Ошибка предиката для '{item['name']}': {e}")
-        return None
-
-    # ---------- Скачивание / Загрузка ----------
-
-    async def download_file(self, remote_path: str, destination: Path) -> bool:
-        """
-        Скачивает файл с Диска ПОТОКОВО (chunked),
-        не загружая весь файл в память.
-        """
-        url = f"{YANDEX_API_BASE}/resources/download"
-        params = {"path": remote_path}
-        try:
-            async with self.session.get(
-                url, headers=self.headers, params=params, timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    logging.error(f"Yandex API download: HTTP {resp.status}")
-                    return False
-                data = await resp.json()
-                href = data.get("href")
-                if not href:
-                    return False
-
-            async with self.session.get(href, timeout=600) as file_resp:
-                if file_resp.status != 200:
-                    logging.error(f"Ошибка скачивания файла: HTTP {file_resp.status}")
-                    return False
-                with open(destination, "wb") as f:
-                    async for chunk in file_resp.content.iter_chunked(64 * 1024):
-                        f.write(chunk)
-            return True
-        except Exception as e:
-            logging.error(f"Ошибка download_file: {e}", exc_info=True)
-            return False
-
-    async def upload_file(self, local_path: Path, remote_path: str,
-                          overwrite: bool = True) -> bool:
-        url = f"{YANDEX_API_BASE}/resources/upload"
-        params = {"path": remote_path, "overwrite": str(overwrite).lower()}
-        try:
-            async with self.session.get(
-                url, headers=self.headers, params=params, timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    logging.error(f"Yandex API upload URL: HTTP {resp.status}")
-                    return False
-                data = await resp.json()
-                href = data.get("href")
-                if not href:
-                    return False
-
-            with open(local_path, "rb") as f:
-                async with self.session.put(href, data=f, timeout=600) as upload_resp:
-                    if upload_resp.status not in (200, 201, 202):
-                        logging.error(f"Ошибка загрузки на Диск: HTTP {upload_resp.status}")
-                        return False
-            return True
-        except Exception as e:
-            logging.error(f"Ошибка upload_file: {e}", exc_info=True)
-            return False
+        t = await self.resource_type(path)
+        return t == "dir"
 
     # ---------- Создание папок ----------
 
     async def create_folder(self, path: str) -> bool:
         """
         Создаёт одну папку (без родителей).
-        Если папка уже существует (409) — подтверждает это через GET и
-        возвращает True. Устойчиво к любому варианту 409 от Яндекс API:
+
+        ✅ FIX (Bug #1): при 409 доверяем статусу — это надёжный сигнал
+        «уже существует». Fallback GET используется только для логов
+        и НЕ может превратить успех в неудачу при временной ошибке сети.
+
+        409 от Яндекс API может означать:
         - DiskPathAlreadyExistsError
         - DiskResourceAlreadyExistsError
-        - DiskPathPointsToExistentDirectoryError  ← встречается на практике
+        - DiskPathPointsToExistentDirectoryError
         """
         url = f"{YANDEX_API_BASE}/resources"
         params = {"path": path}
@@ -230,30 +192,38 @@ class YandexDiskClient:
             async with self.session.put(
                 url, headers=self.headers, params=params, timeout=30
             ) as resp:
-                # ✅ FIX: 201 = создано
+                # 201 = создано
                 if resp.status == 201:
                     return True
 
-                # ✅ FIX: 409 = «уже существует». Не доверяем полю error —
-                # проверяем фактическое существование через GET.
+                # 409 = «уже существует». Доверяем статусу.
                 if resp.status == 409:
                     try:
                         body = await resp.text()
                         logging.info(
-                            f"create_folder {path}: 409 (already exists) — "
-                            f"подтверждаю через GET. body={body[:200]}"
+                            f"create_folder {path}: 409 (already exists). "
+                            f"body={body[:200]}"
                         )
                     except Exception:
                         pass
-                    try:
-                        return await self.folder_exists(path)
-                    except Exception as e:
-                        logging.error(
-                            f"create_folder {path}: fallback GET failed: {e}"
-                        )
-                        return False
 
-                # ✅ FIX: любая другая ошибка — логируем тело ответа
+                    # ✅ Fallback GET — только для логов и редкой диагностики.
+                    # Что бы ни вернул/бросил GET — при 409 считаем папку существующей.
+                    try:
+                        exists = await self.folder_exists(path)
+                        if not exists:
+                            logging.warning(
+                                f"create_folder {path}: PUT=409, но GET говорит 'нет'. "
+                                f"Доверяем PUT — считаем папку существующей."
+                            )
+                    except Exception as e:
+                        logging.warning(
+                            f"create_folder {path}: PUT=409, fallback GET упал ({e}). "
+                            f"Доверяем PUT — считаем папку существующей."
+                        )
+                    return True
+
+                # Любая другая ошибка — логируем тело ответа
                 try:
                     body = await resp.text()
                 except Exception:
@@ -269,16 +239,15 @@ class YandexDiskClient:
     async def ensure_folder(self, path: str) -> bool:
         """
         Создаёт папку и всех родителей при необходимости.
-        Сначала проверяет существование через GET, только потом создаёт —
-        это устраняет гонки и ложные ошибки при существующих папках.
+        Сначала проверяет существование, только потом создаёт.
 
-        Пример: для path="/a/b/c" проверит и создаст /a, /a/b, /a/b/c.
+        ✅ FIX (Bug #1): если проверка существования падает с YandexDiskError —
+        логируем и всё равно пробуем создать (не прерываем флоу).
         """
         parts = [p for p in path.strip("/").split("/") if p]
         for i in range(1, len(parts) + 1):
             current = "/" + "/".join(parts[:i])
 
-            # ✅ FIX: сначала проверяем существование
             try:
                 if await self.folder_exists(current):
                     continue
@@ -288,7 +257,6 @@ class YandexDiskClient:
                     f"Пробую создать."
                 )
 
-            # Создаём только если не существует
             if not await self.create_folder(current):
                 logging.error(f"ensure_folder: не удалось создать {current}")
                 return False
