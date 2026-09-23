@@ -294,15 +294,12 @@ async def _yd_prepare_files(
                     "проповедь не определена автоматически."
                 )
             else:
-                # ✅ Используем список ключевых слов из конфига
+                # ✅ Передаём ВЕСЬ список ключевых слов
                 keywords = yandex_state.config.sermon_keywords or [
                     yandex_state.config.sermon_keyword
                 ]
-                # Для совместимости find_sermon_range принимает одну строку —
-                # используем первый keyword. На этапе 2 расширим.
-                keyword = keywords[0] if keywords else yandex_state.config.sermon_keyword
 
-                start, end, matches = find_sermon_range(notes, keyword)
+                start, end, matches = find_sermon_range(notes, keywords)
                 if matches and len(matches) == 1:
                     start, end = None, None
                 incomplete_warning = None
@@ -539,21 +536,33 @@ async def _yd_render_sermon_prompt(
     )
 
     if has_valid_range:
-        # --- Проповедь найдена, диапазон валиден ---
-        preview = ", ".join(str(n) for n in matches[:15])
-        if len(matches) > 15:
-            preview += f" …и ещё {len(matches) - 15}"
-
+        # --- Диапазон задан (автоматически или вручную) ---
         sermon_count = _count_slides_for_range(start, end, total_slides)
         other_count = max(0, total_slides - sermon_count)
 
-        text = (
-            f"🎯 <b>Найдена пометка «проповедь»</b>\n\n"
-            f"📄 Файл: <code>{file_esc}</code>\n"
-            f"📌 Слайды с пометкой: <code>{preview}</code>\n"
-            f"📊 Предлагаемый диапазон: <b>{start}–{end}</b>\n\n"
-            f"❓ <b>Какие слайды конвертировать?</b>"
-        )
+        manual_range = item.get("manual_range", False)
+
+        if manual_range:
+            # Ручной ввод — не говорим «найдена пометка»
+            text = (
+                f"🎯 <b>Диапазон проповеди установлен</b>\n\n"
+                f"📄 Файл: <code>{file_esc}</code>\n"
+                f"📊 Диапазон: <b>{start}–{end}</b>\n\n"
+                f"❓ <b>Какие слайды конвертировать?</b>"
+            )
+        else:
+            # Автоматический поиск — показываем пометки
+            preview = ", ".join(str(n) for n in matches[:15])
+            if len(matches) > 15:
+                preview += f" …и ещё {len(matches) - 15}"
+
+            text = (
+                f"🎯 <b>Найдена пометка «проповедь»</b>\n\n"
+                f"📄 Файл: <code>{file_esc}</code>\n"
+                f"📌 Слайды с пометкой: <code>{preview}</code>\n"
+                f"📊 Предлагаемый диапазон: <b>{start}–{end}</b>\n\n"
+                f"❓ <b>Какие слайды конвертировать?</b>"
+            )  
 
         kb.row(
             InlineKeyboardButton(
@@ -624,7 +633,7 @@ async def _yd_render_sermon_prompt(
             InlineKeyboardButton(
                 text=f"📄 Конвертировать всё ({total_slides} с.)",
                 callback_data=(
-                    f"yd_sermon_mode:{task_id}:{idx}:{prompt_nonce}:both"
+                    f"yd_sermon_mode:{task_id}:{idx}:{prompt_nonce}:other"
                 ),
             ),
         )
@@ -1814,7 +1823,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
-    item = pending["prepared"][idx]
+    item = pending["prepаared"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан
     if mode in ("sermon", "both") and (

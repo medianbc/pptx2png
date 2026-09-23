@@ -32,7 +32,6 @@ from yandex_disk import YandexDiskError
 from yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
-    upload_files as yd_upload_files,
     cleanup_task as yd_cleanup_task,
     is_sermon_slide,
     prompt_timeout_watchdog,
@@ -697,7 +696,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         idx = pending.get("awaiting_range_for_idx")
         current = pending["prepared"][idx]
 
-        # total_slides — считаем из PPTX (pngs_sorted больше нет)
+        # total_slides — считаем из PPTX
         file_path = current.get("file_path")
         total_slides = 0
         if file_path and Path(file_path).exists():
@@ -711,12 +710,9 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         text_clean = message.text.strip().lower()
 
         # "отмена"/"0" = пользователь не хочет вводить диапазон
-        # Показываем промпт как для «проповедь не найдена» — можно
-        # конвертировать всё или указать диапазон заново.
         if text_clean in ("отмена", "cancel", "0"):
             pending.pop("awaiting_range_for_idx", None)
 
-            # Отменяем watchdog
             timeout_task = pending.get("prompt_timeout_task")
             if timeout_task is not None and not timeout_task.done():
                 timeout_task.cancel()
@@ -729,7 +725,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             await message.reply(
                 "⏭ Хорошо, диапазон не меняем. Показываю варианты ещё раз."
             )
-            # Показываем промпт заново для текущего файла
             await render_sermon_prompt(
                 task_id=tid,
                 item=current,
@@ -741,7 +736,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         # Парсим ввод
         ranges = parse_slides_ranges(message.text.strip())
         if not ranges:
-            # Невалидный формат — перезапускаем watchdog и даём шанс исправиться
             old_timeout = pending.get("prompt_timeout_task")
             if old_timeout is not None and not old_timeout.done():
                 old_timeout.cancel()
@@ -787,7 +781,26 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         current["ranges"] = normalized
         current["start"] = normalized[0][0] if normalized else None
         current["end"] = normalized[-1][1] if normalized else None
-        current["confirmed"] = False       # ← ждём выбор режима
+
+        # ✅ Bug #4: заполняем matches всеми номерами слайдов из диапазона.
+        # Это нужно, чтобы _yd_render_sermon_prompt увидел has_valid_range=True
+        # и показал все 3 кнопки режимов (sermon / other / both).
+        if normalized:
+            all_matches = []
+            for s, e in normalized:
+                all_matches.extend(range(s, e + 1))
+            current["matches"] = sorted(set(all_matches))
+            logging.debug(
+                f"[YD-INPUT] Ручной диапазон: ranges={normalized}, "
+                f"matches={current['matches'][:20]}"
+                + ("..." if len(current["matches"]) > 20 else "")
+            )
+        else:
+            current["matches"] = []
+
+        # ✅ Помечаем, что диапазон был введён вручную — пригодится в промпте
+        current["manual_range"] = True
+        current["confirmed"] = False
         pending.pop("awaiting_range_for_idx", None)
 
         # Отменяем watchdog

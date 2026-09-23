@@ -138,7 +138,7 @@ def setup_environment():
             + "\n  ".join(_invalid)
         )
 
-        # ✅ Категории слайдов (settings.ini, секция [SlideCategories])
+    # ✅ Категории слайдов (settings.ini, секция [SlideCategories])
     def _parse_keywords(raw: str) -> list:
         if not raw:
             return []
