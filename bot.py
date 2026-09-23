@@ -1,5 +1,5 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.3)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.4)
 # ==========================================
 
 import sys
@@ -105,6 +105,39 @@ def setup_environment():
         yandex_sermon_keyword = "проповед"
     yandex_template_file = settings_config.get("YandexDisk", "template_file", fallback="template.yaml").strip()
 
+    # ✅ Таймауты и cleanup (из settings.ini, секция [Timeouts])
+    prompt_timeout_sec = settings_config.getint(
+        "Timeouts", "prompt_timeout_sec", fallback=1800
+    )
+    cleanup_interval_sec = settings_config.getint(
+        "Timeouts", "cleanup_interval_sec", fallback=300
+    )
+    cleanup_max_age_sec = settings_config.getint(
+        "Timeouts", "cleanup_max_age_sec", fallback=7200
+    )
+
+    # ✅ Валидация: все три значения должны быть > 0
+    # Иначе: sleep(0) → мгновенно, cleanup_loop крутится в busy-loop,
+    # свежие папки удаляются сразу.
+    _invalid = []
+    if prompt_timeout_sec <= 0:
+        _invalid.append(
+            f"Timeouts.prompt_timeout_sec={prompt_timeout_sec} (нужно > 0)"
+        )
+    if cleanup_interval_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_interval_sec={cleanup_interval_sec} (нужно > 0)"
+        )
+    if cleanup_max_age_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_max_age_sec={cleanup_max_age_sec} (нужно > 0)"
+        )
+    if _invalid:
+        sys.exit(
+            "❌ Ошибка в settings.ini, секция [Timeouts]:\n  "
+            + "\n  ".join(_invalid)
+        )
+
     return {
         "script_dir": script_dir,
         "env_name": env_name,
@@ -120,6 +153,10 @@ def setup_environment():
         "yandex_sermon_folder": yandex_sermon_folder,
         "yandex_sermon_keyword": yandex_sermon_keyword,
         "yandex_template_file": yandex_template_file,
+        # ✅ Таймауты
+        "prompt_timeout_sec": prompt_timeout_sec,
+        "cleanup_interval_sec": cleanup_interval_sec,
+        "cleanup_max_age_sec": cleanup_max_age_sec,
     }
 
 
@@ -238,6 +275,14 @@ def create_bot_and_dispatcher(cfg: dict):
     else:
         logging.warning("⚠️ Яндекс.Диск не настроен — /sunday будет недоступна")
 
+    # ✅ Пробрасываем таймауты в yandex_state.config
+    yandex_state.config.prompt_timeout_sec = cfg["prompt_timeout_sec"]
+    logging.info(
+        f"⏱️ Таймаут промпта: {cfg['prompt_timeout_sec']}s, "
+        f"cleanup interval: {cfg['cleanup_interval_sec']}s, "
+        f"max_age: {cfg['cleanup_max_age_sec']}s"
+    )
+
     def get_settings_keyboard(user_id):
         c = user_mgr.get_user_config(user_id)
         q_std = "✅ Standard" if c["quality"] == "standard" else "Standard"
@@ -313,7 +358,12 @@ async def main():
 
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
-    asyncio.create_task(cleanup_loop(cfg["shm_dir"], interval=300, max_age=7200))
+    # ✅ Cleaner с параметрами из settings.ini
+    asyncio.create_task(cleanup_loop(
+        cfg["shm_dir"],
+        interval=cfg["cleanup_interval_sec"],
+        max_age=cfg["cleanup_max_age_sec"],
+    ))
 
     logging.info("✅ Бот успешно инициализирован и готов к работе")
 

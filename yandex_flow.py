@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.1)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.2)
 # ==========================================
 
 import asyncio
@@ -27,7 +27,6 @@ from yandex_state import (
     yd_try_acquire,
     yd_release,
     yd_is_active,
-    YD_PROMPT_TIMEOUT_SEC,
 )
 
 from yandex_disk import (
@@ -177,7 +176,6 @@ async def _yd_prepare_files(
         f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
     )
 
-    # Создаём минимальную task-сессию СРАЗУ + регистрируем в picker
     async with yd_session_lock:
         picker = sessions.get(session_key)
         if picker is None:
@@ -280,12 +278,10 @@ async def _yd_prepare_files(
             pngs_sorted = sorted(pngs, key=lambda p: p.name)
             logging.debug(f"[YD-PREP] {file_name}: конвертировано {len(pngs_sorted)} PNG")
 
-            # Извлекаем заметки
             notes_ok, notes, incomplete = await asyncio.to_thread(
                 extract_speaker_notes, str(used_pptx)
             )
 
-            # Различаем три состояния заметок
             if not notes_ok:
                 notes = {}
                 start, end, matches = None, None, []
@@ -331,7 +327,6 @@ async def _yd_prepare_files(
                 "confirmed": False,
             })
 
-        # Публикуем pending под локом
         cleanup_needed = False
         async with yd_session_lock:
             picker = sessions.get(session_key)
@@ -617,13 +612,20 @@ async def _yd_render_sermon_prompt(
         pending["prompt_timeout_task"] = None
         pending["prompt_watchdog_nonce"] = None
 
+    # ✅ Используем таймаут из конфига (settings.ini)
     pending["prompt_timeout_task"] = asyncio.create_task(
-        _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, prompt_nonce)
+        _yd_prompt_timeout_watchdog(
+            task_id, yandex_state.config.prompt_timeout_sec, prompt_nonce
+        )
     )
     pending["prompt_watchdog_nonce"] = prompt_nonce
 
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
+    """
+    Если пользователь не ответил на промпт за timeout_sec —
+    уведомляем и очищаем задачу.
+    """
     try:
         await asyncio.sleep(timeout_sec)
         session = sessions.get(task_id)
@@ -634,14 +636,58 @@ async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_n
             return
         if pending.get("prompt_nonce") != expected_nonce:
             return
-        logging.info(f"[YD-PROMPT] ⏰ Промпт {task_id} не подтверждён за {timeout_sec}s — очистка")
+
+        chat_id = pending.get("chat_id")
+        bot: Optional[Bot] = pending.get("bot")
+        owner_user_id = pending.get("owner_user_id")
+        session_key = pending.get("session_key")
+        task_dir = pending.get("task_dir")
+        nonce = pending.get("nonce")
+        prompt_message_id = pending.get("prompt_message_id")
+
+        logging.info(
+            f"[YD-PROMPT] ⏰ Промпт {task_id} не подтверждён за {timeout_sec}s — очистка"
+        )
+
+        # 1. Уведомляем пользователя
+        if bot is not None and chat_id is not None:
+            minutes = max(1, timeout_sec // 60)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏰ <b>Время ожидания диапазона истекло</b> "
+                        f"({minutes} мин).\n\n"
+                        f"Задача отменена, временные файлы удалены.\n"
+                        f"Если хотите обработать файл — запустите /sunday заново."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить о таймауте: {e}")
+
+        # 2. Убираем клавиатуру со старого сообщения
+        if bot is not None and chat_id is not None and prompt_message_id is not None:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=prompt_message_id,
+                    reply_markup=None,
+                )
+            except Exception as e:
+                logging.debug(
+                    f"Не удалось убрать клавиатуру промпта "
+                    f"{prompt_message_id}: {e}"
+                )
+
+        # 3. Очищаем задачу
         await _yd_cleanup_task(
             task_id,
-            pending.get("session_key"),
-            pending.get("task_dir"),
-            pending.get("owner_user_id"),
-            pending.get("chat_id"),
-            pending.get("nonce"),
+            session_key,
+            task_dir,
+            owner_user_id,
+            chat_id,
+            nonce,
         )
     except asyncio.CancelledError:
         pass
@@ -669,7 +715,6 @@ async def _yd_cleanup_task(
         f"reason={'error' if error else 'normal'}"
     )
 
-    # 1. Папка задачи
     try:
         if task_dir and task_dir.exists():
             shutil.rmtree(task_dir)
@@ -677,7 +722,6 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
 
-    # 2. Watchdog
     try:
         session = sessions.get(task_id)
         if session is not None:
@@ -696,7 +740,6 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True)
 
-    # 3. Сессии
     try:
         async with yd_session_lock:
             picker = sessions.get(session_key)
@@ -715,13 +758,11 @@ async def _yd_cleanup_task(
     except Exception as e:
         logging.error(f"Ошибка очистки сессий для {task_id}: {e}", exc_info=True)
 
-    # 4. yd_release
     try:
         await yd_release(owner_user_id, chat_id, nonce)
     except Exception as e:
         logging.error(f"Ошибка yd_release для {task_id}: {e}", exc_info=True)
 
-    # 5. Сообщение об ошибке
     if error is not None and bot is not None and status_msg is not None:
         try:
             await status_msg.edit_text(
@@ -735,7 +776,7 @@ async def _yd_cleanup_task(
 
 
 # ==========================================
-# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия, v2.1)
+# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия, v2.2)
 # ==========================================
 
 async def _yd_upload_files(
@@ -802,7 +843,6 @@ async def _yd_upload_files(
         for f_idx, item in enumerate(prepared, start=1):
             _touch_task(task_dir)
 
-            # Отмена в начале обработки файла
             if _is_cancelled():
                 logging.info(f"[YD-UP] Отмена перед файлом #{f_idx}")
                 return
@@ -852,7 +892,6 @@ async def _yd_upload_files(
                 total_failed += 1
                 continue
 
-            # Разделяем PNG на sermon / others
             sermon_pngs = []
             other_pngs = []
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
@@ -861,7 +900,6 @@ async def _yd_upload_files(
                 else:
                     other_pngs.append(png_path)
 
-            # Диапазоны как '1–2, 8–9', а не '1–9'
             ranges_text = _format_ranges_text(ranges, start, end)
 
             # === Архив с проповедью ===
@@ -947,7 +985,6 @@ async def _yd_upload_files(
                     )
                     logging.error(f"[YD-UP] {file_name}: sermon ZIP upload failed")
 
-                # Удаляем ZIP и PNG после упаковки
                 _safe_unlink(sermon_zip_path)
                 for png in sermon_pngs:
                     _safe_unlink(png)
@@ -1031,12 +1068,10 @@ async def _yd_upload_files(
                     other_info = "❌ Остальные слайды: не удалось загрузить ZIP"
                     logging.error(f"[YD-UP] {file_name}: slides ZIP upload failed")
 
-                # Удаляем ZIP и PNG после упаковки
                 _safe_unlink(other_zip_path)
                 for png in other_pngs:
                     _safe_unlink(png)
 
-            # Формируем запись отчёта
             entry_lines = [f"{f_idx}. 📄 <b>{file_name_esc}</b>"]
             if sermon_info:
                 entry_lines.append(f"   • {sermon_info}")
@@ -1045,12 +1080,10 @@ async def _yd_upload_files(
                 entry_lines.append(f"   • {incomplete_warning}")
             report_lines.append("\n".join(entry_lines))
 
-        # Отмена перед отправкой отчёта
         if _is_cancelled():
             logging.info(f"[YD-UP] Отмена перед отправкой отчёта")
             return
 
-        # Итог
         if total_failed > 0:
             report_lines.append(
                 f"\n⚠️ Всего загружено архивов: <b>{total_uploaded_zip}</b>\n"
@@ -1098,8 +1131,6 @@ async def _yd_upload_files(
         )
         return
     finally:
-        # ✅ Fix #4: без ignore_errors — реальные ошибки попадут в except.
-        # logging.debug вызывается ТОЛЬКО после успешного rmtree.
         if zip_tmp_dir is not None and zip_tmp_dir.exists():
             try:
                 shutil.rmtree(zip_tmp_dir)
@@ -1777,8 +1808,11 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     if old_timeout is not None and not old_timeout.done():
         old_timeout.cancel()
 
+    # ✅ Используем таймаут из конфига (settings.ini)
     pending["prompt_timeout_task"] = asyncio.create_task(
-        _yd_prompt_timeout_watchdog(task_id, YD_PROMPT_TIMEOUT_SEC, manual_nonce)
+        _yd_prompt_timeout_watchdog(
+            task_id, yandex_state.config.prompt_timeout_sec, manual_nonce
+        )
     )
     pending["prompt_watchdog_nonce"] = manual_nonce
 

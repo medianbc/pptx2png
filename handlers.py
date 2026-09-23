@@ -27,7 +27,7 @@ from utils import (
 
 # ✅ Yandex-подсистема
 import yandex_state
-from yandex_state import sessions, yd_session_lock, yd_active_tasks, YD_PROMPT_TIMEOUT_SEC
+from yandex_state import sessions, yd_session_lock, yd_active_tasks
 from yandex_disk import YandexDiskError
 from yandex_flow import (
     router as yandex_router,
@@ -755,7 +755,11 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             if pending.get("prompt_nonce") is not None:
                 current_nonce = pending["prompt_nonce"]
                 pending["prompt_timeout_task"] = asyncio.create_task(
-                    prompt_timeout_watchdog(tid, YD_PROMPT_TIMEOUT_SEC, current_nonce)
+                    prompt_timeout_watchdog(
+                        tid,
+                        yandex_state.config.prompt_timeout_sec,
+                        current_nonce,
+                    )
                 )
                 pending["prompt_watchdog_nonce"] = current_nonce
             await message.reply(
