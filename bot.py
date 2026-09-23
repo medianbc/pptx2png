@@ -1,5 +1,5 @@
 # ==========================================
-# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.2)
+# bot.py — ГЛАВНЫЙ ЗАПУСКНОЙ СКРИПТ (v1.4)
 # ==========================================
 
 import sys
@@ -19,7 +19,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiohttp
 
 from user_manager import UserManager
-from handlers import router, sessions, task_lock_manager
+from handlers import router, task_lock_manager
+
+# ✅ Yandex-подсистема: конфиг и состояние
+import yandex_state
+from yandex_disk import YandexDiskClient
+from yandex_state import yd_active_tasks, yd_session_lock
 
 
 # ==========================================
@@ -93,7 +98,45 @@ def setup_environment():
     yandex_pptx2png_folder = settings_config.get("YandexDisk", "pptx2png_folder", fallback="pptx2png").strip()
     yandex_sermon_folder = settings_config.get("YandexDisk", "sermon_folder", fallback="проповедь - png").strip()
     yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
+    if not yandex_sermon_keyword:
+        logging.warning(
+            "⚠️ sermon_keyword пустой — использую значение по умолчанию 'проповед'"
+        )
+        yandex_sermon_keyword = "проповед"
     yandex_template_file = settings_config.get("YandexDisk", "template_file", fallback="template.yaml").strip()
+
+    # ✅ Таймауты и cleanup (из settings.ini, секция [Timeouts])
+    prompt_timeout_sec = settings_config.getint(
+        "Timeouts", "prompt_timeout_sec", fallback=1800
+    )
+    cleanup_interval_sec = settings_config.getint(
+        "Timeouts", "cleanup_interval_sec", fallback=300
+    )
+    cleanup_max_age_sec = settings_config.getint(
+        "Timeouts", "cleanup_max_age_sec", fallback=7200
+    )
+
+    # ✅ Валидация: все три значения должны быть > 0
+    # Иначе: sleep(0) → мгновенно, cleanup_loop крутится в busy-loop,
+    # свежие папки удаляются сразу.
+    _invalid = []
+    if prompt_timeout_sec <= 0:
+        _invalid.append(
+            f"Timeouts.prompt_timeout_sec={prompt_timeout_sec} (нужно > 0)"
+        )
+    if cleanup_interval_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_interval_sec={cleanup_interval_sec} (нужно > 0)"
+        )
+    if cleanup_max_age_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_max_age_sec={cleanup_max_age_sec} (нужно > 0)"
+        )
+    if _invalid:
+        sys.exit(
+            "❌ Ошибка в settings.ini, секция [Timeouts]:\n  "
+            + "\n  ".join(_invalid)
+        )
 
     return {
         "script_dir": script_dir,
@@ -110,6 +153,10 @@ def setup_environment():
         "yandex_sermon_folder": yandex_sermon_folder,
         "yandex_sermon_keyword": yandex_sermon_keyword,
         "yandex_template_file": yandex_template_file,
+        # ✅ Таймауты
+        "prompt_timeout_sec": prompt_timeout_sec,
+        "cleanup_interval_sec": cleanup_interval_sec,
+        "cleanup_max_age_sec": cleanup_max_age_sec,
     }
 
 
@@ -151,19 +198,32 @@ def setup_logging(log_dir: str):
 async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     """
     Удаляет старые НЕактивные папки задач.
-    Активные задачи (захваченные task_lock_manager) не удаляются.
+    Активные задачи (task_lock_manager + yd_active_tasks) не удаляются.
     """
     if not shm_dir.exists():
         return
+
     current_time = time.time()
     deleted = 0
 
+    # ✅ Снимок активных Yandex-задач под локом
+    async with yd_session_lock:
+        active_yd = set(yd_active_tasks)
+
     for item in shm_dir.iterdir():
-        if not item.is_dir() or not item.name.startswith("task_"):
+        # ✅ Обрабатываем и task_*, и yd_task_*
+        if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
             continue
         task_id = item.name
+
+        # Проверка обычных задач
         if await task_lock_manager.is_active(task_id):
             continue
+
+        # Проверка Yandex-задач
+        if task_id in active_yd:
+            continue
+
         try:
             mtime = item.stat().st_mtime
             age_seconds = current_time - mtime
@@ -173,6 +233,7 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
                 logging.info(f"🧹 Удалена старая папка {item.name} ({age_seconds/60:.1f} мин)")
         except Exception as e:
             logging.error(f"Ошибка обработки {item}: {e}")
+
     if deleted:
         logging.info(f"🧹 Очищено {deleted} старых папок")
 
@@ -198,21 +259,29 @@ def create_bot_and_dispatcher(cfg: dict):
     http_session = aiohttp.ClientSession()
 
     # ──── Инициализация Яндекс.Диска ────
-    import handlers
-    from yandex_disk import YandexDiskClient
-
     if cfg["yandex_token"] and cfg["yandex_base_path"]:
-        handlers.yandex_client = YandexDiskClient(cfg["yandex_token"])
-        handlers.yandex_base_path = cfg["yandex_base_path"]
-        handlers.yandex_source_folder = cfg["yandex_source_folder"]
-        handlers.yandex_target_folder = cfg["yandex_target_folder"]
-        handlers.yandex_pptx2png_folder = cfg["yandex_pptx2png_folder"]
-        handlers.yandex_sermon_folder = cfg["yandex_sermon_folder"]
-        handlers.yandex_sermon_keyword = cfg["yandex_sermon_keyword"]
-        handlers.yandex_template_file = cfg["yandex_template_file"]
+        yandex_state.config.client = YandexDiskClient(
+            cfg["yandex_token"],
+            http_session,
+        )
+        yandex_state.config.base_path = cfg["yandex_base_path"]
+        yandex_state.config.source_folder = cfg["yandex_source_folder"]
+        yandex_state.config.target_folder = cfg["yandex_target_folder"]
+        yandex_state.config.pptx2png_folder = cfg["yandex_pptx2png_folder"]
+        yandex_state.config.sermon_folder = cfg["yandex_sermon_folder"]
+        yandex_state.config.sermon_keyword = cfg["yandex_sermon_keyword"]
+        yandex_state.config.template_file = cfg["yandex_template_file"]
         logging.info(f"✅ Яндекс.Диск инициализирован: {cfg['yandex_base_path']}")
     else:
         logging.warning("⚠️ Яндекс.Диск не настроен — /sunday будет недоступна")
+
+    # ✅ Пробрасываем таймауты в yandex_state.config
+    yandex_state.config.prompt_timeout_sec = cfg["prompt_timeout_sec"]
+    logging.info(
+        f"⏱️ Таймаут промпта: {cfg['prompt_timeout_sec']}s, "
+        f"cleanup interval: {cfg['cleanup_interval_sec']}s, "
+        f"max_age: {cfg['cleanup_max_age_sec']}s"
+    )
 
     def get_settings_keyboard(user_id):
         c = user_mgr.get_user_config(user_id)
@@ -287,12 +356,14 @@ async def main():
     logging.info(f"💾 RAM-диск: {cfg['shm_dir']}")
     logging.info(f"📄 Логи: {cfg['log_dir']}")
 
-    # ✅ Стартовая очистка НЕ вызывается (multi-instance safety).
-    # Активные задачи будут очищены по возрасту через cleanup_loop.
-
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
 
-    asyncio.create_task(cleanup_loop(cfg["shm_dir"], interval=300, max_age=7200))
+    # ✅ Cleaner с параметрами из settings.ini
+    asyncio.create_task(cleanup_loop(
+        cfg["shm_dir"],
+        interval=cfg["cleanup_interval_sec"],
+        max_age=cfg["cleanup_max_age_sec"],
+    ))
 
     logging.info("✅ Бот успешно инициализирован и готов к работе")
 
