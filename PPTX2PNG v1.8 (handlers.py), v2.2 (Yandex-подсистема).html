@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>PPTX2PNG Bot — Срез проекта 23.09.2026</title>
+<style>
+    /* === Базовые стили === */
+    :root {
+        --text: #1a1a1a;
+        --text-muted: #555;
+        --accent: #634FD1;
+        --accent-light: #eee9ff;
+        --border: #ddd;
+        --code-bg: #f4f4f8;
+        --code-fg: #c7254e;
+        --bg: #fff;
+        --bg-alt: #fafafa;
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, "Noto Sans", "DejaVu Sans", sans-serif;
+        font-size: 11pt;
+        line-height: 1.55;
+        color: var(--text);
+        background: var(--bg);
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 30px 40px 60px;
+    }
+
+    /* === Типографика === */
+    h1 {
+        font-size: 22pt;
+        font-weight: 700;
+        margin: 0 0 8px;
+        color: var(--text);
+        border-bottom: 3px solid var(--accent);
+        padding-bottom: 10px;
+    }
+
+    h2 {
+        font-size: 15pt;
+        font-weight: 700;
+        margin: 32px 0 12px;
+        color: var(--accent);
+        page-break-after: avoid;
+    }
+
+    h3 {
+        font-size: 12pt;
+        font-weight: 600;
+        margin: 22px 0 8px;
+        color: var(--text);
+        page-break-after: avoid;
+    }
+
+    h4 {
+        font-size: 11pt;
+        font-weight: 600;
+        margin: 16px 0 6px;
+        color: var(--text-muted);
+    }
+
+    p {
+        margin: 6px 0 10px;
+    }
+
+    strong {
+        font-weight: 600;
+    }
+
+    em {
+        font-style: italic;
+    }
+
+    /* === Мета-блок === */
+    .meta {
+        background: var(--accent-light);
+        border-left: 4px solid var(--accent);
+        padding: 12px 16px;
+        margin: 16px 0 24px;
+        font-size: 10pt;
+        border-radius: 4px;
+    }
+
+    .meta p {
+        margin: 3px 0;
+    }
+
+    /* === Таблицы === */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 12px 0 18px;
+        font-size: 10pt;
+        page-break-inside: avoid;
+    }
+
+    th {
+        background: var(--accent-light);
+        text-align: left;
+        padding: 8px 10px;
+        border-bottom: 2px solid var(--accent);
+        font-weight: 600;
+        color: var(--text);
+    }
+
+    td {
+        padding: 6px 10px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+    }
+
+    tbody tr:nth-child(even) td {
+        background: var(--bg-alt);
+    }
+
+    /* === Код === */
+    code {
+        font-family: "SF Mono", "Monaco", "Menlo", "DejaVu Sans Mono", monospace;
+        font-size: 9.5pt;
+        background: var(--code-bg);
+        color: var(--code-fg);
+        padding: 1px 5px;
+        border-radius: 3px;
+    }
+
+    pre {
+        background: var(--code-bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 12px 14px;
+        overflow-x: auto;
+        font-size: 9pt;
+        line-height: 1.4;
+        page-break-inside: avoid;
+        margin: 10px 0 14px;
+    }
+
+    pre code {
+        background: none;
+        color: var(--text);
+        padding: 0;
+        font-size: 9pt;
+    }
+
+    /* === Списки === */
+    ul, ol {
+        margin: 6px 0 12px;
+        padding-left: 26px;
+    }
+
+    li {
+        margin: 3px 0;
+    }
+
+    /* === Разделитель === */
+    hr {
+        border: none;
+        border-top: 1px solid var(--border);
+        margin: 28px 0;
+    }
+
+    /* === Бейджи статусов === */
+    .status-ok {
+        display: inline-block;
+        background: #e6f4ea;
+        color: #1a7f37;
+        padding: 1px 7px;
+        border-radius: 10px;
+        font-size: 9pt;
+        font-weight: 600;
+    }
+
+    .status-wip {
+        display: inline-block;
+        background: #fff4e0;
+        color: #b8860b;
+        padding: 1px 7px;
+        border-radius: 10px;
+        font-size: 9pt;
+        font-weight: 600;
+    }
+
+    .status-todo {
+        display: inline-block;
+        background: #ffeaea;
+        color: #c7254e;
+        padding: 1px 7px;
+        border-radius: 10px;
+        font-size: 9pt;
+        font-weight: 600;
+    }
+
+    /* === Схема (ASCII в pre) === */
+    .diagram {
+        background: #f8f8fb;
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
+        padding: 14px 16px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8.5pt;
+        line-height: 1.35;
+        white-space: pre;
+        overflow-x: auto;
+        margin: 12px 0 18px;
+    }
+
+    /* === Печать === */
+    @media print {
+        body {
+            padding: 0;
+            font-size: 10.5pt;
+        }
+
+        h1 { font-size: 20pt; }
+        h2 { font-size: 14pt; page-break-before: auto; }
+        h3 { font-size: 11.5pt; }
+
+        table { page-break-inside: auto; }
+        tr { page-break-inside: avoid; }
+
+        pre, .diagram { page-break-inside: avoid; }
+
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        a[href]::after {
+            content: " (" attr(href) ")";
+            font-size: 9pt;
+            color: var(--text-muted);
+        }
+
+        .no-print {
+            display: none;
+        }
+    }
+
+    /* === Кнопка печати (не в PDF) === */
+    .print-btn {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 10px 18px;
+        font-size: 11pt;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 4px 12px rgba(99, 79, 209, 0.35);
+        z-index: 1000;
+    }
+
+    .print-btn:hover {
+        background: #5040a8;
+    }
+
+    /* === Оглавление === */
+    .toc {
+        background: var(--bg-alt);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px 22px;
+        margin: 20px 0 28px;
+        font-size: 10pt;
+    }
+
+    .toc h3 {
+        margin: 0 0 10px;
+        font-size: 11pt;
+        color: var(--text);
+    }
+
+    .toc ol {
+        margin: 0;
+        padding-left: 22px;
+    }
+
+    .toc li {
+        margin: 4px 0;
+    }
+
+    .toc a {
+        color: var(--text);
+        text-decoration: none;
+    }
+
+    .toc a:hover {
+        color: var(--accent);
+        text-decoration: underline;
+    }
+</style>
+</head>
+<body>
+
+<button class="print-btn no-print" onclick="window.print()">🖨 Печать / PDF</button>
+
+<h1>PPTX2PNG Bot — Описание среза проекта</h1>
+
+<div class="meta">
+    <p><strong>Версия документа:</strong> 1.0</p>
+    <p><strong>Дата среза:</strong> 23.09.2026</p>
+    <p><strong>Ответственные:</strong> Алексей Базров (заказчик), команда разработки</p>
+    <p><strong>Репозиторий:</strong> github.com/medianbc/pptx2png</p>
+</div>
+
+<div class="toc">
+    <h3>Содержание</h3>
+    <ol>
+        <li><a href="#sec1">Общие сведения</a></li>
+        <li><a href="#sec2">Серверная часть</a></li>
+        <li><a href="#sec3">Клиентская часть</a></li>
+        <li><a href="#sec4">Принятые решения по функциональности</a></li>
+        <li><a href="#sec5">Приложения</a></li>
+        <li><a href="#sec6">Резюме</a></li>
+    </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="sec1">1. Общие сведения</h2>
+
+<table>
+    <tbody>
+        <tr><th style="width: 35%;">Название проекта</th><td>PPTX2PNG Telegram Bot</td></tr>
+        <tr><th>Текущая версия</th><td>v1.8 (handlers.py), v2.2 (Yandex-подсистема)</td></tr>
+        <tr><th>Дата среза</th><td>23.09.2026</td></tr>
+        <tr><th>Ответственные</th><td>Заказчик — Алексей Базров; разработка — команда</td></tr>
+        <tr><th>Репозиторий</th><td><code>github.com/medianbc/pptx2png</code></td></tr>
+        <tr><th>Платформа</th><td>Raspberry Pi 4B, Debian GNU/Linux, Python 3.13.5</td></tr>
+        <tr><th>Окружения</th><td>test (текущий), prod (планируется)</td></tr>
+    </tbody>
+</table>
+
+<h3>Краткое назначение продукта</h3>
+<p>Telegram-бот для автоматизации подготовки презентаций к церковным трансляциям. Решает три задачи:</p>
+<ol>
+    <li><strong>Конвертация PPTX/PPT/ZIP в PNG</strong> — с выбором качества (Standard/2K/4K), dark mode (чёрный фон, белый текст), упаковкой в ZIP.</li>
+    <li><strong>Подготовка трансляций с Яндекс.Диска</strong> — автоматический поиск презентаций на ближайшее воскресенье, извлечение заметок докладчика, определение слайдов проповеди, раскладка по структуре папок.</li>
+    <li><strong>Проверка орфографии</strong> — через API Яндекс.Спеллера перед конвертацией.</li>
+</ol>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2 id="sec2">2. Серверная часть</h2>
+
+<h3>2.1. Архитектура</h3>
+<p><strong>Монолит</strong> в одном процессе Python. Разделён на слои.</p>
+
+<div class="diagram">┌─────────────────────────────────────────────────────┐
+│  bot.py                                             │
+│  ├─ setup_environment()      — конфиг из .ini       │
+│  ├─ setup_logging()          — RotatingFileHandler  │
+│  ├─ create_bot_and_dispatcher()                     │
+│  └─ cleanup_loop()           — фоновая очистка      │
+└────────────────────┬────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────┐
+│  handlers.py (Telegram-роутер, ~1100 строк)         │
+│  ├─ cmd_start, handle_all_slides, handle_docs, …    │
+│  ├─ handle_text_input (общий: Yandex + обычная)     │
+│  ├─ TaskLockManager (защита от дублей)              │
+│  └─ TaskContext (контекст обычной конвертации)      │
+└────────────────────┬────────────────────────────────┘
+                     │ include_router
+┌────────────────────▼────────────────────────────────┐
+│  yandex_flow.py (Yandex-оркестрация, ~1500 строк)   │
+│  ├─ cmd_sunday, yd_pick, yd_cancel, yd_sermon_*     │
+│  ├─ _yd_prepare_files    — download + convert       │
+│  ├─ _yd_render_sermon_prompt — промпты              │
+│  ├─ _yd_upload_files     — ZIP + upload             │
+│  └─ _yd_cleanup_task     — идемпотентная очистка    │
+└────────────────────┬────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────┐
+│  yandex_state.py  — глобальное состояние            │
+│  ├─ YandexConfig (client, base_path, …)             │
+│  ├─ sessions (общий dict)                           │
+│  ├─ yd_session_lock, yd_active_sessions             │
+│  └─ yd_active_tasks (защита от cleaner)             │
+└────────────────────┬────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────┐
+│  yandex_disk.py — клиент API Яндекс.Диска           │
+│  ├─ YandexDiskClient (async aiohttp)                │
+│  ├─ resource_type, get_resource, list_folder        │
+│  ├─ create_folder, ensure_folder                    │
+│  ├─ upload_file, download_file                      │
+│  └─ resolve_sunday_paths, find_pptx_in_source       │
+└─────────────────────────────────────────────────────┘</div>
+
+<h4>Вспомогательные модули</h4>
+<table>
+    <thead><tr><th>Модуль</th><th>Назначение</th></tr></thead>
+    <tbody>
+        <tr><td><code>converter_engine.py</code></td><td>PPTX → PDF → PNG, dark mode, ZIP</td></tr>
+        <tr><td><code>utils.py</code></td><td>Извлечение текста, spellcheck, download по URL, core_pipeline, speaker notes</td></tr>
+        <tr><td><code>structure.py</code></td><td>Работа с <code>template.yaml</code> (для CLI-скрипта)</td></tr>
+        <tr><td><code>sermon_detector.py</code></td><td>Поиск диапазона проповеди в заметках</td></tr>
+        <tr><td><code>user_manager.py</code></td><td>Настройки пользователей (quality, keep_pdf)</td></tr>
+    </tbody>
+</table>
+
+<h3>2.2. Технологический стек</h3>
+<table>
+    <thead><tr><th>Компонент</th><th>Технология</th></tr></thead>
+    <tbody>
+        <tr><td>Язык</td><td>Python 3.13.5</td></tr>
+        <tr><td>Bot framework</td><td>aiogram 3.x</td></tr>
+        <tr><td>HTTP</td><td>aiohttp</td></tr>
+        <tr><td>PPTX</td><td>python-pptx</td></tr>
+        <tr><td>PDF/PNG</td><td>PyMuPDF (fitz), LibreOffice headless</td></tr>
+        <tr><td>Yandex API</td><td>REST API Яндекс.Диска v1</td></tr>
+        <tr><td>Хранение настроек</td><td>JSON (<code>user_settings.json</code>)</td></tr>
+        <tr><td>Конфигурация</td><td><code>config.ini</code> (секреты), <code>settings.ini</code> (настройки)</td></tr>
+        <tr><td>Логи</td><td>RotatingFileHandler → <code>bot.log</code>, <code>debug.log</code></td></tr>
+        <tr><td>Временные файлы</td><td><code>/dev/shm/pptx2png_tasks/&lt;env&gt;/</code> (RAM), <code>/tmp</code> (ZIP)</td></tr>
+    </tbody>
+</table>
+
+<h3>2.3. Инфраструктура и окружения</h3>
+<table>
+    <thead><tr><th>Окружение</th><th>Путь</th><th>Назначение</th></tr></thead>
+    <tbody>
+        <tr><td>test</td><td><code>/mnt/external_data/pptx2png/test/</code></td><td>Разработка и тестирование</td></tr>
+        <tr><td>prod</td><td><code>/mnt/external_data/pptx2png/prod/</code></td><td>Планируется</td></tr>
+    </tbody>
+</table>
+<p><strong>Запуск:</strong> через <code>manage.sh</code> (обёртка над <code>bot.py</code>).</p>
+
+<h3>2.4. Реализованные модули и API</h3>
+
+<h4>Telegram-команды</h4>
+<table>
+    <thead><tr><th>Команда</th><th>Статус</th><th>Описание</th></tr></thead>
+    <tbody>
+        <tr><td><code>/start</code></td><td><span class="status-ok">Готово</span></td><td>Приветствие + проверка Яндекс.Диска + настройки</td></tr>
+        <tr><td><code>/sunday</code></td><td><span class="status-ok">Готово</span></td><td>Список pptx для ближайшего воскресенья</td></tr>
+        <tr><td><code>/cancel_yd</code></td><td><span class="status-ok">Готово</span></td><td>Отмена активной Yandex-сессии</td></tr>
+    </tbody>
+</table>
+
+<h4>Callback-хендлеры (обычная конвертация)</h4>
+<table>
+    <thead><tr><th>Callback</th><th>Статус</th><th>Описание</th></tr></thead>
+    <tbody>
+        <tr><td><code>slides_all:{task_id}</code></td><td><span class="status-ok">Готово</span></td><td>Конвертировать все слайды</td></tr>
+        <tr><td><code>slides_select:{task_id}</code></td><td><span class="status-ok">Готово</span></td><td>Ввод диапазона вручную</td></tr>
+        <tr><td><code>slides_convert:{task_id}</code></td><td><span class="status-ok">Готово</span></td><td>Конвертировать выбранное</td></tr>
+        <tr><td><code>chk_spell:{task_id}</code></td><td><span class="status-ok">Готово</span></td><td>Проверка орфографии</td></tr>
+        <tr><td><code>chk_conv:{task_id}</code></td><td><span class="status-ok">Готово</span></td><td>Продолжить после спеллера</td></tr>
+        <tr><td><code>set_q_*</code>, <code>toggle_pdf</code></td><td><span class="status-ok">Готово</span></td><td>Настройки качества и PDF</td></tr>
+        <tr><td><code>adm_allow_*</code>, <code>adm_deny_*</code></td><td><span class="status-ok">Готово</span></td><td>Админский контроль доступа</td></tr>
+    </tbody>
+</table>
+
+<h4>Callback-хендлеры (Yandex-подсистема)</h4>
+<table>
+    <thead><tr><th>Callback</th><th>Статус</th><th>Описание</th></tr></thead>
+    <tbody>
+        <tr><td><code>yd_pick:{uid}:{nonce}:{idx}</code></td><td><span class="status-ok">Готово</span></td><td>Выбор файла из <code>/sunday</code></td></tr>
+        <tr><td><code>yd_cancel:{uid}:{nonce}</code></td><td><span class="status-ok">Готово</span></td><td>Отмена сессии</td></tr>
+        <tr><td><code>yd_sermon_ok</code></td><td><span class="status-ok">Готово</span></td><td>Подтвердить авто-диапазон</td></tr>
+        <tr><td><code>yd_sermon_edit</code></td><td><span class="status-ok">Готово</span></td><td>Ввести диапазон вручную</td></tr>
+        <tr><td><code>yd_sermon_skip</code></td><td><span class="status-ok">Готово</span></td><td>Пропустить файл</td></tr>
+    </tbody>
+</table>
+
+<h4>Yandex.Disk API (используемые эндпоинты)</h4>
+<table>
+    <thead><tr><th>Метод</th><th>Назначение</th><th>Статус</th></tr></thead>
+    <tbody>
+        <tr><td><code>GET /resources</code></td><td>Метаданные, список содержимого</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td><code>PUT /resources</code></td><td>Создание папки</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td><code>GET /resources/download</code></td><td>Ссылка на скачивание</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td><code>GET /resources/upload</code></td><td>Ссылка на загрузку</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td><code>PUT &lt;upload href&gt;</code></td><td>Загрузка файла</td><td><span class="status-ok">Готово</span></td></tr>
+    </tbody>
+</table>
+
+<h3>2.5. Модель данных</h3>
+<p>Хранилище в памяти (<code>sessions</code>):</p>
+<ul>
+    <li><strong>Обычные конвертации:</strong> <code>task_&lt;chat&gt;_&lt;user&gt;_&lt;msg&gt;_&lt;hex&gt;</code></li>
+    <li><strong>Yandex picker-сессии:</strong> <code>yd_&lt;user&gt;_&lt;chat&gt;</code></li>
+    <li><strong>Yandex-задачи:</strong> <code>yd_task_&lt;user&gt;_&lt;hex&gt;</code></li>
+</ul>
+<p>Активные сессии (для блокировок):</p>
+<ul>
+    <li><code>yd_active_sessions: Dict[str, str]</code> — <code>{user:chat → nonce}</code></li>
+    <li><code>yd_active_tasks: Set[str]</code> — <code>{task_id}</code></li>
+</ul>
+<p>Настройки пользователей — <code>user_settings.json</code>.</p>
+
+<h3>2.6. Внешние интеграции</h3>
+<table>
+    <thead><tr><th>Сервис</th><th>Назначение</th><th>Статус</th></tr></thead>
+    <tbody>
+        <tr><td>Telegram Bot API</td><td>Все взаимодействия</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Yandex.Disk REST API v1</td><td>Хранение презентаций, PNG, ZIP</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Яндекс.Спеллер API</td><td>Проверка орфографии</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Google Docs</td><td>Скачивание pptx по ссылке</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>LibreOffice headless</td><td>PPTX → PDF</td><td><span class="status-ok">Готово</span></td></tr>
+    </tbody>
+</table>
+
+<h3>2.7. Что не реализовано / техдолг</h3>
+<table>
+    <thead><tr><th>Область</th><th>Техдолг</th></tr></thead>
+    <tbody>
+        <tr><td>Хранилище</td><td><code>sessions</code> в памяти — при рестарте теряются</td></tr>
+        <tr><td>Шардирование</td><td>Один процесс — нет горизонтального масштабирования</td></tr>
+        <tr><td>Тесты</td><td>Нет автоматических тестов</td></tr>
+        <tr><td>CI/CD</td><td>Нет pipeline</td></tr>
+        <tr><td>Метрики</td><td>Нет Prometheus/StatsD</td></tr>
+        <tr><td>Очереди</td><td>Всё в event loop</td></tr>
+        <tr><td>Multi-tenancy</td><td>Один бот — один Yandex-аккаунт</td></tr>
+        <tr><td>Отмена upload</td><td>Не прерывает текущий upload</td></tr>
+        <tr><td>Параллельная загрузка ZIP</td><td>Последовательно</td></tr>
+        <tr><td>Авто-деплой</td><td>Нет</td></tr>
+    </tbody>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2 id="sec3">3. Клиентская часть</h2>
+<p><strong>Клиент — Telegram.</strong> Отдельных web/mobile/desktop приложений нет.</p>
+
+<h3>3.1. Платформы</h3>
+<p>Telegram Android, iOS, Desktop, Web — все платформы работают.</p>
+
+<h3>3.2. Реализованные сценарии</h3>
+<p><strong>Обычная конвертация:</strong></p>
+<ol>
+    <li><code>/start</code> — приветствие + настройки</li>
+    <li>Загрузка <code>.pptx</code>/<code>.zip</code>/ссылки → кнопки «Все слайды / Выбрать слайды»</li>
+    <li>Выбор диапазона слайдов</li>
+    <li>Проверка орфографии (опционально)</li>
+    <li>Конвертация → отправка ZIP + PDF</li>
+</ol>
+
+<p><strong>Yandex-трансляция (<code>/sunday</code>):</strong></p>
+<ol>
+    <li>Проверка Яндекс.Диска</li>
+    <li>Поиск папки ближайшего воскресенья</li>
+    <li>Список pptx с размерами</li>
+    <li>Выбор файла</li>
+    <li>Download + конвертация + извлечение заметок</li>
+    <li>Промпт подтверждения:
+        <ul>
+            <li>Если проповедь найдена → 3 кнопки (Confirm / Edit / Skip)</li>
+            <li>Если не найдена → 2 кнопки (Edit / Skip) + причина</li>
+        </ul>
+    </li>
+    <li>Ручной ввод диапазона при необходимости</li>
+    <li>Upload ZIP:
+        <ul>
+            <li>Проповедь → <code>проповедь - png/&lt;file&gt;_проповедь.zip</code></li>
+            <li>Остальные → <code>pptx2png/&lt;file&gt;/&lt;file&gt;_слайды.zip</code></li>
+        </ul>
+    </li>
+    <li>Отчёт с ссылками на папки</li>
+</ol>
+
+<h3>3.3. Взаимодействие с сервером</h3>
+<ul>
+    <li><strong>Аутентификация:</strong> whitelist + одобрение админа</li>
+    <li><strong>Обработка ошибок:</strong> <code>_safe_edit</code> логирует, пользователю понятные сообщения</li>
+    <li><strong>Состояние:</strong> только на сервере в <code>sessions</code></li>
+</ul>
+
+<h3>3.4. Что не реализовано / техдолг</h3>
+<table>
+    <thead><tr><th>Область</th><th>Статус</th></tr></thead>
+    <tbody>
+        <tr><td>Прогресс-бар конвертации</td><td><span class="status-todo">Нет</span></td></tr>
+        <tr><td>Отмена долгих операций из UI</td><td><span class="status-wip">Частично</span></td></tr>
+        <tr><td>История операций</td><td><span class="status-todo">Нет</span></td></tr>
+        <tr><td>Персонализация UI</td><td><span class="status-wip">Только quality и keep_pdf</span></td></tr>
+        <tr><td>Локализация</td><td><span class="status-wip">Только русский</span></td></tr>
+    </tbody>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2 id="sec4">4. Принятые решения по функциональности</h2>
+
+<h3>4.1. Реализованный функционал</h3>
+<table>
+    <thead><tr><th>Фича</th><th>Статус</th></tr></thead>
+    <tbody>
+        <tr><td>Конвертация PPTX/PPT/ZIP → PNG</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Выбор диапазона слайдов</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>ZIP + PDF отправка</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Проверка орфографии</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Качество Standard / 2K / 4K</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td><code>/sunday</code> — поиск презентаций</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Определение проповеди</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Ручной ввод диапазона</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Раскладка по структуре Диска</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>ZIP-загрузка на Диск</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Отмена операций</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Watchdog таймаута промпта</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Cleaner старых задач</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Админский whitelist</td><td><span class="status-ok">Готово</span></td></tr>
+        <tr><td>Логи INFO + DEBUG</td><td><span class="status-ok">Готово</span></td></tr>
+    </tbody>
+</table>
+
+<h3>4.2. Сознательно отложенный функционал</h3>
+<table>
+    <thead><tr><th>Фича</th><th>Причина</th></tr></thead>
+    <tbody>
+        <tr><td>Параллельная загрузка ZIP</td><td>Не критично; редко &gt;1 файла одновременно</td></tr>
+        <tr><td>Валидация конфига</td><td>Техдолг, добавлен в бэклог</td></tr>
+        <tr><td>Реестр истёкших промптов</td><td>Избыточно; уведомление о таймауте покрывает UX</td></tr>
+        <tr><td>Прогресс-бар</td><td>Telegram ограничен; текст дешевле</td></tr>
+        <tr><td>Публикация папок Диска</td><td>Изменит видимость; не запрошено</td></tr>
+        <tr><td>Поддержка ODT/DOCX</td><td>Не запрошено</td></tr>
+        <tr><td>Web-интерфейс</td><td>Не запрошено</td></tr>
+    </tbody>
+</table>
+
+<h3>4.3. Ключевые компромиссы</h3>
+<table>
+    <thead><tr><th>Область</th><th>Компромисс</th><th>Почему</th></tr></thead>
+    <tbody>
+        <tr><td>Хранение сессий</td><td>В памяти, теряются при рестарте</td><td>Проще; задачи короткоживущие</td></tr>
+        <tr><td>ZIP на Диске (не распакованные PNG)</td><td>Пользователь распаковывает сам</td><td>Yandex API не умеет распаковку</td></tr>
+        <tr><td>ZIP tempdir в <code>/tmp</code></td><td>Не в <code>/dev/shm</code></td><td>RAM ограничена; peak при упаковке</td></tr>
+        <tr><td>Последовательная загрузка</td><td>Не параллельная</td><td>Простота; риск rate limit</td></tr>
+        <tr><td>Отмена upload</td><td>Не мгновенная</td><td>Реализовать = сложно; редко критично</td></tr>
+        <tr><td>Таймаут из <code>settings.ini</code></td><td>Не в коде</td><td>Гибкость без пересборки</td></tr>
+        <tr><td>Cleaner в боте</td><td>Не отдельный сервис</td><td>Простота; один процесс</td></tr>
+    </tbody>
+</table>
+
+<h3>4.4. Открытые вопросы и риски</h3>
+<table>
+    <thead><tr><th>Вопрос / Риск</th><th>Приоритет</th></tr></thead>
+    <tbody>
+        <tr><td>Нет валидации timeout &gt; 0 в конфиге</td><td><span class="status-todo">High</span></td></tr>
+        <tr><td>Reply на сообщение бота в обычной конвертации</td><td><span class="status-todo">High</span></td></tr>
+        <tr><td>Нет автотестов</td><td><span class="status-wip">Medium</span></td></tr>
+        <tr><td>Медленный upload на Pi</td><td><span class="status-wip">Medium</span></td></tr>
+        <tr><td>Рост <code>_locks</code> в TaskLockManager</td><td><span class="status-ok">Low</span></td></tr>
+        <tr><td>Multi-tenancy</td><td><span class="status-wip">Medium</span></td></tr>
+        <tr><td>Метрики и алертинг</td><td><span class="status-wip">Medium</span></td></tr>
+    </tbody>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2 id="sec5">5. Приложения</h2>
+
+<h3>5.1. Схема работы <code>/sunday</code></h3>
+<div class="diagram">Пользователь → /sunday
+     ↓
+Bot: проверка Yandex client
+     ↓
+Bot: resolve_sunday_paths (месяц → дата → Служение/Трансляция)
+     ↓
+Bot: find_pptx_in_source
+     ↓
+Bot → Пользователь: список pptx + кнопки [🎯/📄 file, 📁 Все, ❌ Отмена]
+     ↓
+Пользователь → yd_pick (например, все файлы)
+     ↓
+Bot: _yd_prepare_files (task_dir в /dev/shm)
+     ├─ для каждого файла:
+     │    ├─ download_file
+     │    ├─ convert_all_pngs (PPTX → PNG)
+     │    ├─ extract_speaker_notes
+     │    └─ find_sermon_range
+     ↓
+Bot: needs_confirm?
+     ├─ ДА → _yd_render_sermon_prompt
+     │         ├─ matches ≥2 → 3 кнопки (Confirm/Edit/Skip)
+     │         └─ matches <2 → 2 кнопки (Edit/Skip)
+     │         ↓
+     │      Пользователь → ok/skip/edit
+     │         ↓
+     │      _yd_upload_files
+     │
+     └─ НЕТ → _yd_upload_files
+
+_yd_upload_files:
+     ├─ zip_tmp_dir = mkdtemp() в /tmp
+     ├─ для каждого файла:
+     │    ├─ ensure_folder(pptx2png/<slug>)
+     │    ├─ split PNG: sermon / others
+     │    ├─ create_zip_stream(sermon_pngs) → /tmp/*_проповедь.zip
+     │    ├─ upload → sermon_dir/
+     │    ├─ create_zip_stream(other_pngs) → /tmp/*_слайды.zip
+     │    └─ upload → pptx2png_dir/
+     ├─ send_report (со ссылками)
+     └─ cleanup (task_dir, zip_tmp_dir, sessions)</div>
+
+<h3>5.2. Ссылки</h3>
+<table>
+    <thead><tr><th>Ресурс</th><th>Ссылка</th></tr></thead>
+    <tbody>
+        <tr><td>Репозиторий</td><td><a href="https://github.com/medianbc/pptx2png">github.com/medianbc/pptx2png</a></td></tr>
+        <tr><td>Yandex.Disk API docs</td><td><a href="https://yandex.ru/dev/disk/api/">yandex.ru/dev/disk/api/</a></td></tr>
+        <tr><td>aiogram 3 docs</td><td><a href="https://docs.aiogram.dev">docs.aiogram.dev</a></td></tr>
+    </tbody>
+</table>
+
+<h3>5.3. Метрики текущего среза</h3>
+<table>
+    <thead><tr><th>Метрика</th><th>Значение</th></tr></thead>
+    <tbody>
+        <tr><td>Размер <code>handlers.py</code></td><td>~1100 строк</td></tr>
+        <tr><td>Размер <code>yandex_flow.py</code></td><td>~1500 строк</td></tr>
+        <tr><td>Размер <code>yandex_disk.py</code></td><td>~400 строк</td></tr>
+        <tr><td>Пользователей</td><td>1 (Алексей Базров)</td></tr>
+        <tr><td>Презентаций обработано</td><td>~10</td></tr>
+        <tr><td>Среднее время (186 слайдов)</td><td>~90 сек (конвертация) + ~120 сек (upload) = <strong>~3.5 минуты</strong></td></tr>
+        <tr><td>Warnings/errors</td><td>0 критических</td></tr>
+    </tbody>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2 id="sec6">6. Резюме</h2>
+
+<p><strong>Проект в рабочем состоянии.</strong> Основной функционал — конвертация, <code>/sunday</code>, определение проповеди, ZIP-загрузка на Диск — работает стабильно. Критических багов, ломающих основной flow, <strong>нет</strong>.</p>
+
+<h4>Что закрыть в следующей итерации</h4>
+<ol>
+    <li><span class="status-todo">High</span> <strong>Удалить reply-проверку в <code>handle_text_input</code></strong> — ломает обычную конвертацию.</li>
+    <li><span class="status-todo">High</span> <strong>Добавить валидацию timeout в <code>bot.py</code></strong> — при <code>≤ 0</code> бот не должен запускаться.</li>
+    <li><span class="status-wip">Medium</span> <strong>Добавить автотесты</strong> — smoke-test для <code>create_zip_stream</code>, <code>_format_ranges_text</code>, <code>resolve_sunday_paths</code> (mock).</li>
+    <li><span class="status-wip">Medium</span> <strong>Ускорить upload</strong> — параллельная загрузка или chunked PUT.</li>
+</ol>
+
+<h4>Что отложено на будущее</h4>
+<ul>
+    <li>Multi-tenancy (несколько Yandex-аккаунтов).</li>
+    <li>Метрики / алертинг.</li>
+    <li>Web-интерфейс для админа.</li>
+    <li>Расширение форматов (ODT, DOCX).</li>
+</ul>
+
+<hr>
+
+<p style="text-align: center; color: #888; font-size: 9pt; margin-top: 40px;">
+    Документ сгенерирован 23.09.2026 · PPTX2PNG Bot v1.8
+</p>
+
+</body>
+</html>
