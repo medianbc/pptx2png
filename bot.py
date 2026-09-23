@@ -138,6 +138,35 @@ def setup_environment():
             + "\n  ".join(_invalid)
         )
 
+        # ✅ Категории слайдов (settings.ini, секция [SlideCategories])
+    def _parse_keywords(raw: str) -> list:
+        if not raw:
+            return []
+        return [kw.strip().lower() for kw in raw.split(",") if kw.strip()]
+
+    sermon_keywords_raw = settings_config.get(
+        "SlideCategories", "sermon_keywords",
+        fallback=yandex_sermon_keyword,  # fallback на [YandexDisk]
+    )
+    opening_keywords_raw = settings_config.get(
+        "SlideCategories", "opening_keywords",
+        fallback="начало,в начале",
+    )
+    prayer_keywords_raw = settings_config.get(
+        "SlideCategories", "prayer_keywords",
+        fallback="молитва,молиться",
+    )
+
+    sermon_keywords = _parse_keywords(sermon_keywords_raw)
+    opening_keywords = _parse_keywords(opening_keywords_raw)
+    prayer_keywords = _parse_keywords(prayer_keywords_raw)
+
+    if not sermon_keywords:
+        logging.warning(
+            "⚠️ sermon_keywords пустой — использую ['проповед', 'проповедь']"
+        )
+        sermon_keywords = ["проповед", "проповедь"]
+
     return {
         "script_dir": script_dir,
         "env_name": env_name,
@@ -157,6 +186,10 @@ def setup_environment():
         "prompt_timeout_sec": prompt_timeout_sec,
         "cleanup_interval_sec": cleanup_interval_sec,
         "cleanup_max_age_sec": cleanup_max_age_sec,
+        # ✅ Категории слайдов
+        "sermon_keywords": sermon_keywords,
+        "opening_keywords": opening_keywords,
+        "prayer_keywords": prayer_keywords,
     }
 
 
@@ -281,6 +314,17 @@ def create_bot_and_dispatcher(cfg: dict):
         f"⏱️ Таймаут промпта: {cfg['prompt_timeout_sec']}s, "
         f"cleanup interval: {cfg['cleanup_interval_sec']}s, "
         f"max_age: {cfg['cleanup_max_age_sec']}s"
+    )
+
+    # ✅ Пробрасываем категории слайдов
+    yandex_state.config.sermon_keywords = cfg["sermon_keywords"]
+    yandex_state.config.opening_keywords = cfg["opening_keywords"]
+    yandex_state.config.prayer_keywords = cfg["prayer_keywords"]
+    logging.info(
+        f"📂 Категории слайдов: "
+        f"sermon={cfg['sermon_keywords']}, "
+        f"opening={cfg['opening_keywords']}, "
+        f"prayer={cfg['prayer_keywords']}"
     )
 
     def get_settings_keyboard(user_id):
