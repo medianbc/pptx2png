@@ -1675,35 +1675,74 @@ async def cmd_cancel_yd(message: types.Message, check_access):
 async def yd_task_cancel_callback(callback: types.CallbackQuery):
     """
     Отмена текущей Yandex-задачи (не всей сессии).
-
-    Семантика (вариант «третье»):
-      - Помечаем задачу как `cancelled=True`.
-      - Отвечаем пользователю сразу.
-      - Текущая операция (upload/download) доводится до конца.
-      - Следующая проверка `_is_cancelled()` → cleanup.
-
-    Если задача ещё на стадии промпта — cleanup сработает немедленно.
     """
+    # ============================================================
+    # ВРЕМЕННЫЙ ЛОГ ДЛЯ ДИАГНОСТИКИ
+    # ============================================================
     parts = callback.data.split(":")
+    task_id = parts[1] if len(parts) == 2 else "INVALID"
+
+    async with yd_session_lock:
+        all_active = [k for k in sessions.keys() if k.startswith("yd_task_")]
+        all_picker = [k for k in sessions.keys() if k.startswith("yd_") and not k.startswith("yd_task_")]
+
+    logging.info(
+        f"[YD-TASK-CANCEL-DEBUG] callback.data={callback.data!r}, "
+        f"parsed_task_id={task_id!r}, "
+        f"in_sessions={task_id in sessions}, "
+        f"active_tasks={all_active}, "
+        f"picker_sessions={all_picker}, "
+        f"from_user={callback.from_user.id}, "
+        f"chat_id={callback.message.chat.id if callback.message else None}, "
+        f"msg_id={callback.message.message_id if callback.message else None}"
+    )
+    # ============================================================
+
     if len(parts) != 2:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
         return
 
-    task_id = parts[1]
-
     session = sessions.get(task_id)
     if not session or "pending" not in session:
-        await callback.answer("❌ Задача уже неактивна.", show_alert=True)
+        # Задача уже очищена — убираем клавиатуру и мягко сообщаем
+        logging.info(
+            f"[YD-TASK-CANCEL-DEBUG] Задача {task_id!r} не найдена. "
+            f"Возможно, устаревшая кнопка."
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.answer(
+            "ℹ️ Эта задача уже завершена или отменена.",
+            show_alert=True,
+        )
         return
 
     pending = session["pending"]
     if not isinstance(pending, dict):
-        await callback.answer("❌ Задача уже неактивна.", show_alert=True)
+        logging.info(
+            f"[YD-TASK-CANCEL-DEBUG] Задача {task_id!r} — pending не dict"
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.answer(
+            "ℹ️ Эта задача уже завершена или отменена.",
+            show_alert=True,
+        )
         return
 
     owner_user_id = pending.get("owner_user_id")
 
     if callback.from_user.id != owner_user_id:
+        logging.info(
+            f"[YD-TASK-CANCEL-DEBUG] Отказ: user={callback.from_user.id} "
+            f"!= owner={owner_user_id}"
+        )
         await callback.answer(
             "❌ Только автор задачи может её отменить.",
             show_alert=True,
@@ -1715,18 +1754,14 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         f"отменил задачу {task_id}"
     )
 
-    # ✅ Помечаем задачу как отменённую
+    # Помечаем задачу как отменённую
     session["cancelled"] = True
 
-    # Отвечаем пользователю
     try:
         await callback.answer("❌ Задача отменена")
     except Exception:
         pass
 
-    # ✅ Если задача ещё на стадии промпта — можно сразу очистить.
-    # Если на стадии upload — текущий upload дойдёт до конца,
-    # следующая проверка _is_cancelled() прервёт цикл и вызовет cleanup.
     prompt_active = pending.get("prompt_nonce") is not None
 
     if prompt_active:
@@ -1737,18 +1772,17 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 "Временные файлы удалены.\n"
                 "Запустите <code>/sunday</code> заново, если нужно.",
                 parse_mode="HTML",
+                reply_markup=None,
             )
         except Exception:
             pass
 
-        # Отменяем watchdog
         timeout_task = pending.get("prompt_timeout_task")
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
         pending["prompt_timeout_task"] = None
         pending["prompt_watchdog_nonce"] = None
 
-        # Запускаем cleanup
         await _yd_cleanup_task(
             task_id=task_id,
             session_key=pending.get("session_key"),
@@ -1758,17 +1792,17 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
             nonce=pending.get("nonce"),
         )
     else:
-        # Задача в процессе (upload/download) — просто уведомляем.
-        # Следующая проверка _is_cancelled() завершит работу.
+        # Задача в процессе (upload/download)
         try:
             await callback.message.edit_text(
                 "⏳ <b>Отмена запрошена…</b>\n\n"
-                "Текущий шаг завершится, затем задача будет очищена.",
+                "Текущий шаг завершится, затем задача будет очищена.\n"
+                "<i>Больше ничего нажимать не нужно.</i>",
                 parse_mode="HTML",
+                reply_markup=None,
             )
         except Exception:
             pass
-
 
 # ==========================================
 # yd_sermon_ok / skip / edit
