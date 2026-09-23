@@ -8,11 +8,13 @@ from typing import Dict, Optional, Tuple, List
 
 def find_sermon_range(
     notes: Dict[int, str],
-    keyword: str,
+    keyword,
 ) -> Tuple[Optional[int], Optional[int], List[int]]:
     """
-    Ищет диапазон проповеди по ключевому слову в заметках.
+    Ищет диапазон проповеди по ключевым словам в заметках.
 
+    :param keyword: str | list[str] — одно ключевое слово или список.
+                    Совместимо со старым API (str).
     :return: (start, end, all_matches)
              - (None, None, []) — не найдено
              - (N, N, [N])     — одно совпадение (нужен ручной ввод)
@@ -20,15 +22,30 @@ def find_sermon_range(
     """
     if not notes:
         return None, None, []
-    if not keyword or not keyword.strip():
-        logging.error("find_sermon_range: пустой keyword — пропускаем поиск")
-        return None, None, []
-        
-    keyword_lower = keyword.lower()
-    matches = []
 
+    # ✅ Нормализуем в список ключевых слов
+    if isinstance(keyword, str):
+        keywords = [keyword]
+    elif isinstance(keyword, (list, tuple, set)):
+        keywords = [str(k) for k in keyword]
+    else:
+        keywords = []
+
+    keywords = [k.strip().lower() for k in keywords if k and k.strip()]
+
+    if not keywords:
+        logging.error("find_sermon_range: пустой список keywords — пропускаем поиск")
+        return None, None, []
+
+    logging.debug(f"find_sermon_range: ищем keywords={keywords!r}, слайдов={len(notes)}")
+
+    matches = []
     for slide_num, text in sorted(notes.items()):
-        if keyword_lower in text.lower():
+        if not text:
+            continue
+        text_lower = text.lower()
+        # ✅ Слайд считается «проповедью», если содержит ЛЮБОЕ из ключевых слов
+        if any(kw in text_lower for kw in keywords):
             matches.append(slide_num)
 
     if not matches:
@@ -36,6 +53,7 @@ def find_sermon_range(
 
     start = min(matches)
     end = max(matches)
+    logging.debug(f"find_sermon_range: matches={matches}, start={start}, end={end}")
     return start, end, matches
 
 
