@@ -671,22 +671,6 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         candidates.append((tid, sess, pending))
 
     target = None
-    # ✅ Проверка: если это reply на сообщение бота, но pending уже нет —
-    # значит промпт истёк/отменён. Отвечаем понятно.
-    if (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.is_bot
-        and not candidates
-    ):
-        await message.reply(
-            "⏰ <b>Эта задача уже неактивна.</b>\n\n"
-            "Возможно, время ожидания истекло или задача отменена.\n"
-            "Запустите /sunday заново, чтобы обработать файл.",
-            parse_mode="HTML",
-        )
-        return
-
-    target = None
     if message.reply_to_message is not None and message.reply_to_message.from_user.is_bot:
         reply_to_id = message.reply_to_message.message_id
         for tid, sess, pending in candidates:
