@@ -116,6 +116,28 @@ def setup_environment():
         "Timeouts", "cleanup_max_age_sec", fallback=7200
     )
 
+    # ✅ Валидация: все три значения должны быть > 0
+    # Иначе: sleep(0) → мгновенно, cleanup_loop крутится в busy-loop,
+    # свежие папки удаляются сразу.
+    _invalid = []
+    if prompt_timeout_sec <= 0:
+        _invalid.append(
+            f"Timeouts.prompt_timeout_sec={prompt_timeout_sec} (нужно > 0)"
+        )
+    if cleanup_interval_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_interval_sec={cleanup_interval_sec} (нужно > 0)"
+        )
+    if cleanup_max_age_sec <= 0:
+        _invalid.append(
+            f"Timeouts.cleanup_max_age_sec={cleanup_max_age_sec} (нужно > 0)"
+        )
+    if _invalid:
+        sys.exit(
+            "❌ Ошибка в settings.ini, секция [Timeouts]:\n  "
+            + "\n  ".join(_invalid)
+        )
+
     return {
         "script_dir": script_dir,
         "env_name": env_name,
