@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_state.py — ГЛОБАЛЬНОЕ СОСТОЯНИЕ ЯНДЕКС.ДИСКА
+# yandex_state.py — ГЛОБАЛЬНОЕ СОСТОЯНИЕ ЯНДЕКС.ДИСКА (v1.1)
 # ==========================================
 
 import asyncio
@@ -25,6 +25,9 @@ class YandexConfig:
         self.sermon_folder: str = "проповедь - png"
         self.sermon_keyword: str = "проповед"
         self.template_file: str = "template.yaml"
+        # ✅ Таймаут ожидания ответа на промпт (секунды)
+        # Устанавливается из bot.py (settings.ini, секция [Timeouts])
+        self.prompt_timeout_sec: int = 1800  # 30 минут по умолчанию
 
 
 config = YandexConfig()
@@ -48,10 +51,6 @@ yd_active_sessions: Dict[str, str] = {}
 
 # Реестр активных Yandex-задач (защита от cleaner)
 yd_active_tasks: Set[str] = set()
-
-
-# Таймаут ожидания ответа пользователя на промпт (в секундах)
-YD_PROMPT_TIMEOUT_SEC = 600  # 10 минут
 
 
 # ==========================================
