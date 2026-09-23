@@ -485,6 +485,11 @@ async def _yd_render_sermon_prompt(
       1. has_valid_range = True → 3 кнопки режимов + Изменить + Отмена
       2. matches > 0, но одна пометка → 2 кнопки + Изменить + Отмена
       3. matches = 0 / notes не прочитаны → «Конвертировать всё» + Изменить + Отмена
+
+    ✅ Исправление бага №4: подсчёт и отображение диапазона ведётся
+    по item["ranges"] (если он есть), а не по схлопнутым start/end.
+    Для ввода вида "1,10" это даёт 2 слайда и текст "1, 10",
+    а не 10 слайдов и текст "1–10".
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -495,21 +500,29 @@ async def _yd_render_sermon_prompt(
     if not isinstance(pending, dict):
         return
 
-    idx = pending["prepared"].index(item)
+    try:
+        idx = pending["prepared"].index(item)
+    except (ValueError, KeyError):
+        logging.error(
+            f"_yd_render_sermon_prompt: item не найден в prepared "
+            f"для task_id={task_id}"
+        )
+        return
+
     pending["prompt_idx"] = idx
 
     if pending.get("prompt_nonce") is None:
         pending["prompt_nonce"] = secrets.token_hex(8)
     prompt_nonce = pending["prompt_nonce"]
 
-    matches = item.get("matches", [])
+    matches = item.get("matches", []) or []
     start = item.get("start")
     end = item.get("end")
+    ranges = item.get("ranges")
     file_name = item.get("file_name", "")
     file_esc = html_module.escape(file_name)
 
-    # ✅ Общее количество слайдов — для счётчиков на кнопках
-    # Пока не знаем точно (не конвертировали). Берём из PPTX.
+    # ✅ Общее количество слайдов — считаем из PPTX (без конвертации)
     file_path = item.get("file_path")
     total_slides = 0
     if file_path and Path(file_path).exists():
@@ -531,13 +544,22 @@ async def _yd_render_sermon_prompt(
 
     logging.debug(
         f"[YD-PROMPT] task_id={task_id}, idx={idx}, file={file_name!r}, "
-        f"matches={len(matches)}, start={start}, end={end}, "
+        f"matches={len(matches)}, start={start}, end={end}, ranges={ranges}, "
         f"has_valid_range={has_valid_range}, total_slides={total_slides}"
     )
 
     if has_valid_range:
         # --- Диапазон задан (автоматически или вручную) ---
-        sermon_count = _count_slides_for_range(start, end, total_slides)
+
+        # ✅ Баг №4: считаем sermon_count по ranges, если они есть.
+        # Это корректно обрабатывает несвязные диапазоны (1,10 → 2 слайда).
+        if ranges:
+            sermon_count = _count_slides_in_ranges(ranges, total_slides)
+            ranges_text = _format_ranges_text(ranges, start, end)
+        else:
+            sermon_count = _count_slides_for_range(start, end, total_slides)
+            ranges_text = _format_ranges_text(None, start, end)
+
         other_count = max(0, total_slides - sermon_count)
 
         manual_range = item.get("manual_range", False)
@@ -547,7 +569,8 @@ async def _yd_render_sermon_prompt(
             text = (
                 f"🎯 <b>Диапазон проповеди установлен</b>\n\n"
                 f"📄 Файл: <code>{file_esc}</code>\n"
-                f"📊 Диапазон: <b>{start}–{end}</b>\n\n"
+                f"📊 Диапазон: <b>{ranges_text}</b>\n"
+                f"🎯 Слайдов проповеди: <b>{sermon_count}</b>\n\n"
                 f"❓ <b>Какие слайды конвертировать?</b>"
             )
         else:
@@ -560,9 +583,9 @@ async def _yd_render_sermon_prompt(
                 f"🎯 <b>Найдена пометка «проповедь»</b>\n\n"
                 f"📄 Файл: <code>{file_esc}</code>\n"
                 f"📌 Слайды с пометкой: <code>{preview}</code>\n"
-                f"📊 Предлагаемый диапазон: <b>{start}–{end}</b>\n\n"
+                f"📊 Предлагаемый диапазон: <b>{ranges_text}</b>\n\n"
                 f"❓ <b>Какие слайды конвертировать?</b>"
-            )  
+            )
 
         kb.row(
             InlineKeyboardButton(
@@ -689,7 +712,6 @@ async def _yd_render_sermon_prompt(
         )
     )
     pending["prompt_watchdog_nonce"] = prompt_nonce
-
 
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
     """Если пользователь не ответил на промпт — уведомляем и очищаем."""
@@ -1823,7 +1845,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
-    item = pending["prepаared"][idx]
+    item = pending["prepаred"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан
     if mode in ("sermon", "both") and (
@@ -1833,6 +1855,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
             "❌ Диапазон не задан. Укажите его вручную.",
             show_alert=True,
         )
+        await _yd_render_sermon_prompt(task_id, item, callback.message)
         return
 
     item["convert_mode"] = mode
