@@ -1868,7 +1868,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
-    item = pending["prepаred"][idx]
+    item = pending["prepared"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан
     if mode in ("sermon", "both") and (
