@@ -778,17 +778,21 @@ async def _yd_upload_files(
     session_key = pending["session_key"]
     nonce = pending["nonce"]
 
-    # ZIP создаются в disk-backed tempdir, не в /dev/shm.
-    zip_tmp_dir = Path(tempfile.mkdtemp(prefix=f"pptx2png_{task_id}_"))
+    # ✅ Fix #3: zip_tmp_dir инициализируется None ДО try.
+    # Создание — ВНУТРИ try, чтобы падение mkdtemp шло через _yd_cleanup_task.
+    zip_tmp_dir: Optional[Path] = None
 
     cleanup_done = False
 
     logging.info(
         f"[YD-UP] Старт: task_id={task_id}, файлов={len(prepared)}, "
-        f"target_base={target_base!r}, zip_tmp_dir={zip_tmp_dir}"
+        f"target_base={target_base!r}"
     )
 
     try:
+        # ✅ Fix #3: mkdtemp внутри try
+        zip_tmp_dir = Path(tempfile.mkdtemp(prefix=f"pptx2png_{task_id}_"))
+        logging.debug(f"[YD-UP] Создана временная папка {zip_tmp_dir}")
         total_uploaded_zip = 0
         total_slides_packed = 0
         total_failed = 0
@@ -1094,13 +1098,18 @@ async def _yd_upload_files(
         )
         return
     finally:
-        # Удаляем temp-директорию с ZIP (вне /dev/shm)
-        if zip_tmp_dir and zip_tmp_dir.exists():
+        # ✅ Fix #4: без ignore_errors — реальные ошибки попадут в except.
+        # logging.debug вызывается ТОЛЬКО после успешного rmtree.
+        if zip_tmp_dir is not None and zip_tmp_dir.exists():
             try:
-                shutil.rmtree(zip_tmp_dir, ignore_errors=True)
+                shutil.rmtree(zip_tmp_dir)
                 logging.debug(f"[YD-UP] Удалена временная папка {zip_tmp_dir}")
             except Exception as e:
-                logging.warning(f"Не удалось удалить {zip_tmp_dir}: {e}")
+                logging.warning(
+                    f"[YD-UP] Не удалось удалить временную папку "
+                    f"{zip_tmp_dir}: {e}",
+                    exc_info=True,
+                )
 
         if not cleanup_done:
             await _yd_cleanup_task(
