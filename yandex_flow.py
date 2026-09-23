@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.2)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v2.3)
 # ==========================================
 
 import asyncio
@@ -82,7 +82,6 @@ def _safe_unlink(path: Path):
 async def _safe_edit(msg, text: str, **kwargs) -> bool:
     """
     Безопасный edit_text с логированием ошибок.
-    Раньше падения edit_text глотались через 'pass' — теперь логируются.
     """
     if msg is None:
         return False
@@ -98,7 +97,6 @@ def _format_ranges_text(ranges, start=None, end=None) -> str:
     """
     Форматирует список диапазонов в '1–2, 8–9'.
     Если ranges пустой, но есть start/end — использует их.
-    Пример: [(1,2), (8,9)] → '1–2, 8–9'.
     """
     if ranges:
         return ", ".join(
@@ -122,10 +120,7 @@ def _is_sermon_slide(item: dict, slide_idx: int) -> bool:
 
 
 def _yd_public_url(disk_path: str) -> str:
-    """
-    Строит корректный кликабельный URL Яндекс.Диска.
-    Путь полностью URL-encode'ится, '/' остаётся разделителем.
-    """
+    """Строит корректный кликабельный URL Яндекс.Диска."""
     path = disk_path.lstrip("/")
     encoded = urllib.parse.quote(path, safe="/")
     return f"https://disk.yandex.ru/client/disk/{encoded}"
@@ -140,6 +135,21 @@ def _format_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.1f} МБ"
     return f"{num_bytes / (1024 * 1024 * 1024):.2f} ГБ"
+
+
+def _get_cancel_keyboard(task_id: str) -> InlineKeyboardBuilder:
+    """
+    Клавиатура с единственной кнопкой «Отменить задачу».
+    Используется на всех промежуточных этапах.
+    """
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="❌ Отменить задачу",
+            callback_data=f"yd_task_cancel:{task_id}",
+        ),
+    )
+    return kb
 
 
 # ==========================================
@@ -160,9 +170,6 @@ async def _yd_prepare_files(
     """
     Первая фаза: скачивание + конвертация всех файлов.
     Сохраняет результат в sessions[task_id]["pending"].
-
-    Не создаёт никаких папок на Яндекс.Диске — целевые папки будут
-    созданы по требованию в _yd_upload_files через ensure_folder.
     """
     status_msg = callback.message
     owner_user_id = callback.from_user.id
@@ -220,10 +227,12 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
+            # ✅ Скачивание с кнопкой отмены
             await _safe_edit(
                 status_msg,
                 f"📥 Скачиваю <code>{file_name_esc}</code>...",
                 parse_mode="HTML",
+                reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
             local_pptx = task_dir / file_name
@@ -244,10 +253,12 @@ async def _yd_prepare_files(
                 f"размер={_format_size(local_pptx.stat().st_size)}"
             )
 
+            # ✅ Конвертация с кнопкой отмены
             await _safe_edit(
                 status_msg,
                 f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
                 parse_mode="HTML",
+                reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
             temp_png_dir = task_dir / f"png_{f_idx}"
@@ -278,6 +289,7 @@ async def _yd_prepare_files(
             pngs_sorted = sorted(pngs, key=lambda p: p.name)
             logging.debug(f"[YD-PREP] {file_name}: конвертировано {len(pngs_sorted)} PNG")
 
+            # Извлекаем заметки
             notes_ok, notes, incomplete = await asyncio.to_thread(
                 extract_speaker_notes, str(used_pptx)
             )
@@ -412,6 +424,7 @@ async def _yd_ask_sermon_confirmation(
 # ==========================================
 
 async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
+    """Атомарно проверяет и 'потребляет' промпт."""
     parts = callback.data.split(":")
     if len(parts) != 4:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
@@ -469,6 +482,10 @@ async def _yd_render_sermon_prompt(
     status_msg,
     reply_fn=None,
 ) -> None:
+    """
+    Единая точка отрисовки промпта подтверждения проповеди.
+    Два варианта + кнопка отмены задачи.
+    """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
@@ -581,6 +598,14 @@ async def _yd_render_sermon_prompt(
             ),
         )
 
+    # ✅ Кнопка отмены всей задачи
+    kb.row(
+        InlineKeyboardButton(
+            text="❌ Отменить задачу",
+            callback_data=f"yd_task_cancel:{task_id}",
+        ),
+    )
+
     sent_msg = None
     if reply_fn is not None:
         sent_msg = await reply_fn(text, parse_mode="HTML", reply_markup=kb.as_markup())
@@ -612,7 +637,6 @@ async def _yd_render_sermon_prompt(
         pending["prompt_timeout_task"] = None
         pending["prompt_watchdog_nonce"] = None
 
-    # ✅ Используем таймаут из конфига (settings.ini)
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(
             task_id, yandex_state.config.prompt_timeout_sec, prompt_nonce
@@ -710,6 +734,7 @@ async def _yd_cleanup_task(
     status_msg=None,
     error: Optional[Exception] = None,
 ):
+    """Идемпотентная очистка. Безопасна к pending=None."""
     logging.info(
         f"[YD-CLEANUP] task_id={task_id}, session_key={session_key!r}, "
         f"reason={'error' if error else 'normal'}"
@@ -776,7 +801,7 @@ async def _yd_cleanup_task(
 
 
 # ==========================================
-# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия, v2.2)
+# ЗАГРУЗКА НА ЯНДЕКС.ДИСК (ZIP-версия, v2.3)
 # ==========================================
 
 async def _yd_upload_files(
@@ -819,8 +844,7 @@ async def _yd_upload_files(
     session_key = pending["session_key"]
     nonce = pending["nonce"]
 
-    # ✅ Fix #3: zip_tmp_dir инициализируется None ДО try.
-    # Создание — ВНУТРИ try, чтобы падение mkdtemp шло через _yd_cleanup_task.
+    # zip_tmp_dir инициализируется None ДО try.
     zip_tmp_dir: Optional[Path] = None
 
     cleanup_done = False
@@ -831,7 +855,6 @@ async def _yd_upload_files(
     )
 
     try:
-        # ✅ Fix #3: mkdtemp внутри try
         zip_tmp_dir = Path(tempfile.mkdtemp(prefix=f"pptx2png_{task_id}_"))
         logging.debug(f"[YD-UP] Создана временная папка {zip_tmp_dir}")
         total_uploaded_zip = 0
@@ -874,10 +897,12 @@ async def _yd_upload_files(
                 f"pngs={len(pngs_sorted)}, ranges={ranges}"
             )
 
+            # ✅ Кнопка отмены на этапе подготовки архивов
             await _safe_edit(
                 status_msg,
                 f"📦 Готовлю архивы для <code>{file_name_esc}</code>...",
                 parse_mode="HTML",
+                reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
             pptx2png_dir = (
@@ -949,10 +974,12 @@ async def _yd_upload_files(
                     f"({_format_size(sermon_zip_size)}) → {remote_path!r}"
                 )
 
+                # ✅ Кнопка отмены на этапе upload проповеди
                 await _safe_edit(
                     status_msg,
                     f"📤 Загружаю архив проповеди (<code>{file_name_esc}</code>)...",
                     parse_mode="HTML",
+                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
                 )
 
                 if _is_cancelled():
@@ -1030,10 +1057,12 @@ async def _yd_upload_files(
                     f"({_format_size(other_zip_size)}) → {remote_path!r}"
                 )
 
+                # ✅ Кнопка отмены на этапе upload слайдов
                 await _safe_edit(
                     status_msg,
                     f"📤 Загружаю архив слайдов (<code>{file_name_esc}</code>)...",
                     parse_mode="HTML",
+                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
                 )
 
                 if _is_cancelled():
@@ -1106,6 +1135,12 @@ async def _yd_upload_files(
                     f'{html_module.escape(folder_name)}/</a>'
                 )
                 logging.debug(f"[YD-UP] ссылка на {label}: {url}")
+
+        # ✅ Убираем кнопку отмены — работа завершена
+        try:
+            await status_msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
         await _yd_send_report(
             bot=bot,
@@ -1632,6 +1667,113 @@ async def cmd_cancel_yd(message: types.Message, check_access):
     await message.reply("✅ Сессия Яндекс.Диска сброшена.")
 
 
+# ==========================================
+# НОВЫЙ ХЕНДЛЕР: отмена текущей задачи
+# ==========================================
+
+@router.callback_query(F.data.startswith("yd_task_cancel:"))
+async def yd_task_cancel_callback(callback: types.CallbackQuery):
+    """
+    Отмена текущей Yandex-задачи (не всей сессии).
+
+    Семантика (вариант «третье»):
+      - Помечаем задачу как `cancelled=True`.
+      - Отвечаем пользователю сразу.
+      - Текущая операция (upload/download) доводится до конца.
+      - Следующая проверка `_is_cancelled()` → cleanup.
+
+    Если задача ещё на стадии промпта — cleanup сработает немедленно.
+    """
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    task_id = parts[1]
+
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await callback.answer("❌ Задача уже неактивна.", show_alert=True)
+        return
+
+    pending = session["pending"]
+    if not isinstance(pending, dict):
+        await callback.answer("❌ Задача уже неактивна.", show_alert=True)
+        return
+
+    owner_user_id = pending.get("owner_user_id")
+
+    if callback.from_user.id != owner_user_id:
+        await callback.answer(
+            "❌ Только автор задачи может её отменить.",
+            show_alert=True,
+        )
+        return
+
+    logging.info(
+        f"[YD-TASK-CANCEL] Пользователь {callback.from_user.id} "
+        f"отменил задачу {task_id}"
+    )
+
+    # ✅ Помечаем задачу как отменённую
+    session["cancelled"] = True
+
+    # Отвечаем пользователю
+    try:
+        await callback.answer("❌ Задача отменена")
+    except Exception:
+        pass
+
+    # ✅ Если задача ещё на стадии промпта — можно сразу очистить.
+    # Если на стадии upload — текущий upload дойдёт до конца,
+    # следующая проверка _is_cancelled() прервёт цикл и вызовет cleanup.
+    prompt_active = pending.get("prompt_nonce") is not None
+
+    if prompt_active:
+        # Промпт ещё активен — прерываем сразу
+        try:
+            await callback.message.edit_text(
+                "❌ <b>Задача отменена</b>\n\n"
+                "Временные файлы удалены.\n"
+                "Запустите <code>/sunday</code> заново, если нужно.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        # Отменяем watchdog
+        timeout_task = pending.get("prompt_timeout_task")
+        if timeout_task is not None and not timeout_task.done():
+            timeout_task.cancel()
+        pending["prompt_timeout_task"] = None
+        pending["prompt_watchdog_nonce"] = None
+
+        # Запускаем cleanup
+        await _yd_cleanup_task(
+            task_id=task_id,
+            session_key=pending.get("session_key"),
+            task_dir=pending.get("task_dir"),
+            owner_user_id=owner_user_id,
+            chat_id=pending.get("chat_id"),
+            nonce=pending.get("nonce"),
+        )
+    else:
+        # Задача в процессе (upload/download) — просто уведомляем.
+        # Следующая проверка _is_cancelled() завершит работу.
+        try:
+            await callback.message.edit_text(
+                "⏳ <b>Отмена запрошена…</b>\n\n"
+                "Текущий шаг завершится, затем задача будет очищена.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+# ==========================================
+# yd_sermon_ok / skip / edit
+# ==========================================
+
 @router.callback_query(F.data.startswith("yd_sermon_ok:"))
 async def yd_sermon_ok(callback: types.CallbackQuery, bot: Bot):
     parts = callback.data.split(":")
@@ -1751,17 +1893,73 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     total_slides = len(current["pngs_sorted"])
     file_name_esc = html_module.escape(current["file_name"])
 
+    # ✅ Собираем контекст о найденных слайдах
+    matches = current.get("matches", []) or []
+    start = current.get("start")
+    end = current.get("end")
+    ranges = current.get("ranges")
+    notes_ok = current.get("notes_ok", True)
+    incomplete = current.get("incomplete", False)
+
+    context_lines = []
+
+    if matches:
+        preview = ", ".join(str(n) for n in matches[:20])
+        if len(matches) > 20:
+            preview += f" …и ещё {len(matches) - 20}"
+        context_lines.append(
+            f"📌 <b>Найдены пометки на слайдах:</b> <code>{preview}</code>"
+        )
+        if start is not None and end is not None:
+            ranges_text = _format_ranges_text(ranges, start, end)
+            context_lines.append(
+                f"📊 <b>Предложенный диапазон:</b> <code>{ranges_text}</code>"
+            )
+    elif not notes_ok:
+        context_lines.append(
+            "⚠️ <i>Заметки докладчика не удалось прочитать.</i>"
+        )
+    elif incomplete:
+        context_lines.append(
+            "⚠️ <i>Заметки прочитаны частично.</i>"
+        )
+    else:
+        context_lines.append(
+            "📌 <i>Автоматических пометок «проповедь» не найдено.</i>"
+        )
+
+    context_block = "\n".join(context_lines)
+    if context_block:
+        context_block = "\n\n" + context_block
+
+    # ✅ Кнопки: «Отменить задачу» и «Пропустить»
+    cancel_kb = InlineKeyboardBuilder()
+    cancel_kb.row(
+        InlineKeyboardButton(
+            text="⏭ Пропустить (файл в общую папку)",
+            callback_data=f"yd_sermon_skip:{task_id}:{idx}:{manual_nonce}",
+        ),
+    )
+    cancel_kb.row(
+        InlineKeyboardButton(
+            text="❌ Отменить задачу",
+            callback_data=f"yd_task_cancel:{task_id}",
+        ),
+    )
+
     sent_msg = None
     try:
         await callback.answer()
         sent_msg = await callback.message.edit_text(
             f"✏️ <b>Введите диапазон проповеди</b>\n\n"
             f"📄 Файл: <code>{file_name_esc}</code>\n"
-            f"📊 Всего слайдов: {total_slides}\n\n"
-            f"Пример: <code>5-30</code> или <code>5,7,10-15</code>\n"
+            f"📊 Всего слайдов: <b>{total_slides}</b>"
+            f"{context_block}\n\n"
+            f"<b>Формат:</b> <code>5-30</code> или <code>5,7,10-15</code>\n"
             f"Отправьте текстом в чат (ответом на это сообщение).\n"
             f"<i>Отправьте <code>отмена</code> или <code>0</code>, чтобы пропустить.</i>",
             parse_mode="HTML",
+            reply_markup=cancel_kb.as_markup(),
         )
     except Exception as e:
         logging.error(
@@ -1808,7 +2006,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     if old_timeout is not None and not old_timeout.done():
         old_timeout.cancel()
 
-    # ✅ Используем таймаут из конфига (settings.ini)
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(
             task_id, yandex_state.config.prompt_timeout_sec, manual_nonce
