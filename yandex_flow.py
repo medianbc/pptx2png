@@ -150,6 +150,29 @@ def _count_slides_for_range(start, end, total):
         return 0
     return max(0, min(end, total) - max(start, 1) + 1)
 
+def _count_slides_in_ranges(ranges, total_slides: int) -> int:
+    """
+    Считает количество УНИКАЛЬНЫХ слайдов, попадающих в объединение диапазонов.
+
+    ranges: список кортежей (start, end) или None
+    total_slides: общее количество слайдов (для клиппинга)
+
+    Пример:
+        ranges=[(1,1),(10,10)], total=20 → 2
+        ranges=[(1,5),(3,8)],   total=20 → 8  (не 11 — пересечение не двоится)
+    """
+    if not ranges or total_slides <= 0:
+        return 0
+
+    unique_slides = set()
+    for s, e in ranges:
+        lo = max(1, s)
+        hi = min(total_slides, e)
+        if lo > hi:
+            continue
+        unique_slides.update(range(lo, hi + 1))
+    return len(unique_slides)
+    
 
 # ==========================================
 # ПАЙПЛАЙН ПОДГОТОВКИ (без конвертации)
