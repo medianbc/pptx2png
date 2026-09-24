@@ -143,6 +143,82 @@ def _get_cancel_keyboard(task_id: str) -> InlineKeyboardBuilder:
     )
     return kb
 
+# ==========================================
+# СПИННЕР ПРОГРЕССА
+# ==========================================
+
+_MODE_LABELS = {
+    "sermon": "🎯 Только проповедь",
+    "other":  "📄 Только остальные",
+    "both":   "📦 Проповедь + остальные",
+}
+
+
+def _mode_label(mode: str) -> str:
+    """Человекочитаемая метка выбранного режима конвертации."""
+    return _MODE_LABELS.get(mode, f"❓ {mode}")
+
+
+async def _yd_progress_spinner(
+    status_msg,
+    task_id: str,
+    base_text: str,
+    stop_event: asyncio.Event,
+    interval: float = 1.2,
+) -> None:
+    """
+    Пока идёт долгая операция — циклически дописывает '.', '..', '...'
+    в конец статусного сообщения. Останавливается по stop_event.
+
+    Пример последовательности:
+        base_text
+        base_text .
+        base_text ..
+        base_text ...
+        base_text .
+        ...
+    """
+    dots = [".", "..", "..."]
+    idx = 0
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return  # stop_event установлен — выходим
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            await status_msg.edit_text(
+                f"{base_text} {dots[idx]}",
+                parse_mode="HTML",
+                reply_markup=_get_cancel_keyboard(task_id).as_markup(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Telegram часто отдаёт "message is not modified" — это не ошибка
+            logging.debug(f"[YD-SPINNER] edit_text: {e}")
+
+        idx = (idx + 1) % len(dots)
+
+
+async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
+    """
+    Запускает корутину `coro`, параллельно анимируя статусное сообщение.
+    Гарантированно останавливает спиннер и возвращает результат coro.
+    """
+    stop_event = asyncio.Event()
+    spinner_task = asyncio.create_task(
+        _yd_progress_spinner(status_msg, task_id, base_text, stop_event)
+    )
+    try:
+        return await coro
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(spinner_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            spinner_task.cancel()
 
 def _count_slides_for_range(start, end, total):
     """Возвращает количество слайдов в диапазоне [start, end]."""
@@ -256,16 +332,22 @@ async def _yd_prepare_files(
             )
 
             # Скачивание с кнопкой отмены
+            base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
                 status_msg,
-                f"📥 Скачиваю <code>{file_name_esc}</code>...",
+                base_dl_text,
                 parse_mode="HTML",
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
             local_pptx = task_dir / file_name
-            ok = await yandex_state.config.client.download_file(
-                pptx_item["path"], local_pptx
+            ok = await _yd_with_spinner(
+                status_msg,
+                task_id,
+                base_dl_text,
+                yandex_state.config.client.download_file(
+                    pptx_item["path"], local_pptx
+                ),
             )
             if not ok:
                 logging.error(f"[YD-PREP] {file_name}: скачивание провалилось")
@@ -1030,9 +1112,25 @@ async def _yd_convert_and_upload(
             )
 
             # === Конвертация PNG ===
+            mode_label = _mode_label(convert_mode)
+            ranges_str = _format_ranges_text(ranges, start, end)
+
+            # «Шапка» — что именно делает бот
+            header_lines = [
+                f"🎬 <b>{mode_label}</b>",
+                f"📄 Файл: <code>{file_name_esc}</code>",
+            ]
+            if ranges or (start is not None and end is not None):
+                header_lines.append(f"📊 Диапазон: <code>{ranges_str}</code>")
+            header_lines.append("")  # разделитель
+            header = "\n".join(header_lines)
+
+            base_convert_text = f"{header}\n⚙️ Конвертирую в PNG"
+
+            # Первичная отрисовка — сразу видно, что выбрал пользователь
             await _safe_edit(
                 status_msg,
-                f"⚙️ Конвертирую <code>{file_name_esc}</code> в PNG...",
+                base_convert_text,
                 parse_mode="HTML",
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
@@ -1041,8 +1139,11 @@ async def _yd_convert_and_upload(
             temp_png_dir.mkdir(exist_ok=True)
 
             try:
-                pngs, used_pptx = await convert_all_pngs(
-                    Path(file_path), temp_png_dir, quality
+                pngs, used_pptx = await _yd_with_spinner(
+                    status_msg,
+                    task_id,
+                    base_convert_text,
+                    convert_all_pngs(Path(file_path), temp_png_dir, quality),
                 )
             except Exception as e:
                 logging.error(
@@ -1141,10 +1242,15 @@ async def _yd_convert_and_upload(
                 sermon_zip_size = sermon_zip_path.stat().st_size
                 remote_path = f"{sermon_dir}/{sermon_zip_name}"
 
+                base_upload_text = (
+                    f"{header}\n"
+                    f"📤 Загружаю архив проповеди "
+                    f"(<code>{file_name_esc}</code>)"
+                )
+
                 await _safe_edit(
                     status_msg,
-                    f"📤 Загружаю архив проповеди "
-                    f"(<code>{file_name_esc}</code>)...",
+                    base_upload_text,
                     parse_mode="HTML",
                     reply_markup=_get_cancel_keyboard(task_id).as_markup(),
                 )
@@ -1153,8 +1259,13 @@ async def _yd_convert_and_upload(
                     _safe_unlink(sermon_zip_path)
                     return
 
-                ok = await yandex_state.config.client.upload_file(
-                    sermon_zip_path, remote_path
+                ok = await _yd_with_spinner(
+                    status_msg,
+                    task_id,
+                    base_upload_text,
+                    yandex_state.config.client.upload_file(
+                        sermon_zip_path, remote_path
+                    ),
                 )
 
                 if ok:
@@ -1218,10 +1329,15 @@ async def _yd_convert_and_upload(
                 other_zip_size = other_zip_path.stat().st_size
                 remote_path = f"{pptx2png_dir}/{other_zip_name}"
 
+                base_upload_text = (
+                    f"{header}\n"
+                    f"📤 Загружаю архив слайдов "
+                    f"(<code>{file_name_esc}</code>)"
+                )
+
                 await _safe_edit(
                     status_msg,
-                    f"📤 Загружаю архив слайдов "
-                    f"(<code>{file_name_esc}</code>)...",
+                    base_upload_text,
                     parse_mode="HTML",
                     reply_markup=_get_cancel_keyboard(task_id).as_markup(),
                 )
@@ -1230,8 +1346,13 @@ async def _yd_convert_and_upload(
                     _safe_unlink(other_zip_path)
                     return
 
-                ok = await yandex_state.config.client.upload_file(
-                    other_zip_path, remote_path
+                ok = await _yd_with_spinner(
+                    status_msg,
+                    task_id,
+                    base_upload_text,
+                    yandex_state.config.client.upload_file(
+                        other_zip_path, remote_path
+                    ),
                 )
 
                 other_folder_short = (
