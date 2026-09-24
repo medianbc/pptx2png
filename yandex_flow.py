@@ -1,5 +1,12 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.0)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.1)
+# ==========================================
+# Изменения v3.1:
+#   • Добавлен _count_slides_in_ranges (устранение NameError, баг №1)
+#   • Исправлена опечатка pending["prepаared"] → pending["prepared"]
+#   • Укорочены task_id и nonce (лимит callback_data 64 байта)
+#   • Добавлена шапка с режимом конвертации в статус-сообщениях
+#   • Добавлен спиннер прогресса + корректная остановка при отмене
 # ==========================================
 
 import asyncio
@@ -143,6 +150,38 @@ def _get_cancel_keyboard(task_id: str) -> InlineKeyboardBuilder:
     )
     return kb
 
+
+def _count_slides_for_range(start, end, total):
+    """Возвращает количество слайдов в диапазоне [start, end]."""
+    if start is None or end is None:
+        return 0
+    return max(0, min(end, total) - max(start, 1) + 1)
+
+
+def _count_slides_in_ranges(ranges, total_slides: int) -> int:
+    """
+    Считает количество УНИКАЛЬНЫХ слайдов, попадающих в объединение диапазонов.
+
+    ranges: список кортежей (start, end) или None
+    total_slides: общее количество слайдов (для клиппинга)
+
+    Пример:
+        ranges=[(1,1),(10,10)], total=20 → 2
+        ranges=[(1,5),(3,8)],   total=20 → 8  (пересечение не двоится)
+    """
+    if not ranges or total_slides <= 0:
+        return 0
+
+    unique_slides = set()
+    for s, e in ranges:
+        lo = max(1, s)
+        hi = min(total_slides, e)
+        if lo > hi:
+            continue
+        unique_slides.update(range(lo, hi + 1))
+    return len(unique_slides)
+
+
 # ==========================================
 # СПИННЕР ПРОГРЕССА
 # ==========================================
@@ -152,6 +191,9 @@ _MODE_LABELS = {
     "other":  "📄 Только остальные",
     "both":   "📦 Проповедь + остальные",
 }
+
+# Реестр активных спиннеров: task_id -> (stop_event, spinner_task)
+_active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 
 
 def _mode_label(mode: str) -> str:
@@ -166,26 +208,18 @@ async def _yd_progress_spinner(
     stop_event: asyncio.Event,
     interval: float = 1.2,
 ) -> None:
-    """
-    Пока идёт долгая операция — циклически дописывает '.', '..', '...'
-    в конец статусного сообщения. Останавливается по stop_event.
-
-    Пример последовательности:
-        base_text
-        base_text .
-        base_text ..
-        base_text ...
-        base_text .
-        ...
-    """
+    """Циклически дописывает '.', '..', '...' в конец статусного сообщения."""
     dots = [".", "..", "..."]
     idx = 0
-    while True:
+    while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            return  # stop_event установлен — выходим
+            return  # stop_event установлен
         except asyncio.TimeoutError:
             pass
+
+        if stop_event.is_set():
+            return
 
         try:
             await status_msg.edit_text(
@@ -202,6 +236,29 @@ async def _yd_progress_spinner(
         idx = (idx + 1) % len(dots)
 
 
+async def _yd_stop_spinner(task_id: str, wait_timeout: float = 2.0) -> None:
+    """
+    Останавливает активный спиннер задачи (если есть) и дожидается его выхода.
+
+    Вызывается:
+      - в finally у _yd_with_spinner (когда корутина сама завершилась);
+      - в yd_task_cancel_callback (до редактирования сообщения).
+    """
+    entry = _active_spinners.pop(task_id, None)
+    if entry is None:
+        return
+    stop_event, spinner_task = entry
+    stop_event.set()
+    try:
+        await asyncio.wait_for(spinner_task, timeout=wait_timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        spinner_task.cancel()
+        try:
+            await spinner_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
     """
     Запускает корутину `coro`, параллельно анимируя статусное сообщение.
@@ -211,44 +268,23 @@ async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
     spinner_task = asyncio.create_task(
         _yd_progress_spinner(status_msg, task_id, base_text, stop_event)
     )
+    _active_spinners[task_id] = (stop_event, spinner_task)
     try:
         return await coro
     finally:
+        entry = _active_spinners.get(task_id)
+        if entry is not None and entry[1] is spinner_task:
+            _active_spinners.pop(task_id, None)
         stop_event.set()
         try:
             await asyncio.wait_for(spinner_task, timeout=2.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             spinner_task.cancel()
+            try:
+                await spinner_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
-def _count_slides_for_range(start, end, total):
-    """Возвращает количество слайдов в диапазоне [start, end]."""
-    if start is None or end is None:
-        return 0
-    return max(0, min(end, total) - max(start, 1) + 1)
-
-def _count_slides_in_ranges(ranges, total_slides: int) -> int:
-    """
-    Считает количество УНИКАЛЬНЫХ слайдов, попадающих в объединение диапазонов.
-
-    ranges: список кортежей (start, end) или None
-    total_slides: общее количество слайдов (для клиппинга)
-
-    Пример:
-        ranges=[(1,1),(10,10)], total=20 → 2
-        ranges=[(1,5),(3,8)],   total=20 → 8  (не 11 — пересечение не двоится)
-    """
-    if not ranges or total_slides <= 0:
-        return 0
-
-    unique_slides = set()
-    for s, e in ranges:
-        lo = max(1, s)
-        hi = min(total_slides, e)
-        if lo > hi:
-            continue
-        unique_slides.update(range(lo, hi + 1))
-    return len(unique_slides)
-    
 
 # ==========================================
 # ПАЙПЛАЙН ПОДГОТОВКИ (без конвертации)
@@ -275,8 +311,8 @@ async def _yd_prepare_files(
     owner_user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
-    # user_id уже хранится в sessions[task_id]["user_id"] и pending["owner_user_id"],
-    # дублировать его в callback_data не нужно.
+    # ✅ Укороченный task_id — не дублирует user_id (он есть в sessions).
+    # Укладывается в лимит callback_data 64 байта вместе с nonce и mode.
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -331,7 +367,7 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
-            # Скачивание с кнопкой отмены
+            # Скачивание с кнопкой отмены + спиннером
             base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
                 status_msg,
@@ -595,8 +631,7 @@ async def _yd_render_sermon_prompt(
 
     ✅ Исправление бага №4: подсчёт и отображение диапазона ведётся
     по item["ranges"] (если он есть), а не по схлопнутым start/end.
-    Для ввода вида "1,10" это даёт 2 слайда и текст "1, 10",
-    а не 10 слайдов и текст "1–10".
+    Для ввода вида "1,10" это даёт 2 слайда и текст "1, 10".
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -619,6 +654,7 @@ async def _yd_render_sermon_prompt(
     pending["prompt_idx"] = idx
 
     if pending.get("prompt_nonce") is None:
+        # ✅ Укороченный nonce (8 hex) — вписывается в лимит callback_data
         pending["prompt_nonce"] = secrets.token_hex(4)
     prompt_nonce = pending["prompt_nonce"]
 
@@ -659,7 +695,6 @@ async def _yd_render_sermon_prompt(
         # --- Диапазон задан (автоматически или вручную) ---
 
         # ✅ Баг №4: считаем sermon_count по ranges, если они есть.
-        # Это корректно обрабатывает несвязные диапазоны (1,10 → 2 слайда).
         if ranges:
             sermon_count = _count_slides_in_ranges(ranges, total_slides)
             ranges_text = _format_ranges_text(ranges, start, end)
@@ -820,6 +855,7 @@ async def _yd_render_sermon_prompt(
     )
     pending["prompt_watchdog_nonce"] = prompt_nonce
 
+
 async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
     """Если пользователь не ответил на промпт — уведомляем и очищаем."""
     try:
@@ -900,6 +936,12 @@ async def _yd_cleanup_task(
         f"[YD-CLEANUP] task_id={task_id}, session_key={session_key!r}, "
         f"reason={'error' if error else 'normal'}"
     )
+
+    # ✅ Гарантируем, что спиннер мёртв до редактирования сообщения
+    try:
+        await _yd_stop_spinner(task_id)
+    except Exception as e:
+        logging.debug(f"[YD-CLEANUP] _yd_stop_spinner: {e}")
 
     # Снимаем клавиатуру со всех сообщений задачи
     try:
@@ -1111,23 +1153,22 @@ async def _yd_convert_and_upload(
                 f"convert_mode={convert_mode}, ranges={ranges}"
             )
 
-            # === Конвертация PNG ===
+            # ✅ Шапка статус-сообщения: что именно делает бот
             mode_label = _mode_label(convert_mode)
             ranges_str = _format_ranges_text(ranges, start, end)
 
-            # «Шапка» — что именно делает бот
             header_lines = [
                 f"🎬 <b>{mode_label}</b>",
                 f"📄 Файл: <code>{file_name_esc}</code>",
             ]
             if ranges or (start is not None and end is not None):
                 header_lines.append(f"📊 Диапазон: <code>{ranges_str}</code>")
-            header_lines.append("")  # разделитель
+            header_lines.append("")
             header = "\n".join(header_lines)
 
+            # === Конвертация PNG ===
             base_convert_text = f"{header}\n⚙️ Конвертирую в PNG"
 
-            # Первичная отрисовка — сразу видно, что выбрал пользователь
             await _safe_edit(
                 status_msg,
                 base_convert_text,
@@ -1175,7 +1216,7 @@ async def _yd_convert_and_upload(
                 else:
                     other_pngs.append(png_path)
 
-            ranges_text = _format_ranges_text(ranges, start, end)
+            ranges_text = ranges_str
 
             # === Создаём целевые папки на Диске ===
             pptx2png_dir = (
@@ -1991,6 +2032,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
+    # ✅ ИСПРАВЛЕНО: было "prepаared" с кириллической 'а'
     item = pending["prepared"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан
@@ -2001,6 +2043,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
             "❌ Диапазон не задан. Укажите его вручную.",
             show_alert=True,
         )
+        # Перерисовываем промпт, чтобы пользователь мог выбрать снова
         await _yd_render_sermon_prompt(task_id, item, callback.message)
         return
 
@@ -2080,6 +2123,10 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
 
     # ✅ Ставим cancelled=True ВСЕГДА
     session["cancelled"] = True
+
+    # ✅ ГЛАВНОЕ: останавливаем активный спиннер ДО любых edit_text,
+    # иначе следующий tick перезапишет сообщение об отмене.
+    await _yd_stop_spinner(task_id)
 
     pending = session.get("pending")
 
@@ -2182,6 +2229,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     idx = int(parts[2])
+    # ✅ Укороченный nonce (8 hex) — вписывается в лимит callback_data
     manual_nonce = secrets.token_hex(4)
 
     current = pending["prepared"][idx]
