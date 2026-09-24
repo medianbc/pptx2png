@@ -199,7 +199,9 @@ async def _yd_prepare_files(
     owner_user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
-    task_id = f"yd_task_{owner_user_id}_{secrets.token_hex(4)}"
+    # user_id уже хранится в sessions[task_id]["user_id"] и pending["owner_user_id"],
+    # дублировать его в callback_data не нужно.
+    task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -535,7 +537,7 @@ async def _yd_render_sermon_prompt(
     pending["prompt_idx"] = idx
 
     if pending.get("prompt_nonce") is None:
-        pending["prompt_nonce"] = secrets.token_hex(8)
+        pending["prompt_nonce"] = secrets.token_hex(4)
     prompt_nonce = pending["prompt_nonce"]
 
     matches = item.get("matches", []) or []
@@ -2059,7 +2061,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     idx = int(parts[2])
-    manual_nonce = secrets.token_hex(8)
+    manual_nonce = secrets.token_hex(4)
 
     current = pending["prepared"][idx]
     file_name_esc = html_module.escape(current["file_name"])
