@@ -341,6 +341,22 @@ async def _yd_prepare_files(
             _safe_delete_task_dir(task_dir)
             await _safe_edit(status_msg, "❌ Сессия была отменена.")
             return
+        # ✅ Сверяем nonce: если параллельный /sunday успел заменить сессию
+        # пока мы шли до этой строки, наш task_id принадлежит старой сессии,
+        # которой уже нет. Не регистрируем задачу в чужой сессии.
+        if picker.get("nonce") != nonce:
+            logging.warning(
+                f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
+                f"expected nonce={nonce!r} для session_key={session_key!r} — "
+                f"сессия заменена параллельной командой, прерываем"
+            )
+            _safe_delete_task_dir(task_dir)
+            await _safe_edit(
+                status_msg,
+                "❌ Сессия была заменена другой командой.\n"
+                "Запустите /sunday заново."
+            )
+            return
         picker.setdefault("task_ids", []).append(task_id)
         sessions[task_id] = {
             "user_id": owner_user_id,
@@ -1752,18 +1768,24 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
     )
 
     # ✅ Не позволяем плодить параллельные задачи: если есть активные — отказ.
+    # Активной считаем сессию, у которой:
+    #   • processing=True (yd_pick выбрал файл, но _yd_prepare_files ещё
+    #     не успел зарегистрировать task_id в task_ids), ИЛИ
+    #   • есть живые task_ids (задача уже зарегистрирована).
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     async with yd_session_lock:
         existing_picker = sessions.get(session_key)
         if existing_picker is not None:
-            active_task_ids = [
-                tid for tid in existing_picker.get("task_ids", [])
-                if tid in sessions and not sessions[tid].get("cancelled")
-            ]
+            picker_processing = bool(existing_picker.get("processing"))
+            picker_has_live_task = any(
+                tid in sessions and not sessions[tid].get("cancelled")
+                for tid in existing_picker.get("task_ids", [])
+            )
+            is_active = picker_processing or picker_has_live_task
         else:
-            active_task_ids = []
+            is_active = False
 
-    if active_task_ids:
+    if is_active:
         await message.reply(
             "⚠️ <b>У вас уже есть активная задача.</b>\n\n"
             "Дождитесь её завершения или отмените командой /cancel_yd, "
@@ -1900,25 +1922,51 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
+        race_detected = False
         async with yd_session_lock:
-            # ✅ Старая сессия гарантированно не содержит активных задач —
-            # проверку сделали выше. Удаляем её как "протухшую" без отмены.
             old_picker = sessions.get(session_key)
-            if old_picker is not None and not old_picker.get("task_ids"):
-                sessions.pop(session_key, None)
+            if old_picker is not None:
+                old_processing = bool(old_picker.get("processing"))
+                old_has_tasks = bool(old_picker.get("task_ids"))
+                if old_processing or old_has_tasks:
+                    # Защитный путь: сюда не должны попасть из-за проверки
+                    # в начале cmd_sunday. Если попали — это гонка,
+                    # отказываемся перезаписывать активную сессию.
+                    logging.warning(
+                        f"[YD] Race: active picker {session_key!r} "
+                        f"processing={old_processing}, "
+                        f"task_ids={old_picker.get('task_ids')!r}"
+                    )
+                    race_detected = True
+                else:
+                    sessions.pop(session_key, None)
 
-            sessions[session_key] = {
-                "user_id": message.from_user.id,
-                "chat_id": message.chat.id,
-                "sunday": sunday,
-                "sunday_str": sunday_str,
-                "paths": paths,
-                "files": pptx_files,
-                "nonce": nonce,
-                "created_at": time.time(),
-                "task_ids": [],
-                "cancelled": False,
-            }
+            if not race_detected:
+                sessions[session_key] = {
+                    "user_id": message.from_user.id,
+                    "chat_id": message.chat.id,
+                    "sunday": sunday,
+                    "sunday_str": sunday_str,
+                    "paths": paths,
+                    "files": pptx_files,
+                    "nonce": nonce,
+                    "created_at": time.time(),
+                    "task_ids": [],
+                    "cancelled": False,
+                }
+
+        if race_detected:
+            try:
+                await status_msg.edit_text(
+                    "⚠️ <b>Другая команда /sunday уже активна.</b>\n\n"
+                    "Дождитесь её завершения или отмените /cancel_yd.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await message.reply(
+                    "⚠️ Другая команда /sunday уже активна."
+                )
+            return
 
         kb = InlineKeyboardBuilder()
         for idx, f in enumerate(pptx_files):
