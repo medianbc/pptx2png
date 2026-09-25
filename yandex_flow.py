@@ -2406,6 +2406,29 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
 
+    # ✅ Освобождаем низкоуровневый session-lock (yd_active_sessions).
+    # Иначе следующий /sunday упрётся в
+    # «⏳ У вас уже активна сессия подготовки трансляции», пока
+    # фоновый cleanup не дойдёт до yd_release (десятки секунд на
+    # convert_all_pngs). yd_release внутри сверяет nonce — если
+    # сессию успели заменить, чужой nonce он не тронет.
+    owner_chat_id = session.get("chat_id")
+    owner_nonce = session.get("nonce")
+    if owner_chat_id is not None and owner_nonce:
+        try:
+            released = await yd_release(
+                owner_user_id, owner_chat_id, owner_nonce
+            )
+            logging.info(
+                f"[YD-TASK-CANCEL] yd_release для {task_id}: "
+                f"released={released}"
+            )
+        except Exception as e:
+            logging.error(
+                f"[YD-TASK-CANCEL] yd_release упал для {task_id}: {e}",
+                exc_info=True,
+            )
+
     # ✅ ГЛАВНОЕ: останавливаем активный спиннер ДО любых edit_text,
     # иначе следующий tick перезапишет сообщение об отмене.
     await _yd_stop_spinner(task_id)
