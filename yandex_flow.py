@@ -238,6 +238,57 @@ _MODE_LABELS = {
 # Реестр активных спиннеров: task_id -> (stop_event, spinner_task)
 _active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 
+# Реестр in-flight операций задачи (thread/async ops, которые НЕ
+# должны обрываться на полпути). task_id -> set[asyncio.Task]
+_active_ops: dict[str, set[asyncio.Task]] = {}
+
+
+async def _yd_run_protected(task_id: str, coro):
+    """
+    Запускает корутину как отдельный Task, регистрирует в _active_ops[task_id]
+    и защищает от внешней отмены через asyncio.shield.
+
+    Зачем: при worker.cancel() обёртка умирает, но underlying-операция
+    (особенно executor-поток внутри asyncio.to_thread) продолжает жить.
+    Cleanup должен дождаться её завершения ПЕРЕД удалением task_dir.
+    """
+    async def _runner():
+        try:
+            return await coro
+        finally:
+            bucket = _active_ops.get(task_id)
+            if bucket is not None:
+                bucket.discard(asyncio.current_task())
+                if not bucket:
+                    _active_ops.pop(task_id, None)
+
+    op_task = asyncio.create_task(_runner())
+    _active_ops.setdefault(task_id, set()).add(op_task)
+    # shield: внешняя отмена не убьёт op_task — cleanup дождётся его.
+    return await asyncio.shield(op_task)
+
+
+async def _yd_to_thread(task_id: str, fn, *args, **kwargs):
+    """asyncio.to_thread + регистрация в _active_ops."""
+    return await _yd_run_protected(
+        task_id, asyncio.to_thread(fn, *args, **kwargs)
+    )
+
+
+async def _yd_deferred_task_dir_cleanup(task_dir: Path, ops: list) -> None:
+    """
+    Фоновое удаление task_dir: ждём завершения in-flight ops, потом rmtree.
+    """
+    try:
+        await asyncio.gather(*ops, return_exceptions=True)
+    except Exception as e:
+        logging.debug(f"[YD-DEFERRED] gather: {e}")
+    try:
+        if task_dir and task_dir.exists():
+            shutil.rmtree(task_dir)
+            logging.info(f"🧹 [YD-DEFERRED] Удалена папка {task_dir} после ops")
+    except Exception as e:
+        logging.error(f"[YD-DEFERRED] ошибка удаления {task_dir}: {e}")
 
 def _mode_label(mode: str) -> str:
     """Человекочитаемая метка выбранного режима конвертации."""
@@ -531,8 +582,9 @@ async def _yd_prepare_files(
                         status_msg,
                         task_id,
                         base_norm_text,
-                        asyncio.to_thread(
-                            ppt_to_pptx_crossplatform, local_pptx, per_file_dir
+                        _yd_to_thread(
+                            task_id,
+                            ppt_to_pptx_crossplatform, local_pptx, per_file_dir,
                         ),
                     )
                 except Exception as e:
@@ -587,8 +639,9 @@ async def _yd_prepare_files(
                 )
 
             if not total_slides:
-                renorm_result = await asyncio.to_thread(
-                    librenormalize_to_pptx, normalized_pptx, per_file_dir
+                renorm_result = await _yd_to_thread(
+                    task_id,
+                    librenormalize_to_pptx, normalized_pptx, per_file_dir,
                 )
                 if renorm_result is None:
                     logging.error(
@@ -626,8 +679,8 @@ async def _yd_prepare_files(
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
-            notes_ok, notes, incomplete = await asyncio.to_thread(
-                extract_speaker_notes, str(normalized_pptx)
+            notes_ok, notes, incomplete = await _yd_to_thread(
+                task_id, extract_speaker_notes, str(normalized_pptx)
             )
 
             # Определяем проповедь по ключевым словам из конфига
@@ -1173,12 +1226,23 @@ async def _yd_cleanup_task(
         logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
     # Папка задачи
-    try:
-        if task_dir and task_dir.exists():
-            shutil.rmtree(task_dir)
-            logging.info(f"🧹 Удалена папка задачи: {task_dir}")
-    except Exception as e:
-        logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
+    in_flight_ops = _active_ops.get(task_id)
+    if in_flight_ops:
+        ops_snapshot = list(in_flight_ops)
+        logging.info(
+            f"[YD-CLEANUP] {len(ops_snapshot)} in-flight ops для {task_id} — "
+            f"откладываем удаление task_dir"
+        )
+        asyncio.create_task(
+            _yd_deferred_task_dir_cleanup(task_dir, ops_snapshot)
+        )
+    else:
+        try:
+            if task_dir and task_dir.exists():
+                shutil.rmtree(task_dir)
+                logging.info(f"🧹 Удалена папка задачи: {task_dir}")
+        except Exception as e:
+            logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
 
     # Watchdog
     try:
@@ -1403,7 +1467,12 @@ async def _yd_convert_and_upload(
                     status_msg,
                     task_id,
                     base_convert_text,
-                    convert_all_pngs(Path(file_path), temp_png_dir, quality),
+                    _yd_run_protected(
+                        task_id,
+                        convert_all_pngs(
+                            Path(file_path), temp_png_dir, quality
+                        ),
+                    ),
                 )
             except Exception as e:
                 logging.error(
@@ -1479,8 +1548,9 @@ async def _yd_convert_and_upload(
                 sermon_zip_path = zip_tmp_dir / sermon_zip_name
 
                 try:
-                    await asyncio.to_thread(
-                        create_zip_stream, sermon_pngs, sermon_zip_path
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, sermon_pngs, sermon_zip_path,
                     )
                 except Exception as e:
                     logging.error(
@@ -1563,8 +1633,9 @@ async def _yd_convert_and_upload(
                 other_zip_path = zip_tmp_dir / other_zip_name
 
                 try:
-                    await asyncio.to_thread(
-                        create_zip_stream, other_pngs, other_zip_path
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, other_pngs, other_zip_path,
                     )
                 except Exception as e:
                     logging.error(
