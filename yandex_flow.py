@@ -1210,15 +1210,27 @@ async def _yd_cleanup_task(
     try:
         async with yd_session_lock:
             picker = sessions.get(session_key)
-            if picker is not None:
+            # ✅ Мутируем picker ТОЛЬКО если он относится к нашей задаче
+            # (nonce совпадает). Иначе это picker новой сессии, и его
+            # processing=True отражает реально идущий захват — сброс
+            # флага откроет гонку дубликатов.
+            if picker is not None and picker.get("nonce") == nonce:
                 picker["processing"] = False
                 task_ids = picker.get("task_ids")
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
-
-            current = sessions.get(session_key)
-            if current is not None and current.get("nonce") == nonce:
                 sessions.pop(session_key, None)
+            elif picker is not None:
+                # Picker чужой. Но если наш task_id как-то в него попал —
+                # убираем, чтобы не оставлять мусор. processing не трогаем.
+                task_ids = picker.get("task_ids")
+                if isinstance(task_ids, list) and task_id in task_ids:
+                    task_ids.remove(task_id)
+                    logging.warning(
+                        f"[YD-CLEANUP] task_id={task_id} оказался в чужом "
+                        f"picker'е (nonce={picker.get('nonce')!r}, "
+                        f"ожидался {nonce!r}) — удаляем"
+                    )
 
             sessions.pop(task_id, None)
             yd_active_tasks.discard(task_id)
