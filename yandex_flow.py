@@ -46,7 +46,11 @@ from yandex_disk import (
 from structure import safe_folder_name
 from sermon_detector import find_sermon_range
 from utils import extract_speaker_notes
-from converter_engine import convert_all_pngs, create_zip_stream
+from converter_engine import (
+    convert_all_pngs,
+    create_zip_stream,
+    ppt_to_pptx_crossplatform,
+)
 
 
 router = Router()
@@ -412,7 +416,80 @@ async def _yd_prepare_files(
                 )
                 return
 
-            # ✅ Извлекаем заметки ИЗ PPTX (без конвертации — быстро)
+            # ✅ Нормализация .ppt → .pptx (старые форматы).
+            # Делаем ОДИН РАЗ здесь — дальше работаем только с .pptx:
+            #   • заметки читаются python-pptx (не понимает .ppt);
+            #   • total_slides считается через Presentation();
+            #   • конвертация PNG тоже пойдёт по .pptx.
+            if local_pptx.suffix.lower() == ".ppt":
+                base_norm_text = f"🔧 Готовлю .ppt → .pptx: <code>{file_name_esc}</code>"
+                await _safe_edit(
+                    status_msg,
+                    base_norm_text,
+                    parse_mode="HTML",
+                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
+                )
+                try:
+                    normalized_pptx = await _yd_with_spinner(
+                        status_msg,
+                        task_id,
+                        base_norm_text,
+                        asyncio.to_thread(
+                            ppt_to_pptx_crossplatform, local_pptx, task_dir
+                        ),
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-PREP] {file_name}: .ppt→.pptx упал: {e}",
+                        exc_info=True,
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "normalize",
+                    })
+                    continue
+
+                if not normalized_pptx or not Path(normalized_pptx).exists():
+                    logging.error(
+                        f"[YD-PREP] {file_name}: .pptx не создан"
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "normalize",
+                    })
+                    continue
+            else:
+                normalized_pptx = local_pptx
+
+            # Проверяем отмену после нормализации
+            task_sess = sessions.get(task_id)
+            if task_sess is None or task_sess.get("cancelled"):
+                logging.info(
+                    f"[YD-PREP] Задача {task_id} отменена после нормализации "
+                    f"{file_name} — прерываем"
+                )
+                await _yd_cleanup_task(
+                    task_id, session_key, task_dir,
+                    owner_user_id, chat_id, nonce,
+                )
+                return
+
+            # ✅ Считаем total_slides ОДИН РАЗ и кэшируем в item.
+            # Дальше _yd_render_sermon_prompt / yd_sermon_edit / handle_text_input
+            # берут его из item["total_slides"] — без повторного чтения PPTX.
+            total_slides = 0
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(normalized_pptx))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(
+                    f"[YD-PREP] {file_name}: не удалось посчитать слайды: {e}"
+                )
+
+            # ✅ Читаем заметки из нормализованного .pptx
             await _safe_edit(
                 status_msg,
                 f"🔍 Читаю заметки докладчика: <code>{file_name_esc}</code>...",
@@ -421,7 +498,7 @@ async def _yd_prepare_files(
             )
 
             notes_ok, notes, incomplete = await asyncio.to_thread(
-                extract_speaker_notes, str(local_pptx)
+                extract_speaker_notes, str(normalized_pptx)
             )
 
             # Определяем проповедь по ключевым словам из конфига
@@ -459,7 +536,10 @@ async def _yd_prepare_files(
             prepared.append({
                 "file_name": file_name,
                 "file_slug": safe_folder_name(file_name),
-                "file_path": local_pptx,       # ← PPTX для конвертации позже
+                # ✅ Всегда нормализованный .pptx (для .ppt — конвертированный)
+                "file_path": normalized_pptx,
+                # ✅ Кэш количества слайдов — переиспользуется в промптах
+                "total_slides": total_slides,
                 "start": start,
                 "end": end,
                 "ranges": item_ranges,
@@ -468,7 +548,7 @@ async def _yd_prepare_files(
                 "incomplete": incomplete,
                 "incomplete_warning": incomplete_warning,
                 "confirmed": False,
-                "convert_mode": None,          # ← заполним в yd_sermon_mode
+                "convert_mode": None,
             })
 
         # Публикуем pending
@@ -524,7 +604,6 @@ async def _yd_prepare_files(
                 if item.get("convert_mode") is None:
                     item["convert_mode"] = "both"
             await _yd_convert_and_upload(
-                callback=callback,
                 bot=bot,
                 task_id=task_id,
                 status_msg=status_msg,
@@ -665,16 +744,18 @@ async def _yd_render_sermon_prompt(
     file_name = item.get("file_name", "")
     file_esc = html_module.escape(file_name)
 
-    # ✅ Общее количество слайдов — считаем из PPTX (без конвертации)
-    file_path = item.get("file_path")
-    total_slides = 0
-    if file_path and Path(file_path).exists():
-        try:
-            from pptx import Presentation
-            prs = Presentation(str(file_path))
-            total_slides = len(prs.slides._sldIdLst)
-        except Exception as e:
-            logging.warning(f"Не удалось определить число слайдов: {e}")
+    # ✅ total_slides посчитан в _yd_prepare_files, не читаем PPTX заново.
+    total_slides = item.get("total_slides", 0)
+    if total_slides == 0:
+        # Fallback для задач без кэша (не должно случаться на новом коде)
+        file_path = item.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(file_path))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(f"Не удалось определить число слайдов: {e}")
 
     kb = InlineKeyboardBuilder()
 
@@ -1046,7 +1127,6 @@ async def _yd_cleanup_task(
 # ==========================================
 
 async def _yd_convert_and_upload(
-    callback: types.CallbackQuery,
     bot: Bot,
     task_id: str,
     status_msg,
@@ -1123,12 +1203,19 @@ async def _yd_convert_and_upload(
             file_name_esc = html_module.escape(file_name)
             file_slug = item["file_slug"]
 
+            # ✅ Пользователь пропустил файл вручную — не конвертируем.
+            if item.get("convert_mode") == "skip":
+                logging.info(f"[YD-UP] {file_name}: пропущен пользователем")
+                report_lines.append(f"⏭ {file_name_esc} — пропущен пользователем")
+                continue
+
             if item.get("failed_at_stage"):
                 stage = item["failed_at_stage"]
                 stage_text = {
-                    "download": "ошибка скачивания",
-                    "convert": "ошибка конвертации",
-                    "no_pngs": "нет PNG",
+                    "download":  "ошибка скачивания",
+                    "normalize": "ошибка подготовки .ppt → .pptx",
+                    "convert":   "ошибка конвертации",
+                    "no_pngs":   "нет PNG",
                 }.get(stage, stage)
                 report_lines.append(f"❌ {file_name_esc} — {stage_text}")
                 total_failed += 1
@@ -2089,7 +2176,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
     # Все подтверждены — конвертируем и загружаем
     await _yd_convert_and_upload(
-        callback=callback,
         bot=bot,
         task_id=task_id,
         status_msg=callback.message,
@@ -2256,16 +2342,17 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     current = pending["prepared"][idx]
     file_name_esc = html_module.escape(current["file_name"])
 
-    # ✅ Считаем total_slides через PPTX (без конвертации)
-    file_path = current.get("file_path")
-    total_slides = 0
-    if file_path and Path(file_path).exists():
-        try:
-            from pptx import Presentation
-            prs = Presentation(str(file_path))
-            total_slides = len(prs.slides._sldIdLst)
-        except Exception as e:
-            logging.warning(f"Не удалось определить число слайдов: {e}")
+    # ✅ total_slides из кэша _yd_prepare_files
+    total_slides = current.get("total_slides", 0)
+    if total_slides == 0:
+        file_path = current.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(file_path))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(f"Не удалось определить число слайдов: {e}")
 
     # Контекст о найденных слайдах
     matches = current.get("matches", []) or []
