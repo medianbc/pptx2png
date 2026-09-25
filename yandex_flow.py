@@ -62,6 +62,7 @@ from converter_engine import (
     create_zip_stream,
     ppt_to_pptx_crossplatform,
     count_slides_via_libreoffice,
+    librenormalize_to_pptx,
 )
 
 
@@ -334,38 +335,28 @@ async def _yd_prepare_files(
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
 
-    # ✅ Регистрируем задачу в сессии ДО mkdir. Если mkdir упадёт —
-    # yd_pick снимет processing, а этот ранний except тоже не оставит
-    # stale-флага.
-    try:
-        async with yd_session_lock:
-            picker = sessions.get(session_key)
-            if picker is None:
-                await _safe_edit(status_msg, "❌ Сессия была отменена.")
-                return
-            # ✅ Сверяем nonce: если параллельный /sunday успел заменить
-            # сессию пока мы шли до этой строки, наш task_id принадлежит
-            # старой сессии, которой уже нет. Не регистрируем задачу в чужой.
-            if picker.get("nonce") != nonce:
-                logging.warning(
-                    f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
-                    f"expected nonce={nonce!r} для session_key={session_key!r} — "
-                    f"сессия заменена параллельной командой, прерываем"
-                )
-                await _safe_edit(
-                    status_msg,
-                    "❌ Сессия была заменена другой командой.\n"
-                    "Запустите /sunday заново."
-                )
-                return
+    # ✅ Ранняя регистрация. Под локом — только in-memory операции:
+    # никаких await на Telegram, никаких файловых операций.
+    # Результат проверок сохраняем в переменные и реагируем уже
+    # ВНЕ лока, чтобы не блокировать других пользователей.
+    registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce" | "error"
+    registration_error: Optional[Exception] = None
 
-            task_dir.mkdir(parents=True, exist_ok=True)
-
+    async with yd_session_lock:
+        picker = sessions.get(session_key)
+        if picker is None:
+            registration_status = "no_picker"
+        elif picker.get("nonce") != nonce:
+            logging.warning(
+                f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
+                f"expected nonce={nonce!r} для session_key={session_key!r} — "
+                f"сессия заменена параллельной командой, прерываем"
+            )
+            registration_status = "wrong_nonce"
+        else:
+            # Регистрируем задачу сразу — source of truth.
             picker.setdefault("task_ids", []).append(task_id)
-            # ✅ Task зарегистрирован — источник правды теперь task_ids.
-            # Сбрасываем processing, чтобы флаг отражал ровно окно до регистрации.
             picker["processing"] = False
-
             sessions[task_id] = {
                 "user_id": owner_user_id,
                 "chat_id": chat_id,
@@ -375,29 +366,55 @@ async def _yd_prepare_files(
                 "cancelled": False,
             }
             yd_active_tasks.add(task_id)
+
+    if registration_status == "no_picker":
+        await _safe_edit(status_msg, "❌ Сессия была отменена.")
+        return
+
+    if registration_status == "wrong_nonce":
+        await _safe_edit(
+            status_msg,
+            "❌ Сессия была заменена другой командой.\n"
+            "Запустите /sunday заново."
+        )
+        return
+
+    # ✅ mkdir ВНЕ лока. Если упадёт — снимаем флаг уже в except ниже.
+    try:
+        task_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         logging.error(
-            f"[YD-PREP] ошибка ранней регистрации task_id: {e}",
+            f"[YD-PREP] mkdir упал для {task_id}: {e}",
             exc_info=True,
         )
-        # Попытка снять processing — иначе следующий /sunday упрётся в отказ.
+        # Откатываем регистрацию: убираем task_id из сессий.
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
-                if picker is not None and picker.get("nonce") == nonce:
-                    picker["processing"] = False
+                if picker is not None:
+                    task_ids = picker.get("task_ids")
+                    if isinstance(task_ids, list) and task_id in task_ids:
+                        task_ids.remove(task_id)
+                sessions.pop(task_id, None)
+                yd_active_tasks.discard(task_id)
         except Exception as cleanup_err:
             logging.error(
-                f"[YD-PREP] не удалось сбросить processing: {cleanup_err}",
+                f"[YD-PREP] не удалось откатить регистрацию: {cleanup_err}",
                 exc_info=True,
             )
         _safe_delete_task_dir(task_dir)
         await _safe_edit(
             status_msg,
-            f"❌ Не удалось начать обработку: "
+            f"❌ Не удалось создать папку задачи: "
             f"<code>{html_module.escape(str(e)[:200])}</code>",
         )
         return
+
+    status_message_id = status_msg.message_id if status_msg is not None else None
+
+    logging.info(
+        f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
+    )
 
     status_message_id = status_msg.message_id if status_msg is not None else None
 
@@ -542,10 +559,9 @@ async def _yd_prepare_files(
                 )
                 return
 
-            # ✅ Считаем total_slides ОДИН РАЗ и кэшируем в item.
-            # 1) Быстрый путь — python-pptx.
-            # 2) Fallback — LibreOffice+PDF (для файлов, которые python-pptx
-            #    не открывает, а LibreOffice рендерит).
+            # ✅ Считаем total_slides. Если python-pptx не открывает файл —
+            # пробуем нормализовать его через LibreOffice в валидный .pptx,
+            # чтобы и подсчёт, и последующий make_dark_mode работали.
             total_slides = None
             try:
                 from pptx import Presentation
@@ -557,14 +573,31 @@ async def _yd_prepare_files(
                 )
 
             if not total_slides:
-                total_slides = await asyncio.to_thread(
-                    count_slides_via_libreoffice, normalized_pptx, per_file_dir
+                # Fallback: нормализуем файл через LibreOffice и заново
+                # открываем уже нормализованный результат.
+                renorm_result = await asyncio.to_thread(
+                    librenormalize_to_pptx, normalized_pptx, per_file_dir
+                )
+                if renorm_result is None:
+                    logging.error(
+                        f"[YD-PREP] {file_name}: файл не читается "
+                        f"ни python-pptx, ни после нормализации LibreOffice"
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "count",
+                    })
+                    continue
+                normalized_pptx, total_slides = renorm_result
+                logging.info(
+                    f"[YD-PREP] {file_name}: нормализован через LibreOffice "
+                    f"({total_slides} слайдов)"
                 )
 
             if not total_slides:
                 logging.error(
-                    f"[YD-PREP] {file_name}: не удалось определить число "
-                    f"слайдов (ни python-pptx, ни LibreOffice)"
+                    f"[YD-PREP] {file_name}: total_slides == 0, пропускаем"
                 )
                 prepared.append({
                     "file_name": file_name,
@@ -2091,7 +2124,15 @@ async def yd_pick(
             await callback.answer("❌ Сессия неактивна.", show_alert=True)
             return
 
-        if session.get("processing"):
+        # ✅ Учитываем и processing (окно до регистрации), и уже зарегистрированные
+        # живые задачи (окно после регистрации, пока клавиатура ещё не заменена).
+        # Та же логика, что в cmd_sunday — единая семантика «активная сессия».
+        already_processing = bool(session.get("processing"))
+        has_live_task = any(
+            tid in sessions and not sessions[tid].get("cancelled")
+            for tid in session.get("task_ids", [])
+        )
+        if already_processing or has_live_task:
             await callback.answer("⏳ Обработка уже запущена.", show_alert=True)
             return
 
