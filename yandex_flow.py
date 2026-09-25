@@ -1,12 +1,17 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.1)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.2)
 # ==========================================
-# Изменения v3.1:
-#   • Добавлен _count_slides_in_ranges (устранение NameError, баг №1)
+# Изменения v3.2:
+#   • _count_slides_in_ranges (устранение NameError)
 #   • Исправлена опечатка pending["prepаared"] → pending["prepared"]
 #   • Укорочены task_id и nonce (лимит callback_data 64 байта)
-#   • Добавлена шапка с режимом конвертации в статус-сообщениях
-#   • Добавлен спиннер прогресса + корректная остановка при отмене
+#   • Шапка с режимом конвертации в статус-сообщениях
+#   • Спиннер прогресса + корректная остановка при отмене
+#   • Нормализация .ppt → .pptx в prepare
+#   • Кэш total_slides в item + fallback через LibreOffice
+#   • Уникальная подпапка на каждый файл (не перезаписывают друг друга)
+#   • "skip" режим для ручного пропуска файла
+#   • Запрет параллельных /sunday при активной задаче
 # ==========================================
 
 import asyncio
@@ -50,6 +55,7 @@ from converter_engine import (
     convert_all_pngs,
     create_zip_stream,
     ppt_to_pptx_crossplatform,
+    count_slides_via_libreoffice,
 )
 
 
@@ -202,6 +208,8 @@ _active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 
 def _mode_label(mode: str) -> str:
     """Человекочитаемая метка выбранного режима конвертации."""
+    if mode == "skip":
+        return "⏭ Пропущено"
     return _MODE_LABELS.get(mode, f"❓ {mode}")
 
 
@@ -371,6 +379,11 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
+            # ✅ Уникальная подпапка на файл — чтобы .ppt и .pptx с одинаковым
+            # stem не перекрывали друг друга в общей task_dir.
+            per_file_dir = task_dir / f"src_{f_idx}"
+            per_file_dir.mkdir(exist_ok=True)
+
             # Скачивание с кнопкой отмены + спиннером
             base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
@@ -380,7 +393,7 @@ async def _yd_prepare_files(
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
-            local_pptx = task_dir / file_name
+            local_pptx = per_file_dir / file_name
             ok = await _yd_with_spinner(
                 status_msg,
                 task_id,
@@ -435,7 +448,7 @@ async def _yd_prepare_files(
                         task_id,
                         base_norm_text,
                         asyncio.to_thread(
-                            ppt_to_pptx_crossplatform, local_pptx, task_dir
+                            ppt_to_pptx_crossplatform, local_pptx, per_file_dir
                         ),
                     )
                 except Exception as e:
@@ -477,17 +490,35 @@ async def _yd_prepare_files(
                 return
 
             # ✅ Считаем total_slides ОДИН РАЗ и кэшируем в item.
-            # Дальше _yd_render_sermon_prompt / yd_sermon_edit / handle_text_input
-            # берут его из item["total_slides"] — без повторного чтения PPTX.
-            total_slides = 0
+            # 1) Быстрый путь — python-pptx.
+            # 2) Fallback — LibreOffice+PDF (для файлов, которые python-pptx
+            #    не открывает, а LibreOffice рендерит).
+            total_slides = None
             try:
                 from pptx import Presentation
                 prs = Presentation(str(normalized_pptx))
                 total_slides = len(prs.slides._sldIdLst)
             except Exception as e:
                 logging.warning(
-                    f"[YD-PREP] {file_name}: не удалось посчитать слайды: {e}"
+                    f"[YD-PREP] {file_name}: python-pptx не открыл: {e}"
                 )
+
+            if not total_slides:
+                total_slides = await asyncio.to_thread(
+                    count_slides_via_libreoffice, normalized_pptx, per_file_dir
+                )
+
+            if not total_slides:
+                logging.error(
+                    f"[YD-PREP] {file_name}: не удалось определить число "
+                    f"слайдов (ни python-pptx, ни LibreOffice)"
+                )
+                prepared.append({
+                    "file_name": file_name,
+                    "file_slug": safe_folder_name(file_name),
+                    "failed_at_stage": "count",
+                })
+                continue
 
             # ✅ Читаем заметки из нормализованного .pptx
             await _safe_edit(
@@ -708,9 +739,9 @@ async def _yd_render_sermon_prompt(
       2. matches > 0, но одна пометка → 2 кнопки + Изменить + Отмена
       3. matches = 0 / notes не прочитаны → «Конвертировать всё» + Изменить + Отмена
 
-    ✅ Исправление бага №4: подсчёт и отображение диапазона ведётся
-    по item["ranges"] (если он есть), а не по схлопнутым start/end.
-    Для ввода вида "1,10" это даёт 2 слайда и текст "1, 10".
+    ✅ Подсчёт и отображение диапазона ведётся по item["ranges"],
+    а не по схлопнутым start/end. Для ввода вида "1,10" это даёт
+    2 слайда и текст "1, 10".
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -775,7 +806,7 @@ async def _yd_render_sermon_prompt(
     if has_valid_range:
         # --- Диапазон задан (автоматически или вручную) ---
 
-        # ✅ Баг №4: считаем sermon_count по ranges, если они есть.
+        # Считаем sermon_count по ranges, если они есть.
         if ranges:
             sermon_count = _count_slides_in_ranges(ranges, total_slides)
             ranges_text = _format_ranges_text(ranges, start, end)
@@ -1051,9 +1082,14 @@ async def _yd_cleanup_task(
                             )
                         except Exception as e:
                             if "message is not modified" in str(e):
-                                logging.debug(f"[YD-CLEANUP] {mid}: клавиатура уже снята")
+                                logging.debug(
+                                    f"[YD-CLEANUP] {mid}: клавиатура уже снята"
+                                )
                             else:
-                                logging.debug(f"[YD-CLEANUP] Не удалось снять клавиатуру с {mid}: {e}")
+                                logging.debug(
+                                    f"[YD-CLEANUP] Не удалось снять клавиатуру "
+                                    f"с {mid}: {e}"
+                                )
     except Exception as e:
         logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
@@ -1214,6 +1250,7 @@ async def _yd_convert_and_upload(
                 stage_text = {
                     "download":  "ошибка скачивания",
                     "normalize": "ошибка подготовки .ppt → .pptx",
+                    "count":     "не удалось определить число слайдов",
                     "convert":   "ошибка конвертации",
                     "no_pngs":   "нет PNG",
                 }.get(stage, stage)
@@ -1864,12 +1901,11 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
         async with yd_session_lock:
+            # ✅ Старая сессия гарантированно не содержит активных задач —
+            # проверку сделали выше. Удаляем её как "протухшую" без отмены.
             old_picker = sessions.get(session_key)
-            if old_picker is not None:
-                for old_tid in old_picker.get("task_ids", []):
-                    old_sess = sessions.get(old_tid)
-                    if old_sess is not None:
-                        old_sess["cancelled"] = True
+            if old_picker is not None and not old_picker.get("task_ids"):
+                sessions.pop(session_key, None)
 
             sessions[session_key] = {
                 "user_id": message.from_user.id,
@@ -2140,7 +2176,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
-    # ✅ ИСПРАВЛЕНО: было "prepаared" с кириллической 'а'
     item = pending["prepared"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан

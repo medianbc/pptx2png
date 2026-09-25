@@ -747,12 +747,17 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
                     reply_fn=message.reply,
                 )
             else:
-                # Все файлы решены — запускаем конвертацию (или cleanup, если всё skip)
+                # Все файлы решены — запускаем конвертацию (или cleanup, если всё skip).
+                # ✅ Отправляем бот-сообщение, которое можно редактировать:
+                # пользователь увидит и шапку режима, и спиннер, и кнопку отмены.
                 from yandex_flow import convert_and_upload
+                status_msg = await message.reply(
+                    "⚙️ Запускаю конвертацию оставшихся файлов..."
+                )
                 await convert_and_upload(
                     bot=message.bot,
                     task_id=tid,
-                    status_msg=message,
+                    status_msg=status_msg,
                 )
             return
 
