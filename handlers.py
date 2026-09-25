@@ -32,7 +32,6 @@ from yandex_disk import YandexDiskError
 from yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
-    upload_files as yd_upload_files,
     cleanup_task as yd_cleanup_task,
     is_sermon_slide,
     prompt_timeout_watchdog,
@@ -656,7 +655,9 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
     if not await check_access(message):
         return
 
-    # ---------- Yandex-ветка ----------
+    # ============================================================
+    # Yandex-ветка: ответ на промпт проповеди
+    # ============================================================
     candidates = []
     for tid, sess in sessions.items():
         pending = sess.get("pending")
@@ -694,16 +695,22 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         idx = pending.get("awaiting_range_for_idx")
         current = pending["prepared"][idx]
-        total_slides = len(current["pngs_sorted"])
+
+        # ✅ total_slides из кэша _yd_prepare_files (уже .pptx).
+        total_slides = current.get("total_slides", 0)
+        if total_slides == 0:
+            file_path = current.get("file_path")
+            if file_path and Path(file_path).exists():
+                try:
+                    from pptx import Presentation
+                    prs = Presentation(str(file_path))
+                    total_slides = len(prs.slides._sldIdLst)
+                except Exception as e:
+                    logging.warning(f"Не удалось определить число слайдов: {e}")
 
         text_clean = message.text.strip().lower()
 
-        # "отмена"/"0" = Skip
         if text_clean in ("отмена", "cancel", "0"):
-            current["start"] = None
-            current["end"] = None
-            current["ranges"] = None
-            current["confirmed"] = True
             pending.pop("awaiting_range_for_idx", None)
 
             timeout_task = pending.get("prompt_timeout_task")
@@ -715,36 +722,46 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             pending["prompt_idx"] = None
             pending["prompt_message_id"] = None
 
-            await message.reply("⏭ Пропущено.")
+            # ✅ Помечаем файл пропущенным и двигаемся дальше
+            current["convert_mode"] = "skip"
+            current["confirmed"] = True
 
+            await message.reply(
+                f"⏭ Файл <code>{html_module.escape(current['file_name'])}</code> "
+                f"будет пропущен.",
+                parse_mode="HTML",
+            )
+
+            # Ищем следующий неподтверждённый файл
             remaining = [
                 p for p in pending["prepared"]
-                if "pngs_sorted" in p and not p.get("confirmed")
+                if "file_path" in p and not p.get("confirmed")
             ]
+
             if remaining:
+                # Показываем промпт для следующего
                 await render_sermon_prompt(
-                    task_id=tid, item=remaining[0],
-                    status_msg=None, reply_fn=message.reply,
+                    task_id=tid,
+                    item=remaining[0],
+                    status_msg=None,
+                    reply_fn=message.reply,
                 )
             else:
-                bot = pending.get("bot")
-                if bot:
-                    status_msg = await message.reply("📤 Начинаю загрузку файлов...")
-
-                    class _FakeCallback:
-                        def __init__(self, msg, user):
-                            self.message = msg
-                            self.from_user = user
-                            self.data = ""
-                            self.bot = bot
-
-                    fake_cb = _FakeCallback(status_msg, message.from_user)
-                    await yd_upload_files(
-                        callback=fake_cb, bot=bot,
-                        task_id=tid, status_msg=status_msg,
-                    )
+                # Все файлы решены — запускаем конвертацию (или cleanup, если всё skip).
+                # ✅ Отправляем бот-сообщение, которое можно редактировать:
+                # пользователь увидит и шапку режима, и спиннер, и кнопку отмены.
+                from yandex_flow import convert_and_upload
+                status_msg = await message.reply(
+                    "⚙️ Запускаю конвертацию оставшихся файлов..."
+                )
+                await convert_and_upload(
+                    bot=message.bot,
+                    task_id=tid,
+                    status_msg=status_msg,
+                )
             return
 
+        # Парсим ввод
         ranges = parse_slides_ranges(message.text.strip())
         if not ranges:
             old_timeout = pending.get("prompt_timeout_task")
@@ -762,6 +779,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
                     )
                 )
                 pending["prompt_watchdog_nonce"] = current_nonce
+
             await message.reply(
                 "❌ **Неверный формат.** Пример: `5-30` или `5,7,10-15`"
             )
@@ -775,7 +793,9 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
                 warning_parts.append(f"слайд {s} не существует — пропущен")
                 continue
             if e > total_slides:
-                warning_parts.append(f"диапазон {s}–{e} сокращён до {s}–{total_slides}")
+                warning_parts.append(
+                    f"диапазон {s}–{e} сокращён до {s}–{total_slides}"
+                )
                 e = total_slides
             clipped.append((s, e))
 
@@ -785,12 +805,33 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         warning = ("\n⚠️ " + "; ".join(warning_parts)) if warning_parts else ""
 
+        # Сохраняем диапазон в prepared
         current["ranges"] = normalized
         current["start"] = normalized[0][0] if normalized else None
         current["end"] = normalized[-1][1] if normalized else None
-        current["confirmed"] = True
+
+        # ✅ Bug #4: заполняем matches всеми номерами слайдов из диапазона.
+        # Это нужно, чтобы _yd_render_sermon_prompt увидел has_valid_range=True
+        # и показал все 3 кнопки режимов (sermon / other / both).
+        if normalized:
+            all_matches = []
+            for s, e in normalized:
+                all_matches.extend(range(s, e + 1))
+            current["matches"] = sorted(set(all_matches))
+            logging.debug(
+                f"[YD-INPUT] Ручной диапазон: ranges={normalized}, "
+                f"matches={current['matches'][:20]}"
+                + ("..." if len(current["matches"]) > 20 else "")
+            )
+        else:
+            current["matches"] = []
+
+        # ✅ Помечаем, что диапазон был введён вручную — пригодится в промпте
+        current["manual_range"] = True
+        current["confirmed"] = False
         pending.pop("awaiting_range_for_idx", None)
 
+        # Отменяем watchdog
         timeout_task = pending.get("prompt_timeout_task")
         if timeout_task is not None and not timeout_task.done():
             timeout_task.cancel()
@@ -800,6 +841,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         pending["prompt_idx"] = None
         pending["prompt_message_id"] = None
 
+        # Уведомляем о принятом диапазоне
         if normalized:
             ranges_text = ", ".join(
                 f"{s}–{e}" if s != e else str(s) for s, e in normalized
@@ -810,43 +852,22 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             )
         else:
             await message.reply(
-                f"⚠️ Ни один слайд не попал в диапазон. Проповедь не будет выделена.{warning}",
+                f"⚠️ Ни один слайд не попал в диапазон.{warning}",
                 parse_mode="HTML",
             )
 
-        remaining = [
-            p for p in pending["prepared"]
-            if "pngs_sorted" in p and not p.get("confirmed")
-        ]
-
-        if remaining:
-            await render_sermon_prompt(
-                task_id=tid, item=remaining[0],
-                status_msg=None, reply_fn=message.reply,
-            )
-        else:
-            bot = pending.get("bot")
-            if bot:
-                status_msg = await message.reply(
-                    "📤 Начинаю загрузку файлов на Яндекс.Диск...",
-                    parse_mode="HTML",
-                )
-
-                class _FakeCallback:
-                    def __init__(self, msg, user):
-                        self.message = msg
-                        self.from_user = user
-                        self.data = ""
-                        self.bot = bot
-
-                fake_cb = _FakeCallback(status_msg, message.from_user)
-                await yd_upload_files(
-                    callback=fake_cb, bot=bot,
-                    task_id=tid, status_msg=status_msg,
-                )
+        # ✅ Показываем промпт с режимами конвертации
+        await render_sermon_prompt(
+            task_id=tid,
+            item=current,
+            status_msg=None,
+            reply_fn=message.reply,
+        )
         return
 
-    # ---------- Обычная конвертация ----------
+    # ============================================================
+    # Обычная конвертация (не Yandex)
+    # ============================================================
     user_id = message.from_user.id
     target_chat_id = message.chat.id
 
@@ -883,12 +904,20 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
     )
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(text="✅ Конвертировать", callback_data=f"slides_convert:{active_task_id}"),
-        InlineKeyboardButton(text="✏️ Изменить", callback_data=f"slides_select:{active_task_id}")
+        InlineKeyboardButton(
+            text="✅ Конвертировать",
+            callback_data=f"slides_convert:{active_task_id}",
+        ),
+        InlineKeyboardButton(
+            text="✏️ Изменить",
+            callback_data=f"slides_select:{active_task_id}",
+        ),
     )
     await message.reply(
-        f"📊 **Вы выбрали:** {ranges_text}\n\n{len(ranges)} архив(ов).\nНажмите 'Конвертировать'.",
-        parse_mode="Markdown", reply_markup=kb.as_markup()
+        f"📊 **Вы выбрали:** {ranges_text}\n\n"
+        f"{len(ranges)} архив(ов).\nНажмите 'Конвертировать'.",
+        parse_mode="Markdown",
+        reply_markup=kb.as_markup(),
     )
 
 

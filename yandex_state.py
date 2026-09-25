@@ -25,9 +25,15 @@ class YandexConfig:
         self.sermon_folder: str = "проповедь - png"
         self.sermon_keyword: str = "проповед"
         self.template_file: str = "template.yaml"
+
         # ✅ Таймаут ожидания ответа на промпт (секунды)
-        # Устанавливается из bot.py (settings.ini, секция [Timeouts])
-        self.prompt_timeout_sec: int = 1800  # 30 минут по умолчанию
+        self.prompt_timeout_sec: int = 1800
+
+        # ✅ Категории слайдов (этап 2)
+        # Списки ключевых слов. Используются sermon_detector.
+        self.sermon_keywords: list = ["проповед", "проповедь"]
+        self.opening_keywords: list = ["начало", "в начале"]
+        self.prayer_keywords: list = ["молитва", "молиться"]
 
 
 config = YandexConfig()

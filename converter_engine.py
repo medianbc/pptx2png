@@ -1,5 +1,10 @@
 # ==========================================
-# converter_engine.py — КОНВЕРТЕР PPTX → PNG (v1.4)
+# converter_engine.py — КОНВЕРТЕР PPTX → PNG (v1.5)
+# ==========================================
+# Изменения v1.5:
+#   • Добавлена count_slides_via_libreoffice() — fallback для подсчёта
+#     числа слайдов через LibreOffice + PyMuPDF, когда python-pptx
+#     не может открыть файл.
 # ==========================================
 
 import os
@@ -8,6 +13,7 @@ import subprocess
 import zipfile
 import re
 import asyncio
+import logging
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -146,11 +152,44 @@ def ppt_to_pptx_crossplatform(ppt_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{ppt_path.stem}.pptx"
 
 
+def count_slides_via_libreoffice(
+    pptx_path: Path, work_dir: Path
+) -> Optional[int]:
+    """
+    Fallback-способ узнать число слайдов: LibreOffice → PDF → fitz.
+
+    Используется, когда python-pptx не может открыть файл (например,
+    специфичный OOXML), но LibreOffice рендерит его нормально.
+
+    Возвращает количество слайдов или None при любой ошибке.
+    PDF удаляется сразу после подсчёта.
+    """
+    try:
+        pdf_path = pptx_to_pdf_crossplatform(pptx_path, work_dir)
+        if not pdf_path or not pdf_path.exists():
+            return None
+        doc = fitz.open(pdf_path)
+        count = len(doc)
+        doc.close()
+        try:
+            pdf_path.unlink()
+        except Exception:
+            pass
+        return count if count > 0 else None
+    except Exception as e:
+        logging.warning(
+            f"count_slides_via_libreoffice({pptx_path}): {e}"
+        )
+        return None
+
+
 # ==========================================
 # PDF → PNG
 # ==========================================
 
-def pdf_to_png_fast(pdf_path: Path, output_dir: Path, quality: str) -> Tuple[int, List[Path]]:
+def pdf_to_png_fast(
+    pdf_path: Path, output_dir: Path, quality: str
+) -> Tuple[int, List[Path]]:
     """
     Конвертирует PDF в набор PNG (по слайду на страницу).
     Возвращает (total_pages, [пути к PNG]).
@@ -179,8 +218,9 @@ def pdf_to_png_fast(pdf_path: Path, output_dir: Path, quality: str) -> Tuple[int
 # ZIP
 # ==========================================
 
-def create_zip_stream(file_paths: List[Path], output_path: Path,
-                      compress_level: int = 6) -> Path:
+def create_zip_stream(
+    file_paths: List[Path], output_path: Path, compress_level: int = 6
+) -> Path:
     """
     Создаёт ZIP-архив из списка файлов.
     Сохраняет имена файлов без путей (arcname=f.name).
