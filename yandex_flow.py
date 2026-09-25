@@ -1288,6 +1288,15 @@ async def _yd_convert_and_upload(
     if not isinstance(pending, dict):
         return
 
+    # ✅ Регистрируем worker task для отмены из yd_task_cancel_callback.
+    # Если пользователь отменит во время upload_file, cancel handler
+    # отменит и дождётся этой задачи ПЕРЕД yd_release — иначе in-flight
+    # upload (overwrite=True) может завершиться уже ПОСЛЕ того, как
+    # перезапущенная задача загрузит свой файл на тот же remote path,
+    # и перезапишет его устаревшим контентом.
+    worker_task = asyncio.current_task()
+    session["worker_task"] = worker_task
+
     prepared = pending["prepared"]
     target_base = pending["target_base"]
     task_dir = pending["task_dir"]
@@ -1705,6 +1714,15 @@ async def _yd_convert_and_upload(
         )
         return
     finally:
+        # ✅ Снимаем регистрацию worker'а — чтобы cancel handler не
+        # пытался отменить уже завершённый таск.
+        try:
+            sess = sessions.get(task_id)
+            if sess is not None and sess.get("worker_task") is worker_task:
+                sess["worker_task"] = None
+        except Exception:
+            pass
+
         if zip_tmp_dir is not None and zip_tmp_dir.exists():
             try:
                 shutil.rmtree(zip_tmp_dir)
@@ -2406,12 +2424,40 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
 
+    # ✅ Сначала отменяем и дожидаемся worker'а. Иначе in-flight
+    # upload_file (overwrite=True) может финишировать уже ПОСЛЕ того,
+    # как перезапущенная задача загрузит свой архив на тот же
+    # remote path, и перезапишет его устаревшим контентом.
+    worker = session.get("worker_task")
+    current_task = asyncio.current_task()
+    if worker is not None and not worker.done() and worker is not current_task:
+        logging.info(
+            f"[YD-TASK-CANCEL] Отменяем worker {task_id} перед yd_release"
+        )
+        try:
+            worker.cancel()
+        except Exception as e:
+            logging.debug(f"[YD-TASK-CANCEL] worker.cancel: {e}")
+        try:
+            await asyncio.wait_for(worker, timeout=15.0)
+            logging.info(
+                f"[YD-TASK-CANCEL] worker {task_id} завершён"
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                f"[YD-TASK-CANCEL] worker {task_id} не завершился за 15s — "
+                f"продолжаем, но in-flight upload может продолжиться в фоне"
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.debug(f"[YD-TASK-CANCEL] await worker: {e}")
+
     # ✅ Освобождаем низкоуровневый session-lock (yd_active_sessions).
-    # Иначе следующий /sunday упрётся в
-    # «⏳ У вас уже активна сессия подготовки трансляции», пока
-    # фоновый cleanup не дойдёт до yd_release (десятки секунд на
-    # convert_all_pngs). yd_release внутри сверяет nonce — если
-    # сессию успели заменить, чужой nonce он не тронет.
+    # Делаем это ТОЛЬКО после того, как worker завершён — иначе
+    # следующий /sunday может запустить upload параллельно со старым.
+    # yd_release внутри сверяет nonce — если сессию успели заменить,
+    # чужой nonce он не тронет.
     owner_chat_id = session.get("chat_id")
     owner_nonce = session.get("nonce")
     if owner_chat_id is not None and owner_nonce:
