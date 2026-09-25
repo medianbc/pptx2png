@@ -1,5 +1,12 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.2)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.3)
+# ==========================================
+# Изменения v3.3:
+#   • Race-condition fix: /sunday не плодит параллельные сессии
+#     даже в окне между yd_pick и _yd_prepare_files (processing=True)
+#   • Сверка nonce при регистрации task_id в _yd_prepare_files
+#   • yd_pick: try/except вокруг запуска подготовки + сброс processing
+#   • _yd_prepare_files: сброс processing сразу после регистрации task_id
 # ==========================================
 # Изменения v3.2:
 #   • _count_slides_in_ranges (устранение NameError)
@@ -8,10 +15,9 @@
 #   • Шапка с режимом конвертации в статус-сообщениях
 #   • Спиннер прогресса + корректная остановка при отмене
 #   • Нормализация .ppt → .pptx в prepare
-#   • Кэш total_slides в item + fallback через LibreOffice
-#   • Уникальная подпапка на каждый файл (не перезаписывают друг друга)
+#   • Кэш total_slides + fallback через LibreOffice
+#   • Уникальная подпапка на каждый файл
 #   • "skip" режим для ручного пропуска файла
-#   • Запрет параллельных /sunday при активной задаче
 # ==========================================
 
 import asyncio
@@ -327,46 +333,77 @@ async def _yd_prepare_files(
     # Укладывается в лимит callback_data 64 байта вместе с nonce и mode.
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
+
+    # ✅ Регистрируем задачу в сессии ДО mkdir. Если mkdir упадёт —
+    # yd_pick снимет processing, а этот ранний except тоже не оставит
+    # stale-флага.
+    try:
+        async with yd_session_lock:
+            picker = sessions.get(session_key)
+            if picker is None:
+                await _safe_edit(status_msg, "❌ Сессия была отменена.")
+                return
+            # ✅ Сверяем nonce: если параллельный /sunday успел заменить
+            # сессию пока мы шли до этой строки, наш task_id принадлежит
+            # старой сессии, которой уже нет. Не регистрируем задачу в чужой.
+            if picker.get("nonce") != nonce:
+                logging.warning(
+                    f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
+                    f"expected nonce={nonce!r} для session_key={session_key!r} — "
+                    f"сессия заменена параллельной командой, прерываем"
+                )
+                await _safe_edit(
+                    status_msg,
+                    "❌ Сессия была заменена другой командой.\n"
+                    "Запустите /sunday заново."
+                )
+                return
+
+            task_dir.mkdir(parents=True, exist_ok=True)
+
+            picker.setdefault("task_ids", []).append(task_id)
+            # ✅ Task зарегистрирован — источник правды теперь task_ids.
+            # Сбрасываем processing, чтобы флаг отражал ровно окно до регистрации.
+            picker["processing"] = False
+
+            sessions[task_id] = {
+                "user_id": owner_user_id,
+                "chat_id": chat_id,
+                "pending": None,
+                "nonce": nonce,
+                "created_at": time.time(),
+                "cancelled": False,
+            }
+            yd_active_tasks.add(task_id)
+    except Exception as e:
+        logging.error(
+            f"[YD-PREP] ошибка ранней регистрации task_id: {e}",
+            exc_info=True,
+        )
+        # Попытка снять processing — иначе следующий /sunday упрётся в отказ.
+        try:
+            async with yd_session_lock:
+                picker = sessions.get(session_key)
+                if picker is not None and picker.get("nonce") == nonce:
+                    picker["processing"] = False
+        except Exception as cleanup_err:
+            logging.error(
+                f"[YD-PREP] не удалось сбросить processing: {cleanup_err}",
+                exc_info=True,
+            )
+        _safe_delete_task_dir(task_dir)
+        await _safe_edit(
+            status_msg,
+            f"❌ Не удалось начать обработку: "
+            f"<code>{html_module.escape(str(e)[:200])}</code>",
+        )
+        return
 
     status_message_id = status_msg.message_id if status_msg is not None else None
 
     logging.info(
         f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
     )
-
-    async with yd_session_lock:
-        picker = sessions.get(session_key)
-        if picker is None:
-            _safe_delete_task_dir(task_dir)
-            await _safe_edit(status_msg, "❌ Сессия была отменена.")
-            return
-        # ✅ Сверяем nonce: если параллельный /sunday успел заменить сессию
-        # пока мы шли до этой строки, наш task_id принадлежит старой сессии,
-        # которой уже нет. Не регистрируем задачу в чужой сессии.
-        if picker.get("nonce") != nonce:
-            logging.warning(
-                f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
-                f"expected nonce={nonce!r} для session_key={session_key!r} — "
-                f"сессия заменена параллельной командой, прерываем"
-            )
-            _safe_delete_task_dir(task_dir)
-            await _safe_edit(
-                status_msg,
-                "❌ Сессия была заменена другой командой.\n"
-                "Запустите /sunday заново."
-            )
-            return
-        picker.setdefault("task_ids", []).append(task_id)
-        sessions[task_id] = {
-            "user_id": owner_user_id,
-            "chat_id": chat_id,
-            "pending": None,
-            "nonce": nonce,
-            "created_at": time.time(),
-            "cancelled": False,
-        }
-        yd_active_tasks.add(task_id)
 
     try:
         target_base = paths["target"]
@@ -1924,14 +1961,14 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         race_detected = False
         async with yd_session_lock:
+            # ✅ Защитный путь: сюда не должны попасть из-за проверки
+            # в начале cmd_sunday. Если попали — это гонка, отказываемся
+            # перезаписывать активную сессию.
             old_picker = sessions.get(session_key)
             if old_picker is not None:
                 old_processing = bool(old_picker.get("processing"))
                 old_has_tasks = bool(old_picker.get("task_ids"))
                 if old_processing or old_has_tasks:
-                    # Защитный путь: сюда не должны попасть из-за проверки
-                    # в начале cmd_sunday. Если попали — это гонка,
-                    # отказываемся перезаписывать активную сессию.
                     logging.warning(
                         f"[YD] Race: active picker {session_key!r} "
                         f"processing={old_processing}, "
@@ -1953,6 +1990,7 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                     "created_at": time.time(),
                     "task_ids": [],
                     "cancelled": False,
+                    "processing": False,
                 }
 
         if race_detected:
@@ -2077,22 +2115,55 @@ async def yd_pick(
                 await callback.answer("❌ Некорректный выбор.", show_alert=True)
                 return
 
-    if file_selector == "all":
-        await callback.answer("⏳ Обрабатываю все файлы...")
-    else:
-        await callback.answer("⏳ Начинаю обработку...")
+    # ✅ try/except вокруг запуска подготовки: если callback.answer()
+    # или _yd_prepare_files упадут до регистрации task_id — сбрасываем
+    # processing, иначе следующий /sunday навсегда упрётся в отказ.
+    try:
+        if file_selector == "all":
+            await callback.answer("⏳ Обрабатываю все файлы...")
+        else:
+            await callback.answer("⏳ Начинаю обработку...")
 
-    await _yd_prepare_files(
-        callback=callback,
-        bot=bot,
-        SHM_DIR=SHM_DIR,
-        user_mgr=user_mgr,
-        files_to_process=files_to_process,
-        sunday=sunday,
-        paths=paths,
-        session_key=session_key,
-        nonce=callback_nonce,
-    )
+        await _yd_prepare_files(
+            callback=callback,
+            bot=bot,
+            SHM_DIR=SHM_DIR,
+            user_mgr=user_mgr,
+            files_to_process=files_to_process,
+            sunday=sunday,
+            paths=paths,
+            session_key=session_key,
+            nonce=callback_nonce,
+        )
+    except Exception as e:
+        logging.error(
+            f"[YD-PICK] ошибка запуска подготовки: {e}",
+            exc_info=True,
+        )
+        # Сверяем nonce — если сессию уже заменили другой командой,
+        # не трогаем чужой пикер.
+        try:
+            async with yd_session_lock:
+                picker = sessions.get(session_key)
+                if (
+                    picker is not None
+                    and picker.get("nonce") == callback_nonce
+                ):
+                    picker["processing"] = False
+        except Exception as cleanup_err:
+            logging.error(
+                f"[YD-PICK] не удалось сбросить processing: {cleanup_err}",
+                exc_info=True,
+            )
+        try:
+            await callback.message.reply(
+                f"❌ Не удалось запустить обработку:\n"
+                f"<code>{html_module.escape(str(e)[:200])}</code>\n\n"
+                f"Запустите <code>/sunday</code> заново.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("yd_cancel:"))
