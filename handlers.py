@@ -696,20 +696,20 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         idx = pending.get("awaiting_range_for_idx")
         current = pending["prepared"][idx]
 
-        # total_slides — считаем из PPTX
-        file_path = current.get("file_path")
-        total_slides = 0
-        if file_path and Path(file_path).exists():
-            try:
-                from pptx import Presentation
-                prs = Presentation(str(file_path))
-                total_slides = len(prs.slides._sldIdLst)
-            except Exception as e:
-                logging.warning(f"Не удалось определить число слайдов: {e}")
+        # ✅ total_slides из кэша _yd_prepare_files (уже .pptx).
+        total_slides = current.get("total_slides", 0)
+        if total_slides == 0:
+            file_path = current.get("file_path")
+            if file_path and Path(file_path).exists():
+                try:
+                    from pptx import Presentation
+                    prs = Presentation(str(file_path))
+                    total_slides = len(prs.slides._sldIdLst)
+                except Exception as e:
+                    logging.warning(f"Не удалось определить число слайдов: {e}")
 
         text_clean = message.text.strip().lower()
 
-        # "отмена"/"0" = пользователь не хочет вводить диапазон
         if text_clean in ("отмена", "cancel", "0"):
             pending.pop("awaiting_range_for_idx", None)
 
@@ -722,15 +722,43 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
             pending["prompt_idx"] = None
             pending["prompt_message_id"] = None
 
+            # ✅ Помечаем файл пропущенным и двигаемся дальше
+            current["convert_mode"] = "skip"
+            current["confirmed"] = True
+
             await message.reply(
-                "⏭ Хорошо, диапазон не меняем. Показываю варианты ещё раз."
+                f"⏭ Файл <code>{html_module.escape(current['file_name'])}</code> "
+                f"будет пропущен.",
+                parse_mode="HTML",
             )
-            await render_sermon_prompt(
-                task_id=tid,
-                item=current,
-                status_msg=None,
-                reply_fn=message.reply,
-            )
+
+            # Ищем следующий неподтверждённый файл
+            remaining = [
+                p for p in pending["prepared"]
+                if "file_path" in p and not p.get("confirmed")
+            ]
+
+            if remaining:
+                # Показываем промпт для следующего
+                await render_sermon_prompt(
+                    task_id=tid,
+                    item=remaining[0],
+                    status_msg=None,
+                    reply_fn=message.reply,
+                )
+            else:
+                # Все файлы решены — запускаем конвертацию (или cleanup, если всё skip).
+                # ✅ Отправляем бот-сообщение, которое можно редактировать:
+                # пользователь увидит и шапку режима, и спиннер, и кнопку отмены.
+                from yandex_flow import convert_and_upload
+                status_msg = await message.reply(
+                    "⚙️ Запускаю конвертацию оставшихся файлов..."
+                )
+                await convert_and_upload(
+                    bot=message.bot,
+                    task_id=tid,
+                    status_msg=status_msg,
+                )
             return
 
         # Парсим ввод

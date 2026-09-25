@@ -1,12 +1,23 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.1)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.3)
 # ==========================================
-# Изменения v3.1:
-#   • Добавлен _count_slides_in_ranges (устранение NameError, баг №1)
+# Изменения v3.3:
+#   • Race-condition fix: /sunday не плодит параллельные сессии
+#     даже в окне между yd_pick и _yd_prepare_files (processing=True)
+#   • Сверка nonce при регистрации task_id в _yd_prepare_files
+#   • yd_pick: try/except вокруг запуска подготовки + сброс processing
+#   • _yd_prepare_files: сброс processing сразу после регистрации task_id
+# ==========================================
+# Изменения v3.2:
+#   • _count_slides_in_ranges (устранение NameError)
 #   • Исправлена опечатка pending["prepаared"] → pending["prepared"]
 #   • Укорочены task_id и nonce (лимит callback_data 64 байта)
-#   • Добавлена шапка с режимом конвертации в статус-сообщениях
-#   • Добавлен спиннер прогресса + корректная остановка при отмене
+#   • Шапка с режимом конвертации в статус-сообщениях
+#   • Спиннер прогресса + корректная остановка при отмене
+#   • Нормализация .ppt → .pptx в prepare
+#   • Кэш total_slides + fallback через LibreOffice
+#   • Уникальная подпапка на каждый файл
+#   • "skip" режим для ручного пропуска файла
 # ==========================================
 
 import asyncio
@@ -46,7 +57,13 @@ from yandex_disk import (
 from structure import safe_folder_name
 from sermon_detector import find_sermon_range
 from utils import extract_speaker_notes
-from converter_engine import convert_all_pngs, create_zip_stream
+from converter_engine import (
+    convert_all_pngs,
+    create_zip_stream,
+    ppt_to_pptx_crossplatform,
+    count_slides_via_libreoffice,
+    librenormalize_to_pptx,
+)
 
 
 router = Router()
@@ -198,6 +215,8 @@ _active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 
 def _mode_label(mode: str) -> str:
     """Человекочитаемая метка выбранного режима конвертации."""
+    if mode == "skip":
+        return "⏭ Пропущено"
     return _MODE_LABELS.get(mode, f"❓ {mode}")
 
 
@@ -315,7 +334,81 @@ async def _yd_prepare_files(
     # Укладывается в лимит callback_data 64 байта вместе с nonce и mode.
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
+
+    # ✅ Ранняя регистрация. Под локом — только in-memory операции:
+    # никаких await на Telegram, никаких файловых операций.
+    # Результат проверок сохраняем в переменные и реагируем уже
+    # ВНЕ лока, чтобы не блокировать других пользователей.
+    registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce" | "error"
+    registration_error: Optional[Exception] = None
+
+    async with yd_session_lock:
+        picker = sessions.get(session_key)
+        if picker is None:
+            registration_status = "no_picker"
+        elif picker.get("nonce") != nonce:
+            logging.warning(
+                f"[YD-PREP] picker.nonce={picker.get('nonce')!r} ≠ "
+                f"expected nonce={nonce!r} для session_key={session_key!r} — "
+                f"сессия заменена параллельной командой, прерываем"
+            )
+            registration_status = "wrong_nonce"
+        else:
+            # Регистрируем задачу сразу — source of truth.
+            picker.setdefault("task_ids", []).append(task_id)
+            picker["processing"] = False
+            sessions[task_id] = {
+                "user_id": owner_user_id,
+                "chat_id": chat_id,
+                "pending": None,
+                "nonce": nonce,
+                "created_at": time.time(),
+                "cancelled": False,
+            }
+            yd_active_tasks.add(task_id)
+
+    if registration_status == "no_picker":
+        await _safe_edit(status_msg, "❌ Сессия была отменена.")
+        return
+
+    if registration_status == "wrong_nonce":
+        await _safe_edit(
+            status_msg,
+            "❌ Сессия была заменена другой командой.\n"
+            "Запустите /sunday заново."
+        )
+        return
+
+    # ✅ mkdir ВНЕ лока. Если упадёт — снимаем флаг уже в except ниже.
+    try:
+        task_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logging.error(
+            f"[YD-PREP] mkdir упал для {task_id}: {e}",
+            exc_info=True,
+        )
+        # Откатываем регистрацию: убираем task_id из сессий.
+        try:
+            async with yd_session_lock:
+                picker = sessions.get(session_key)
+                if picker is not None:
+                    task_ids = picker.get("task_ids")
+                    if isinstance(task_ids, list) and task_id in task_ids:
+                        task_ids.remove(task_id)
+                sessions.pop(task_id, None)
+                yd_active_tasks.discard(task_id)
+        except Exception as cleanup_err:
+            logging.error(
+                f"[YD-PREP] не удалось откатить регистрацию: {cleanup_err}",
+                exc_info=True,
+            )
+        _safe_delete_task_dir(task_dir)
+        await _safe_edit(
+            status_msg,
+            f"❌ Не удалось создать папку задачи: "
+            f"<code>{html_module.escape(str(e)[:200])}</code>",
+        )
+        return
 
     status_message_id = status_msg.message_id if status_msg is not None else None
 
@@ -323,22 +416,11 @@ async def _yd_prepare_files(
         f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
     )
 
-    async with yd_session_lock:
-        picker = sessions.get(session_key)
-        if picker is None:
-            _safe_delete_task_dir(task_dir)
-            await _safe_edit(status_msg, "❌ Сессия была отменена.")
-            return
-        picker.setdefault("task_ids", []).append(task_id)
-        sessions[task_id] = {
-            "user_id": owner_user_id,
-            "chat_id": chat_id,
-            "pending": None,
-            "nonce": nonce,
-            "created_at": time.time(),
-            "cancelled": False,
-        }
-        yd_active_tasks.add(task_id)
+    status_message_id = status_msg.message_id if status_msg is not None else None
+
+    logging.info(
+        f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
+    )
 
     try:
         target_base = paths["target"]
@@ -367,6 +449,11 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
+            # ✅ Уникальная подпапка на файл — чтобы .ppt и .pptx с одинаковым
+            # stem не перекрывали друг друга в общей task_dir.
+            per_file_dir = task_dir / f"src_{f_idx}"
+            per_file_dir.mkdir(exist_ok=True)
+
             # Скачивание с кнопкой отмены + спиннером
             base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
@@ -376,7 +463,7 @@ async def _yd_prepare_files(
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
-            local_pptx = task_dir / file_name
+            local_pptx = per_file_dir / file_name
             ok = await _yd_with_spinner(
                 status_msg,
                 task_id,
@@ -412,7 +499,114 @@ async def _yd_prepare_files(
                 )
                 return
 
-            # ✅ Извлекаем заметки ИЗ PPTX (без конвертации — быстро)
+            # ✅ Нормализация .ppt → .pptx (старые форматы).
+            # Делаем ОДИН РАЗ здесь — дальше работаем только с .pptx:
+            #   • заметки читаются python-pptx (не понимает .ppt);
+            #   • total_slides считается через Presentation();
+            #   • конвертация PNG тоже пойдёт по .pptx.
+            if local_pptx.suffix.lower() == ".ppt":
+                base_norm_text = f"🔧 Готовлю .ppt → .pptx: <code>{file_name_esc}</code>"
+                await _safe_edit(
+                    status_msg,
+                    base_norm_text,
+                    parse_mode="HTML",
+                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
+                )
+                try:
+                    normalized_pptx = await _yd_with_spinner(
+                        status_msg,
+                        task_id,
+                        base_norm_text,
+                        asyncio.to_thread(
+                            ppt_to_pptx_crossplatform, local_pptx, per_file_dir
+                        ),
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-PREP] {file_name}: .ppt→.pptx упал: {e}",
+                        exc_info=True,
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "normalize",
+                    })
+                    continue
+
+                if not normalized_pptx or not Path(normalized_pptx).exists():
+                    logging.error(
+                        f"[YD-PREP] {file_name}: .pptx не создан"
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "normalize",
+                    })
+                    continue
+            else:
+                normalized_pptx = local_pptx
+
+            # Проверяем отмену после нормализации
+            task_sess = sessions.get(task_id)
+            if task_sess is None or task_sess.get("cancelled"):
+                logging.info(
+                    f"[YD-PREP] Задача {task_id} отменена после нормализации "
+                    f"{file_name} — прерываем"
+                )
+                await _yd_cleanup_task(
+                    task_id, session_key, task_dir,
+                    owner_user_id, chat_id, nonce,
+                )
+                return
+
+            # ✅ Считаем total_slides. Если python-pptx не открывает файл —
+            # пробуем нормализовать его через LibreOffice в валидный .pptx,
+            # чтобы и подсчёт, и последующий make_dark_mode работали.
+            total_slides = None
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(normalized_pptx))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(
+                    f"[YD-PREP] {file_name}: python-pptx не открыл: {e}"
+                )
+
+            if not total_slides:
+                # Fallback: нормализуем файл через LibreOffice и заново
+                # открываем уже нормализованный результат.
+                renorm_result = await asyncio.to_thread(
+                    librenormalize_to_pptx, normalized_pptx, per_file_dir
+                )
+                if renorm_result is None:
+                    logging.error(
+                        f"[YD-PREP] {file_name}: файл не читается "
+                        f"ни python-pptx, ни после нормализации LibreOffice"
+                    )
+                    prepared.append({
+                        "file_name": file_name,
+                        "file_slug": safe_folder_name(file_name),
+                        "failed_at_stage": "count",
+                    })
+                    continue
+                normalized_pptx, total_slides = renorm_result
+                logging.info(
+                    f"[YD-PREP] {file_name}: нормализован через LibreOffice "
+                    f"({total_slides} слайдов)"
+                )
+
+            if not total_slides:
+                logging.error(
+                    f"[YD-PREP] {file_name}: total_slides == 0, пропускаем"
+                )
+                prepared.append({
+                    "file_name": file_name,
+                    "file_slug": safe_folder_name(file_name),
+                    "failed_at_stage": "count",
+                })
+                continue
+
+            # ✅ Читаем заметки из нормализованного .pptx
             await _safe_edit(
                 status_msg,
                 f"🔍 Читаю заметки докладчика: <code>{file_name_esc}</code>...",
@@ -421,7 +615,7 @@ async def _yd_prepare_files(
             )
 
             notes_ok, notes, incomplete = await asyncio.to_thread(
-                extract_speaker_notes, str(local_pptx)
+                extract_speaker_notes, str(normalized_pptx)
             )
 
             # Определяем проповедь по ключевым словам из конфига
@@ -459,7 +653,10 @@ async def _yd_prepare_files(
             prepared.append({
                 "file_name": file_name,
                 "file_slug": safe_folder_name(file_name),
-                "file_path": local_pptx,       # ← PPTX для конвертации позже
+                # ✅ Всегда нормализованный .pptx (для .ppt — конвертированный)
+                "file_path": normalized_pptx,
+                # ✅ Кэш количества слайдов — переиспользуется в промптах
+                "total_slides": total_slides,
                 "start": start,
                 "end": end,
                 "ranges": item_ranges,
@@ -468,7 +665,7 @@ async def _yd_prepare_files(
                 "incomplete": incomplete,
                 "incomplete_warning": incomplete_warning,
                 "confirmed": False,
-                "convert_mode": None,          # ← заполним в yd_sermon_mode
+                "convert_mode": None,
             })
 
         # Публикуем pending
@@ -524,7 +721,6 @@ async def _yd_prepare_files(
                 if item.get("convert_mode") is None:
                     item["convert_mode"] = "both"
             await _yd_convert_and_upload(
-                callback=callback,
                 bot=bot,
                 task_id=task_id,
                 status_msg=status_msg,
@@ -629,9 +825,9 @@ async def _yd_render_sermon_prompt(
       2. matches > 0, но одна пометка → 2 кнопки + Изменить + Отмена
       3. matches = 0 / notes не прочитаны → «Конвертировать всё» + Изменить + Отмена
 
-    ✅ Исправление бага №4: подсчёт и отображение диапазона ведётся
-    по item["ranges"] (если он есть), а не по схлопнутым start/end.
-    Для ввода вида "1,10" это даёт 2 слайда и текст "1, 10".
+    ✅ Подсчёт и отображение диапазона ведётся по item["ranges"],
+    а не по схлопнутым start/end. Для ввода вида "1,10" это даёт
+    2 слайда и текст "1, 10".
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -665,16 +861,18 @@ async def _yd_render_sermon_prompt(
     file_name = item.get("file_name", "")
     file_esc = html_module.escape(file_name)
 
-    # ✅ Общее количество слайдов — считаем из PPTX (без конвертации)
-    file_path = item.get("file_path")
-    total_slides = 0
-    if file_path and Path(file_path).exists():
-        try:
-            from pptx import Presentation
-            prs = Presentation(str(file_path))
-            total_slides = len(prs.slides._sldIdLst)
-        except Exception as e:
-            logging.warning(f"Не удалось определить число слайдов: {e}")
+    # ✅ total_slides посчитан в _yd_prepare_files, не читаем PPTX заново.
+    total_slides = item.get("total_slides", 0)
+    if total_slides == 0:
+        # Fallback для задач без кэша (не должно случаться на новом коде)
+        file_path = item.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(file_path))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(f"Не удалось определить число слайдов: {e}")
 
     kb = InlineKeyboardBuilder()
 
@@ -694,7 +892,7 @@ async def _yd_render_sermon_prompt(
     if has_valid_range:
         # --- Диапазон задан (автоматически или вручную) ---
 
-        # ✅ Баг №4: считаем sermon_count по ranges, если они есть.
+        # Считаем sermon_count по ranges, если они есть.
         if ranges:
             sermon_count = _count_slides_in_ranges(ranges, total_slides)
             ranges_text = _format_ranges_text(ranges, start, end)
@@ -969,10 +1167,15 @@ async def _yd_cleanup_task(
                                 f"[YD-CLEANUP] Снята клавиатура с сообщения {mid}"
                             )
                         except Exception as e:
-                            logging.debug(
-                                f"[YD-CLEANUP] Не удалось снять клавиатуру "
-                                f"с {mid}: {e}"
-                            )
+                            if "message is not modified" in str(e):
+                                logging.debug(
+                                    f"[YD-CLEANUP] {mid}: клавиатура уже снята"
+                                )
+                            else:
+                                logging.debug(
+                                    f"[YD-CLEANUP] Не удалось снять клавиатуру "
+                                    f"с {mid}: {e}"
+                                )
     except Exception as e:
         logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
@@ -1007,15 +1210,27 @@ async def _yd_cleanup_task(
     try:
         async with yd_session_lock:
             picker = sessions.get(session_key)
-            if picker is not None:
+            # ✅ Мутируем picker ТОЛЬКО если он относится к нашей задаче
+            # (nonce совпадает). Иначе это picker новой сессии, и его
+            # processing=True отражает реально идущий захват — сброс
+            # флага откроет гонку дубликатов.
+            if picker is not None and picker.get("nonce") == nonce:
                 picker["processing"] = False
                 task_ids = picker.get("task_ids")
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
-
-            current = sessions.get(session_key)
-            if current is not None and current.get("nonce") == nonce:
                 sessions.pop(session_key, None)
+            elif picker is not None:
+                # Picker чужой. Но если наш task_id как-то в него попал —
+                # убираем, чтобы не оставлять мусор. processing не трогаем.
+                task_ids = picker.get("task_ids")
+                if isinstance(task_ids, list) and task_id in task_ids:
+                    task_ids.remove(task_id)
+                    logging.warning(
+                        f"[YD-CLEANUP] task_id={task_id} оказался в чужом "
+                        f"picker'е (nonce={picker.get('nonce')!r}, "
+                        f"ожидался {nonce!r}) — удаляем"
+                    )
 
             sessions.pop(task_id, None)
             yd_active_tasks.discard(task_id)
@@ -1046,7 +1261,6 @@ async def _yd_cleanup_task(
 # ==========================================
 
 async def _yd_convert_and_upload(
-    callback: types.CallbackQuery,
     bot: Bot,
     task_id: str,
     status_msg,
@@ -1123,12 +1337,20 @@ async def _yd_convert_and_upload(
             file_name_esc = html_module.escape(file_name)
             file_slug = item["file_slug"]
 
+            # ✅ Пользователь пропустил файл вручную — не конвертируем.
+            if item.get("convert_mode") == "skip":
+                logging.info(f"[YD-UP] {file_name}: пропущен пользователем")
+                report_lines.append(f"⏭ {file_name_esc} — пропущен пользователем")
+                continue
+
             if item.get("failed_at_stage"):
                 stage = item["failed_at_stage"]
                 stage_text = {
-                    "download": "ошибка скачивания",
-                    "convert": "ошибка конвертации",
-                    "no_pngs": "нет PNG",
+                    "download":  "ошибка скачивания",
+                    "normalize": "ошибка подготовки .ppt → .pptx",
+                    "count":     "не удалось определить число слайдов",
+                    "convert":   "ошибка конвертации",
+                    "no_pngs":   "нет PNG",
                 }.get(stage, stage)
                 report_lines.append(f"❌ {file_name_esc} — {stage_text}")
                 total_failed += 1
@@ -1627,6 +1849,33 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         f"base_path={yandex_state.config.base_path!r}"
     )
 
+    # ✅ Не позволяем плодить параллельные задачи: если есть активные — отказ.
+    # Активной считаем сессию, у которой:
+    #   • processing=True (yd_pick выбрал файл, но _yd_prepare_files ещё
+    #     не успел зарегистрировать task_id в task_ids), ИЛИ
+    #   • есть живые task_ids (задача уже зарегистрирована).
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    async with yd_session_lock:
+        existing_picker = sessions.get(session_key)
+        if existing_picker is not None:
+            picker_processing = bool(existing_picker.get("processing"))
+            picker_has_live_task = any(
+                tid in sessions and not sessions[tid].get("cancelled")
+                for tid in existing_picker.get("task_ids", [])
+            )
+            is_active = picker_processing or picker_has_live_task
+        else:
+            is_active = False
+
+    if is_active:
+        await message.reply(
+            "⚠️ <b>У вас уже есть активная задача.</b>\n\n"
+            "Дождитесь её завершения или отмените командой /cancel_yd, "
+            "затем запустите /sunday снова.",
+            parse_mode="HTML",
+        )
+        return
+
     nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
     if nonce is None:
         await message.reply(
@@ -1755,26 +2004,52 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
+        race_detected = False
         async with yd_session_lock:
+            # ✅ Защитный путь: сюда не должны попасть из-за проверки
+            # в начале cmd_sunday. Если попали — это гонка, отказываемся
+            # перезаписывать активную сессию.
             old_picker = sessions.get(session_key)
             if old_picker is not None:
-                for old_tid in old_picker.get("task_ids", []):
-                    old_sess = sessions.get(old_tid)
-                    if old_sess is not None:
-                        old_sess["cancelled"] = True
+                old_processing = bool(old_picker.get("processing"))
+                old_has_tasks = bool(old_picker.get("task_ids"))
+                if old_processing or old_has_tasks:
+                    logging.warning(
+                        f"[YD] Race: active picker {session_key!r} "
+                        f"processing={old_processing}, "
+                        f"task_ids={old_picker.get('task_ids')!r}"
+                    )
+                    race_detected = True
+                else:
+                    sessions.pop(session_key, None)
 
-            sessions[session_key] = {
-                "user_id": message.from_user.id,
-                "chat_id": message.chat.id,
-                "sunday": sunday,
-                "sunday_str": sunday_str,
-                "paths": paths,
-                "files": pptx_files,
-                "nonce": nonce,
-                "created_at": time.time(),
-                "task_ids": [],
-                "cancelled": False,
-            }
+            if not race_detected:
+                sessions[session_key] = {
+                    "user_id": message.from_user.id,
+                    "chat_id": message.chat.id,
+                    "sunday": sunday,
+                    "sunday_str": sunday_str,
+                    "paths": paths,
+                    "files": pptx_files,
+                    "nonce": nonce,
+                    "created_at": time.time(),
+                    "task_ids": [],
+                    "cancelled": False,
+                    "processing": False,
+                }
+
+        if race_detected:
+            try:
+                await status_msg.edit_text(
+                    "⚠️ <b>Другая команда /sunday уже активна.</b>\n\n"
+                    "Дождитесь её завершения или отмените /cancel_yd.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await message.reply(
+                    "⚠️ Другая команда /sunday уже активна."
+                )
+            return
 
         kb = InlineKeyboardBuilder()
         for idx, f in enumerate(pptx_files):
@@ -1861,7 +2136,15 @@ async def yd_pick(
             await callback.answer("❌ Сессия неактивна.", show_alert=True)
             return
 
-        if session.get("processing"):
+        # ✅ Учитываем и processing (окно до регистрации), и уже зарегистрированные
+        # живые задачи (окно после регистрации, пока клавиатура ещё не заменена).
+        # Та же логика, что в cmd_sunday — единая семантика «активная сессия».
+        already_processing = bool(session.get("processing"))
+        has_live_task = any(
+            tid in sessions and not sessions[tid].get("cancelled")
+            for tid in session.get("task_ids", [])
+        )
+        if already_processing or has_live_task:
             await callback.answer("⏳ Обработка уже запущена.", show_alert=True)
             return
 
@@ -1885,22 +2168,55 @@ async def yd_pick(
                 await callback.answer("❌ Некорректный выбор.", show_alert=True)
                 return
 
-    if file_selector == "all":
-        await callback.answer("⏳ Обрабатываю все файлы...")
-    else:
-        await callback.answer("⏳ Начинаю обработку...")
+    # ✅ try/except вокруг запуска подготовки: если callback.answer()
+    # или _yd_prepare_files упадут до регистрации task_id — сбрасываем
+    # processing, иначе следующий /sunday навсегда упрётся в отказ.
+    try:
+        if file_selector == "all":
+            await callback.answer("⏳ Обрабатываю все файлы...")
+        else:
+            await callback.answer("⏳ Начинаю обработку...")
 
-    await _yd_prepare_files(
-        callback=callback,
-        bot=bot,
-        SHM_DIR=SHM_DIR,
-        user_mgr=user_mgr,
-        files_to_process=files_to_process,
-        sunday=sunday,
-        paths=paths,
-        session_key=session_key,
-        nonce=callback_nonce,
-    )
+        await _yd_prepare_files(
+            callback=callback,
+            bot=bot,
+            SHM_DIR=SHM_DIR,
+            user_mgr=user_mgr,
+            files_to_process=files_to_process,
+            sunday=sunday,
+            paths=paths,
+            session_key=session_key,
+            nonce=callback_nonce,
+        )
+    except Exception as e:
+        logging.error(
+            f"[YD-PICK] ошибка запуска подготовки: {e}",
+            exc_info=True,
+        )
+        # Сверяем nonce — если сессию уже заменили другой командой,
+        # не трогаем чужой пикер.
+        try:
+            async with yd_session_lock:
+                picker = sessions.get(session_key)
+                if (
+                    picker is not None
+                    and picker.get("nonce") == callback_nonce
+                ):
+                    picker["processing"] = False
+        except Exception as cleanup_err:
+            logging.error(
+                f"[YD-PICK] не удалось сбросить processing: {cleanup_err}",
+                exc_info=True,
+            )
+        try:
+            await callback.message.reply(
+                f"❌ Не удалось запустить обработку:\n"
+                f"<code>{html_module.escape(str(e)[:200])}</code>\n\n"
+                f"Запустите <code>/sunday</code> заново.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("yd_cancel:"))
@@ -2032,7 +2348,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         return
     pending = claimed
 
-    # ✅ ИСПРАВЛЕНО: было "prepаared" с кириллической 'а'
     item = pending["prepared"][idx]
 
     # Для режимов sermon / both — диапазон должен быть задан
@@ -2068,7 +2383,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
     # Все подтверждены — конвертируем и загружаем
     await _yd_convert_and_upload(
-        callback=callback,
         bot=bot,
         task_id=task_id,
         status_msg=callback.message,
@@ -2235,16 +2549,17 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     current = pending["prepared"][idx]
     file_name_esc = html_module.escape(current["file_name"])
 
-    # ✅ Считаем total_slides через PPTX (без конвертации)
-    file_path = current.get("file_path")
-    total_slides = 0
-    if file_path and Path(file_path).exists():
-        try:
-            from pptx import Presentation
-            prs = Presentation(str(file_path))
-            total_slides = len(prs.slides._sldIdLst)
-        except Exception as e:
-            logging.warning(f"Не удалось определить число слайдов: {e}")
+    # ✅ total_slides из кэша _yd_prepare_files
+    total_slides = current.get("total_slides", 0)
+    if total_slides == 0:
+        file_path = current.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(file_path))
+                total_slides = len(prs.slides._sldIdLst)
+            except Exception as e:
+                logging.warning(f"Не удалось определить число слайдов: {e}")
 
     # Контекст о найденных слайдах
     matches = current.get("matches", []) or []
