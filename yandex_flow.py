@@ -969,10 +969,10 @@ async def _yd_cleanup_task(
                                 f"[YD-CLEANUP] Снята клавиатура с сообщения {mid}"
                             )
                         except Exception as e:
-                            logging.debug(
-                                f"[YD-CLEANUP] Не удалось снять клавиатуру "
-                                f"с {mid}: {e}"
-                            )
+                            if "message is not modified" in str(e):
+                                logging.debug(f"[YD-CLEANUP] {mid}: клавиатура уже снята")
+                            else:
+                                logging.debug(f"[YD-CLEANUP] Не удалось снять клавиатуру с {mid}: {e}")
     except Exception as e:
         logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
@@ -1626,6 +1626,27 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         f"[YD] /sunday от user={message.from_user.id}, "
         f"base_path={yandex_state.config.base_path!r}"
     )
+
+    # ✅ Не позволяем плодить параллельные задачи: если есть активные — отказ.
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    async with yd_session_lock:
+        existing_picker = sessions.get(session_key)
+        if existing_picker is not None:
+            active_task_ids = [
+                tid for tid in existing_picker.get("task_ids", [])
+                if tid in sessions and not sessions[tid].get("cancelled")
+            ]
+        else:
+            active_task_ids = []
+
+    if active_task_ids:
+        await message.reply(
+            "⚠️ <b>У вас уже есть активная задача.</b>\n\n"
+            "Дождитесь её завершения или отмените командой /cancel_yd, "
+            "затем запустите /sunday снова.",
+            parse_mode="HTML",
+        )
+        return
 
     nonce = await yd_try_acquire(message.from_user.id, message.chat.id)
     if nonce is None:
