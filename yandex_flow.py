@@ -1,23 +1,25 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.3)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.6)
 # ==========================================
-# Изменения v3.3:
-#   • Race-condition fix: /sunday не плодит параллельные сессии
-#     даже в окне между yd_pick и _yd_prepare_files (processing=True)
-#   • Сверка nonce при регистрации task_id в _yd_prepare_files
-#   • yd_pick: try/except вокруг запуска подготовки + сброс processing
-#   • _yd_prepare_files: сброс processing сразу после регистрации task_id
+# Изменения v3.6:
+#   • Реестр _deferred_cleanup_tasks + drain_deferred_cleanups
+#     Вызывается из bot.py::main()::finally — папки задач на /dev/shm
+#     удаляются до закрытия event loop.
 # ==========================================
-# Изменения v3.2:
-#   • _count_slides_in_ranges (устранение NameError)
-#   • Исправлена опечатка pending["prepаared"] → pending["prepared"]
-#   • Укорочены task_id и nonce (лимит callback_data 64 байта)
-#   • Шапка с режимом конвертации в статус-сообщениях
-#   • Спиннер прогресса + корректная остановка при отмене
-#   • Нормализация .ppt → .pptx в prepare
-#   • Кэш total_slides + fallback через LibreOffice
-#   • Уникальная подпапка на каждый файл
-#   • "skip" режим для ручного пропуска файла
+# Изменения v3.5:
+#   • _active_ops — реестр in-flight thread-операций
+#   • _yd_run_protected / _yd_to_thread — защита от отмены
+#   • _yd_deferred_task_dir_cleanup — отложенное удаление task_dir
+#   • convert_all_pngs, create_zip_stream, extract_speaker_notes,
+#     ppt_to_pptx_crossplatform, librenormalize_to_pptx — обёрнуты
+# ==========================================
+# Изменения v3.4:
+#   • _picker_is_active — единая семантика активной сессии
+#   • session_key в sessions[task_id]
+#   • cancel немедленно убирает task_id из picker
+#   • yd_release вызывается сразу при отмене
+#   • worker_task: cancel + await перед release
+#   • _yd_cleanup_task мутирует picker только при совпадении nonce
 # ==========================================
 
 import asyncio
@@ -61,7 +63,6 @@ from converter_engine import (
     convert_all_pngs,
     create_zip_stream,
     ppt_to_pptx_crossplatform,
-    count_slides_via_libreoffice,
     librenormalize_to_pptx,
 )
 
@@ -199,6 +200,28 @@ def _count_slides_in_ranges(ranges, total_slides: int) -> int:
     return len(unique_slides)
 
 
+def _picker_is_active(picker: Optional[dict]) -> bool:
+    """
+    Пикер считается активным, если:
+      • processing=True (yd_pick выбрал файл, но _yd_prepare_files
+        ещё не зарегистрировал task_id), ИЛИ
+      • есть живые (не отменённые) задачи в task_ids.
+
+    Отменённые задачи (session["cancelled"]=True) игнорируются:
+    cleanup доведёт их до конца в фоне, но новый /sunday они
+    блокировать не должны.
+    """
+    if not picker:
+        return False
+    if picker.get("processing"):
+        return True
+    for tid in picker.get("task_ids", []):
+        task_sess = sessions.get(tid)
+        if task_sess is not None and not task_sess.get("cancelled"):
+            return True
+    return False
+
+
 # ==========================================
 # СПИННЕР ПРОГРЕССА
 # ==========================================
@@ -249,7 +272,6 @@ async def _yd_progress_spinner(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Telegram часто отдаёт "message is not modified" — это не ошибка
             logging.debug(f"[YD-SPINNER] edit_text: {e}")
 
         idx = (idx + 1) % len(dots)
@@ -258,10 +280,6 @@ async def _yd_progress_spinner(
 async def _yd_stop_spinner(task_id: str, wait_timeout: float = 2.0) -> None:
     """
     Останавливает активный спиннер задачи (если есть) и дожидается его выхода.
-
-    Вызывается:
-      - в finally у _yd_with_spinner (когда корутина сама завершилась);
-      - в yd_task_cancel_callback (до редактирования сообщения).
     """
     entry = _active_spinners.pop(task_id, None)
     if entry is None:
@@ -306,6 +324,106 @@ async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
 
 
 # ==========================================
+# ЗАЩИТА IN-FLIGHT ОПЕРАЦИЙ
+# ==========================================
+
+# Реестр in-flight операций задачи (thread/async ops, которые НЕ
+# должны обрываться на полпути). task_id -> set[asyncio.Task]
+_active_ops: dict[str, set[asyncio.Task]] = {}
+
+# Реестр отложенных cleanup-задач — нужен для drain при shutdown
+_deferred_cleanup_tasks: set[asyncio.Task] = set()
+
+
+async def _yd_run_protected(task_id: str, coro):
+    """
+    Запускает корутину как отдельный Task, регистрирует в _active_ops[task_id]
+    и защищает от внешней отмены через asyncio.shield.
+
+    Зачем: при worker.cancel() обёртка умирает, но underlying-операция
+    (особенно executor-поток внутри asyncio.to_thread) продолжает жить.
+    Cleanup должен дождаться её завершения ПЕРЕД удалением task_dir.
+    """
+    async def _runner():
+        try:
+            return await coro
+        finally:
+            bucket = _active_ops.get(task_id)
+            if bucket is not None:
+                bucket.discard(asyncio.current_task())
+                if not bucket:
+                    _active_ops.pop(task_id, None)
+
+    op_task = asyncio.create_task(_runner())
+    _active_ops.setdefault(task_id, set()).add(op_task)
+    # shield: внешняя отмена не убьёт op_task — cleanup дождётся его.
+    return await asyncio.shield(op_task)
+
+
+async def _yd_to_thread(task_id: str, fn, *args, **kwargs):
+    """asyncio.to_thread + регистрация в _active_ops."""
+    return await _yd_run_protected(
+        task_id, asyncio.to_thread(fn, *args, **kwargs)
+    )
+
+
+async def _yd_deferred_task_dir_cleanup(task_dir: Path, ops: list) -> None:
+    """
+    Фоновое удаление task_dir: ждём завершения in-flight ops, потом rmtree.
+    """
+    try:
+        await asyncio.gather(*ops, return_exceptions=True)
+    except Exception as e:
+        logging.debug(f"[YD-DEFERRED] gather: {e}")
+    try:
+        if task_dir and task_dir.exists():
+            shutil.rmtree(task_dir)
+            logging.info(f"🧹 [YD-DEFERRED] Удалена папка {task_dir} после ops")
+    except Exception as e:
+        logging.error(f"[YD-DEFERRED] ошибка удаления {task_dir}: {e}")
+
+
+def _spawn_deferred_cleanup(task_dir: Path, ops: list) -> None:
+    """
+    Создаёт deferred cleanup task и регистрирует его в _deferred_cleanup_tasks.
+    Использовать вместо голого asyncio.create_task — иначе задача потеряется
+    при shutdown.
+    """
+    task = asyncio.create_task(
+        _yd_deferred_task_dir_cleanup(task_dir, ops)
+    )
+    _deferred_cleanup_tasks.add(task)
+    task.add_done_callback(_deferred_cleanup_tasks.discard)
+
+
+async def drain_deferred_cleanups(timeout: float = 30.0) -> None:
+    """
+    Дожидается завершения всех отложенных cleanup-задач.
+    Вызывается из bot.py при shutdown, ДО закрытия session.
+
+    timeout — сколько ждать максимум, чтобы не блокировать выход,
+    если какой-то поток завис.
+    """
+    pending = [t for t in _deferred_cleanup_tasks if not t.done()]
+    if not pending:
+        return
+    logging.info(
+        f"[YD-DRAIN] Ожидаю {len(pending)} отложенных cleanup-задач..."
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=timeout,
+        )
+        logging.info("[YD-DRAIN] Все отложенные cleanup завершены")
+    except asyncio.TimeoutError:
+        logging.warning(
+            f"[YD-DRAIN] Не все cleanup завершились за {timeout}s — "
+            f"часть папок останется (cleaner подхватит при следующем запуске)"
+        )
+
+
+# ==========================================
 # ПАЙПЛАЙН ПОДГОТОВКИ (без конвертации)
 # ==========================================
 
@@ -330,17 +448,11 @@ async def _yd_prepare_files(
     owner_user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
-    # ✅ Укороченный task_id — не дублирует user_id (он есть в sessions).
-    # Укладывается в лимит callback_data 64 байта вместе с nonce и mode.
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
 
-    # ✅ Ранняя регистрация. Под локом — только in-memory операции:
-    # никаких await на Telegram, никаких файловых операций.
-    # Результат проверок сохраняем в переменные и реагируем уже
-    # ВНЕ лока, чтобы не блокировать других пользователей.
-    registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce" | "error"
-    registration_error: Optional[Exception] = None
+    # ✅ Ранняя регистрация. Под локом — только in-memory операции.
+    registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce"
 
     async with yd_session_lock:
         picker = sessions.get(session_key)
@@ -354,12 +466,12 @@ async def _yd_prepare_files(
             )
             registration_status = "wrong_nonce"
         else:
-            # Регистрируем задачу сразу — source of truth.
             picker.setdefault("task_ids", []).append(task_id)
             picker["processing"] = False
             sessions[task_id] = {
                 "user_id": owner_user_id,
                 "chat_id": chat_id,
+                "session_key": session_key,
                 "pending": None,
                 "nonce": nonce,
                 "created_at": time.time(),
@@ -379,7 +491,7 @@ async def _yd_prepare_files(
         )
         return
 
-    # ✅ mkdir ВНЕ лока. Если упадёт — снимаем флаг уже в except ниже.
+    # mkdir ВНЕ лока.
     try:
         task_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -387,7 +499,6 @@ async def _yd_prepare_files(
             f"[YD-PREP] mkdir упал для {task_id}: {e}",
             exc_info=True,
         )
-        # Откатываем регистрацию: убираем task_id из сессий.
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
@@ -409,12 +520,6 @@ async def _yd_prepare_files(
             f"<code>{html_module.escape(str(e)[:200])}</code>",
         )
         return
-
-    status_message_id = status_msg.message_id if status_msg is not None else None
-
-    logging.info(
-        f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
-    )
 
     status_message_id = status_msg.message_id if status_msg is not None else None
 
@@ -449,8 +554,7 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
-            # ✅ Уникальная подпапка на файл — чтобы .ppt и .pptx с одинаковым
-            # stem не перекрывали друг друга в общей task_dir.
+            # ✅ Уникальная подпапка на файл
             per_file_dir = task_dir / f"src_{f_idx}"
             per_file_dir.mkdir(exist_ok=True)
 
@@ -486,7 +590,6 @@ async def _yd_prepare_files(
                 f"размер={_format_size(local_pptx.stat().st_size)}"
             )
 
-            # Проверяем отмену после скачивания
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
                 logging.info(
@@ -499,11 +602,7 @@ async def _yd_prepare_files(
                 )
                 return
 
-            # ✅ Нормализация .ppt → .pptx (старые форматы).
-            # Делаем ОДИН РАЗ здесь — дальше работаем только с .pptx:
-            #   • заметки читаются python-pptx (не понимает .ppt);
-            #   • total_slides считается через Presentation();
-            #   • конвертация PNG тоже пойдёт по .pptx.
+            # ✅ Нормализация .ppt → .pptx (через _yd_to_thread).
             if local_pptx.suffix.lower() == ".ppt":
                 base_norm_text = f"🔧 Готовлю .ppt → .pptx: <code>{file_name_esc}</code>"
                 await _safe_edit(
@@ -517,8 +616,10 @@ async def _yd_prepare_files(
                         status_msg,
                         task_id,
                         base_norm_text,
-                        asyncio.to_thread(
-                            ppt_to_pptx_crossplatform, local_pptx, per_file_dir
+                        _yd_to_thread(
+                            task_id,
+                            ppt_to_pptx_crossplatform,
+                            local_pptx, per_file_dir,
                         ),
                     )
                 except Exception as e:
@@ -546,7 +647,6 @@ async def _yd_prepare_files(
             else:
                 normalized_pptx = local_pptx
 
-            # Проверяем отмену после нормализации
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
                 logging.info(
@@ -559,9 +659,7 @@ async def _yd_prepare_files(
                 )
                 return
 
-            # ✅ Считаем total_slides. Если python-pptx не открывает файл —
-            # пробуем нормализовать его через LibreOffice в валидный .pptx,
-            # чтобы и подсчёт, и последующий make_dark_mode работали.
+            # ✅ Считаем total_slides.
             total_slides = None
             try:
                 from pptx import Presentation
@@ -573,10 +671,9 @@ async def _yd_prepare_files(
                 )
 
             if not total_slides:
-                # Fallback: нормализуем файл через LibreOffice и заново
-                # открываем уже нормализованный результат.
-                renorm_result = await asyncio.to_thread(
-                    librenormalize_to_pptx, normalized_pptx, per_file_dir
+                renorm_result = await _yd_to_thread(
+                    task_id,
+                    librenormalize_to_pptx, normalized_pptx, per_file_dir,
                 )
                 if renorm_result is None:
                     logging.error(
@@ -606,7 +703,7 @@ async def _yd_prepare_files(
                 })
                 continue
 
-            # ✅ Читаем заметки из нормализованного .pptx
+            # ✅ Читаем заметки (через _yd_to_thread).
             await _safe_edit(
                 status_msg,
                 f"🔍 Читаю заметки докладчика: <code>{file_name_esc}</code>...",
@@ -614,11 +711,10 @@ async def _yd_prepare_files(
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
 
-            notes_ok, notes, incomplete = await asyncio.to_thread(
-                extract_speaker_notes, str(normalized_pptx)
+            notes_ok, notes, incomplete = await _yd_to_thread(
+                task_id, extract_speaker_notes, str(normalized_pptx)
             )
 
-            # Определяем проповедь по ключевым словам из конфига
             if not notes_ok:
                 start, end, matches = None, None, []
                 incomplete_warning = (
@@ -631,11 +727,9 @@ async def _yd_prepare_files(
                     "проповедь не определена автоматически."
                 )
             else:
-                # ✅ Передаём ВЕСЬ список ключевых слов
                 keywords = yandex_state.config.sermon_keywords or [
                     yandex_state.config.sermon_keyword
                 ]
-
                 start, end, matches = find_sermon_range(notes, keywords)
                 if matches and len(matches) == 1:
                     start, end = None, None
@@ -649,13 +743,10 @@ async def _yd_prepare_files(
 
             item_ranges = [(start, end)] if start is not None else None
 
-            # ✅ НЕ конвертируем пока. PNG создадим после подтверждения режима.
             prepared.append({
                 "file_name": file_name,
                 "file_slug": safe_folder_name(file_name),
-                # ✅ Всегда нормализованный .pptx (для .ppt — конвертированный)
                 "file_path": normalized_pptx,
-                # ✅ Кэш количества слайдов — переиспользуется в промптах
                 "total_slides": total_slides,
                 "start": start,
                 "end": end,
@@ -716,7 +807,6 @@ async def _yd_prepare_files(
         )
 
         if not needs_confirm:
-            # Нет файлов для подтверждения — сразу в конвертацию с режимом both
             for item in prepared:
                 if item.get("convert_mode") is None:
                     item["convert_mode"] = "both"
@@ -819,15 +909,6 @@ async def _yd_render_sermon_prompt(
 ) -> None:
     """
     Единая точка отрисовки промпта подтверждения проповеди.
-
-    Три варианта:
-      1. has_valid_range = True → 3 кнопки режимов + Изменить + Отмена
-      2. matches > 0, но одна пометка → 2 кнопки + Изменить + Отмена
-      3. matches = 0 / notes не прочитаны → «Конвертировать всё» + Изменить + Отмена
-
-    ✅ Подсчёт и отображение диапазона ведётся по item["ranges"],
-    а не по схлопнутым start/end. Для ввода вида "1,10" это даёт
-    2 слайда и текст "1, 10".
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -850,7 +931,6 @@ async def _yd_render_sermon_prompt(
     pending["prompt_idx"] = idx
 
     if pending.get("prompt_nonce") is None:
-        # ✅ Укороченный nonce (8 hex) — вписывается в лимит callback_data
         pending["prompt_nonce"] = secrets.token_hex(4)
     prompt_nonce = pending["prompt_nonce"]
 
@@ -861,10 +941,8 @@ async def _yd_render_sermon_prompt(
     file_name = item.get("file_name", "")
     file_esc = html_module.escape(file_name)
 
-    # ✅ total_slides посчитан в _yd_prepare_files, не читаем PPTX заново.
     total_slides = item.get("total_slides", 0)
     if total_slides == 0:
-        # Fallback для задач без кэша (не должно случаться на новом коде)
         file_path = item.get("file_path")
         if file_path and Path(file_path).exists():
             try:
@@ -890,9 +968,6 @@ async def _yd_render_sermon_prompt(
     )
 
     if has_valid_range:
-        # --- Диапазон задан (автоматически или вручную) ---
-
-        # Считаем sermon_count по ranges, если они есть.
         if ranges:
             sermon_count = _count_slides_in_ranges(ranges, total_slides)
             ranges_text = _format_ranges_text(ranges, start, end)
@@ -905,7 +980,6 @@ async def _yd_render_sermon_prompt(
         manual_range = item.get("manual_range", False)
 
         if manual_range:
-            # Ручной ввод — не говорим «найдена пометка»
             text = (
                 f"🎯 <b>Диапазон проповеди установлен</b>\n\n"
                 f"📄 Файл: <code>{file_esc}</code>\n"
@@ -914,7 +988,6 @@ async def _yd_render_sermon_prompt(
                 f"❓ <b>Какие слайды конвертировать?</b>"
             )
         else:
-            # Автоматический поиск — показываем пометки
             preview = ", ".join(str(n) for n in matches[:15])
             if len(matches) > 15:
                 preview += f" …и ещё {len(matches) - 15}"
@@ -958,7 +1031,6 @@ async def _yd_render_sermon_prompt(
             ),
         )
     else:
-        # Проповедь не найдена — предлагаем только «конвертировать всё»
         notes_ok = item.get("notes_ok", True)
         incomplete = item.get("incomplete", False)
 
@@ -1007,7 +1079,6 @@ async def _yd_render_sermon_prompt(
             ),
         )
 
-    # Общая кнопка отмены для всех вариантов
     kb.row(
         InlineKeyboardButton(
             text="❌ Отменить задачу",
@@ -1180,12 +1251,21 @@ async def _yd_cleanup_task(
         logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
     # Папка задачи
-    try:
-        if task_dir and task_dir.exists():
-            shutil.rmtree(task_dir)
-            logging.info(f"🧹 Удалена папка задачи: {task_dir}")
-    except Exception as e:
-        logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
+    in_flight_ops = _active_ops.get(task_id)
+    if in_flight_ops:
+        ops_snapshot = list(in_flight_ops)
+        logging.info(
+            f"[YD-CLEANUP] {len(ops_snapshot)} in-flight ops для {task_id} — "
+            f"откладываем удаление task_dir"
+        )
+        _spawn_deferred_cleanup(task_dir, ops_snapshot)
+    else:
+        try:
+            if task_dir and task_dir.exists():
+                shutil.rmtree(task_dir)
+                logging.info(f"🧹 Удалена папка задачи: {task_dir}")
+        except Exception as e:
+            logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
 
     # Watchdog
     try:
@@ -1210,10 +1290,6 @@ async def _yd_cleanup_task(
     try:
         async with yd_session_lock:
             picker = sessions.get(session_key)
-            # ✅ Мутируем picker ТОЛЬКО если он относится к нашей задаче
-            # (nonce совпадает). Иначе это picker новой сессии, и его
-            # processing=True отражает реально идущий захват — сброс
-            # флага откроет гонку дубликатов.
             if picker is not None and picker.get("nonce") == nonce:
                 picker["processing"] = False
                 task_ids = picker.get("task_ids")
@@ -1221,8 +1297,6 @@ async def _yd_cleanup_task(
                     task_ids.remove(task_id)
                 sessions.pop(session_key, None)
             elif picker is not None:
-                # Picker чужой. Но если наш task_id как-то в него попал —
-                # убираем, чтобы не оставлять мусор. processing не трогаем.
                 task_ids = picker.get("task_ids")
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
@@ -1295,6 +1369,10 @@ async def _yd_convert_and_upload(
     if not isinstance(pending, dict):
         return
 
+    # ✅ Регистрируем worker task для отмены из yd_task_cancel_callback.
+    worker_task = asyncio.current_task()
+    session["worker_task"] = worker_task
+
     prepared = pending["prepared"]
     target_base = pending["target_base"]
     task_dir = pending["task_dir"]
@@ -1304,7 +1382,6 @@ async def _yd_convert_and_upload(
     nonce = pending["nonce"]
     quality = pending.get("quality", "2k")
 
-    # Обновляем status_message_id
     if status_msg is not None and hasattr(status_msg, "message_id"):
         pending["status_message_id"] = status_msg.message_id
 
@@ -1337,7 +1414,6 @@ async def _yd_convert_and_upload(
             file_name_esc = html_module.escape(file_name)
             file_slug = item["file_slug"]
 
-            # ✅ Пользователь пропустил файл вручную — не конвертируем.
             if item.get("convert_mode") == "skip":
                 logging.info(f"[YD-UP] {file_name}: пропущен пользователем")
                 report_lines.append(f"⏭ {file_name_esc} — пропущен пользователем")
@@ -1356,7 +1432,6 @@ async def _yd_convert_and_upload(
                 total_failed += 1
                 continue
 
-            # Путь к PPTX (скачан в _yd_prepare_files)
             file_path = item.get("file_path")
             if not file_path or not Path(file_path).exists():
                 logging.error(f"[YD-UP] {file_name}: PPTX не найден ({file_path})")
@@ -1375,7 +1450,6 @@ async def _yd_convert_and_upload(
                 f"convert_mode={convert_mode}, ranges={ranges}"
             )
 
-            # ✅ Шапка статус-сообщения: что именно делает бот
             mode_label = _mode_label(convert_mode)
             ranges_str = _format_ranges_text(ranges, start, end)
 
@@ -1388,7 +1462,6 @@ async def _yd_convert_and_upload(
             header_lines.append("")
             header = "\n".join(header_lines)
 
-            # === Конвертация PNG ===
             base_convert_text = f"{header}\n⚙️ Конвертирую в PNG"
 
             await _safe_edit(
@@ -1401,12 +1474,18 @@ async def _yd_convert_and_upload(
             temp_png_dir = task_dir / f"png_{f_idx}"
             temp_png_dir.mkdir(exist_ok=True)
 
+            # ✅ convert_all_pngs через _yd_run_protected
             try:
                 pngs, used_pptx = await _yd_with_spinner(
                     status_msg,
                     task_id,
                     base_convert_text,
-                    convert_all_pngs(Path(file_path), temp_png_dir, quality),
+                    _yd_run_protected(
+                        task_id,
+                        convert_all_pngs(
+                            Path(file_path), temp_png_dir, quality
+                        ),
+                    ),
                 )
             except Exception as e:
                 logging.error(
@@ -1429,7 +1508,6 @@ async def _yd_convert_and_upload(
                 logging.info(f"[YD-UP] Отмена после конвертации {file_name}")
                 return
 
-            # === Разделение PNG на sermon / others ===
             sermon_pngs = []
             other_pngs = []
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
@@ -1440,7 +1518,6 @@ async def _yd_convert_and_upload(
 
             ranges_text = ranges_str
 
-            # === Создаём целевые папки на Диске ===
             pptx2png_dir = (
                 f"{target_base}/{yandex_state.config.pptx2png_folder}/{file_slug}"
             )
@@ -1484,8 +1561,9 @@ async def _yd_convert_and_upload(
                 sermon_zip_path = zip_tmp_dir / sermon_zip_name
 
                 try:
-                    await asyncio.to_thread(
-                        create_zip_stream, sermon_pngs, sermon_zip_path
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, sermon_pngs, sermon_zip_path,
                     )
                 except Exception as e:
                     logging.error(
@@ -1568,8 +1646,9 @@ async def _yd_convert_and_upload(
                 other_zip_path = zip_tmp_dir / other_zip_name
 
                 try:
-                    await asyncio.to_thread(
-                        create_zip_stream, other_pngs, other_zip_path
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, other_pngs, other_zip_path,
                     )
                 except Exception as e:
                     logging.error(
@@ -1647,7 +1726,6 @@ async def _yd_convert_and_upload(
                 for png in other_pngs:
                     _safe_unlink(png)
 
-            # Если режим не включал ни одной папки — фиксируем
             if not sermon_info and not other_info:
                 if convert_mode == "sermon" and not sermon_pngs:
                     other_info = "ℹ️ Проповедь не найдена в этом файле"
@@ -1656,7 +1734,6 @@ async def _yd_convert_and_upload(
                 else:
                     other_info = "ℹ️ Нет слайдов для конвертации"
 
-            # Формируем запись отчёта
             entry_lines = [f"{f_idx}. 📄 <b>{file_name_esc}</b>"]
             if sermon_info:
                 entry_lines.append(f"   • {sermon_info}")
@@ -1670,7 +1747,6 @@ async def _yd_convert_and_upload(
             logging.info(f"[YD-UP] Отмена перед отправкой отчёта")
             return
 
-        # Итог
         if total_failed > 0:
             report_lines.append(
                 f"\n⚠️ Всего загружено архивов: <b>{total_uploaded_zip}</b>\n"
@@ -1693,7 +1769,6 @@ async def _yd_convert_and_upload(
                     f'{html_module.escape(folder_name)}/</a>'
                 )
 
-        # Снимаем клавиатуру — работа завершена
         try:
             await status_msg.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -1723,6 +1798,14 @@ async def _yd_convert_and_upload(
         )
         return
     finally:
+        # ✅ Снимаем регистрацию worker'а
+        try:
+            sess = sessions.get(task_id)
+            if sess is not None and sess.get("worker_task") is worker_task:
+                sess["worker_task"] = None
+        except Exception:
+            pass
+
         if zip_tmp_dir is not None and zip_tmp_dir.exists():
             try:
                 shutil.rmtree(zip_tmp_dir)
@@ -1849,23 +1932,10 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         f"base_path={yandex_state.config.base_path!r}"
     )
 
-    # ✅ Не позволяем плодить параллельные задачи: если есть активные — отказ.
-    # Активной считаем сессию, у которой:
-    #   • processing=True (yd_pick выбрал файл, но _yd_prepare_files ещё
-    #     не успел зарегистрировать task_id в task_ids), ИЛИ
-    #   • есть живые task_ids (задача уже зарегистрирована).
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     async with yd_session_lock:
         existing_picker = sessions.get(session_key)
-        if existing_picker is not None:
-            picker_processing = bool(existing_picker.get("processing"))
-            picker_has_live_task = any(
-                tid in sessions and not sessions[tid].get("cancelled")
-                for tid in existing_picker.get("task_ids", [])
-            )
-            is_active = picker_processing or picker_has_live_task
-        else:
-            is_active = False
+        is_active = _picker_is_active(existing_picker)
 
     if is_active:
         await message.reply(
@@ -2006,22 +2076,16 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         race_detected = False
         async with yd_session_lock:
-            # ✅ Защитный путь: сюда не должны попасть из-за проверки
-            # в начале cmd_sunday. Если попали — это гонка, отказываемся
-            # перезаписывать активную сессию.
             old_picker = sessions.get(session_key)
-            if old_picker is not None:
-                old_processing = bool(old_picker.get("processing"))
-                old_has_tasks = bool(old_picker.get("task_ids"))
-                if old_processing or old_has_tasks:
-                    logging.warning(
-                        f"[YD] Race: active picker {session_key!r} "
-                        f"processing={old_processing}, "
-                        f"task_ids={old_picker.get('task_ids')!r}"
-                    )
-                    race_detected = True
-                else:
-                    sessions.pop(session_key, None)
+            if _picker_is_active(old_picker):
+                logging.warning(
+                    f"[YD] Race: active picker {session_key!r} "
+                    f"processing={old_picker.get('processing')}, "
+                    f"task_ids={old_picker.get('task_ids')!r}"
+                )
+                race_detected = True
+            elif old_picker is not None:
+                sessions.pop(session_key, None)
 
             if not race_detected:
                 sessions[session_key] = {
@@ -2136,15 +2200,7 @@ async def yd_pick(
             await callback.answer("❌ Сессия неактивна.", show_alert=True)
             return
 
-        # ✅ Учитываем и processing (окно до регистрации), и уже зарегистрированные
-        # живые задачи (окно после регистрации, пока клавиатура ещё не заменена).
-        # Та же логика, что в cmd_sunday — единая семантика «активная сессия».
-        already_processing = bool(session.get("processing"))
-        has_live_task = any(
-            tid in sessions and not sessions[tid].get("cancelled")
-            for tid in session.get("task_ids", [])
-        )
-        if already_processing or has_live_task:
+        if _picker_is_active(session):
             await callback.answer("⏳ Обработка уже запущена.", show_alert=True)
             return
 
@@ -2168,9 +2224,6 @@ async def yd_pick(
                 await callback.answer("❌ Некорректный выбор.", show_alert=True)
                 return
 
-    # ✅ try/except вокруг запуска подготовки: если callback.answer()
-    # или _yd_prepare_files упадут до регистрации task_id — сбрасываем
-    # processing, иначе следующий /sunday навсегда упрётся в отказ.
     try:
         if file_selector == "all":
             await callback.answer("⏳ Обрабатываю все файлы...")
@@ -2193,8 +2246,6 @@ async def yd_pick(
             f"[YD-PICK] ошибка запуска подготовки: {e}",
             exc_info=True,
         )
-        # Сверяем nonce — если сессию уже заменили другой командой,
-        # не трогаем чужой пикер.
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
@@ -2309,17 +2360,12 @@ async def cmd_cancel_yd(message: types.Message, check_access):
 
 
 # ==========================================
-# НОВЫЙ ХЕНДЛЕР: выбор режима конвертации
+# ВЫБОР РЕЖИМА КОНВЕРТАЦИИ
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_sermon_mode:"))
 async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
-    """
-    Пользователь выбрал режим конвертации:
-      - sermon → только проповедь
-      - other  → только остальные
-      - both   → оба ZIP раздельно
-    """
+    """Пользователь выбрал режим конвертации."""
     parts = callback.data.split(":")
     if len(parts) != 5:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
@@ -2350,7 +2396,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
     item = pending["prepared"][idx]
 
-    # Для режимов sermon / both — диапазон должен быть задан
     if mode in ("sermon", "both") and (
         item.get("start") is None or item.get("end") is None
     ):
@@ -2358,7 +2403,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
             "❌ Диапазон не задан. Укажите его вручную.",
             show_alert=True,
         )
-        # Перерисовываем промпт, чтобы пользователь мог выбрать снова
         await _yd_render_sermon_prompt(task_id, item, callback.message)
         return
 
@@ -2370,18 +2414,15 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
     except Exception:
         pass
 
-    # Проверяем, остались ли неподтверждённые файлы
     remaining = [
         p for p in pending["prepared"]
         if "file_path" in p and not p.get("confirmed")
     ]
 
     if remaining:
-        # Показываем промпт для следующего файла
         await _yd_render_sermon_prompt(task_id, remaining[0], callback.message)
         return
 
-    # Все подтверждены — конвертируем и загружаем
     await _yd_convert_and_upload(
         bot=bot,
         task_id=task_id,
@@ -2390,20 +2431,12 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
 
 # ==========================================
-# НОВЫЙ ХЕНДЛЕР: отмена текущей задачи
+# ОТМЕНА ТЕКУЩЕЙ ЗАДАЧИ
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_task_cancel:"))
 async def yd_task_cancel_callback(callback: types.CallbackQuery):
-    """
-    Отмена текущей Yandex-задачи.
-
-    Работает на любой стадии:
-      - До старта (pending=None) → ставим cancelled, задача отменится
-        на ближайшей проверке.
-      - На промпте → cleanup сразу.
-      - На стадии upload → текущий шаг доводится до конца, потом cleanup.
-    """
+    """Отмена текущей Yandex-задачи."""
     parts = callback.data.split(":")
     if len(parts) != 2:
         await callback.answer("❌ Некорректный запрос.", show_alert=True)
@@ -2438,13 +2471,66 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
     # ✅ Ставим cancelled=True ВСЕГДА
     session["cancelled"] = True
 
-    # ✅ ГЛАВНОЕ: останавливаем активный спиннер ДО любых edit_text,
-    # иначе следующий tick перезапишет сообщение об отмене.
+    # ✅ Немедленно убираем task_id из picker.task_ids
+    session_key_for_task = session.get("session_key")
+    if session_key_for_task:
+        async with yd_session_lock:
+            picker = sessions.get(session_key_for_task)
+            if picker is not None:
+                task_ids = picker.get("task_ids")
+                if isinstance(task_ids, list) and task_id in task_ids:
+                    task_ids.remove(task_id)
+
+    # ✅ Отменяем и дожидаемся worker'а ПЕРЕД yd_release.
+    worker = session.get("worker_task")
+    current_task = asyncio.current_task()
+    if worker is not None and not worker.done() and worker is not current_task:
+        logging.info(
+            f"[YD-TASK-CANCEL] Отменяем worker {task_id} перед yd_release"
+        )
+        try:
+            worker.cancel()
+        except Exception as e:
+            logging.debug(f"[YD-TASK-CANCEL] worker.cancel: {e}")
+        try:
+            await asyncio.wait_for(worker, timeout=15.0)
+            logging.info(
+                f"[YD-TASK-CANCEL] worker {task_id} завершён"
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                f"[YD-TASK-CANCEL] worker {task_id} не завершился за 15s — "
+                f"продолжаем, но in-flight upload может продолжиться в фоне"
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.debug(f"[YD-TASK-CANCEL] await worker: {e}")
+
+    # ✅ Освобождаем низкоуровневый session-lock.
+    owner_chat_id = session.get("chat_id")
+    owner_nonce = session.get("nonce")
+    if owner_chat_id is not None and owner_nonce:
+        try:
+            released = await yd_release(
+                owner_user_id, owner_chat_id, owner_nonce
+            )
+            logging.info(
+                f"[YD-TASK-CANCEL] yd_release для {task_id}: "
+                f"released={released}"
+            )
+        except Exception as e:
+            logging.error(
+                f"[YD-TASK-CANCEL] yd_release упал для {task_id}: {e}",
+                exc_info=True,
+            )
+
+    # ✅ Останавливаем спиннер ДО edit_text
     await _yd_stop_spinner(task_id)
 
     pending = session.get("pending")
 
-    # Случай 1: pending ещё не создан (подготовка не завершена)
+    # Случай 1: pending ещё не создан
     if not isinstance(pending, dict):
         logging.info(
             f"[YD-TASK-CANCEL] Задача {task_id!r} отменена на стадии подготовки"
@@ -2521,7 +2607,7 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
 
 
 # ==========================================
-# ИЗМЕНЕНИЕ ДИАПАЗОНА ПРОПОВЕДИ (ручной ввод)
+# ИЗМЕНЕНИЕ ДИАПАЗОНА ПРОПОВЕДИ
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_sermon_edit:"))
@@ -2543,13 +2629,11 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     idx = int(parts[2])
-    # ✅ Укороченный nonce (8 hex) — вписывается в лимит callback_data
     manual_nonce = secrets.token_hex(4)
 
     current = pending["prepared"][idx]
     file_name_esc = html_module.escape(current["file_name"])
 
-    # ✅ total_slides из кэша _yd_prepare_files
     total_slides = current.get("total_slides", 0)
     if total_slides == 0:
         file_path = current.get("file_path")
@@ -2561,7 +2645,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             except Exception as e:
                 logging.warning(f"Не удалось определить число слайдов: {e}")
 
-    # Контекст о найденных слайдах
     matches = current.get("matches", []) or []
     start = current.get("start")
     end = current.get("end")
@@ -2669,7 +2752,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
 
 # ==========================================
-# ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handlers.py
+# ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handlers.py И bot.py
 # ==========================================
 
 render_sermon_prompt = _yd_render_sermon_prompt
@@ -2678,3 +2761,4 @@ cleanup_task = _yd_cleanup_task
 is_sermon_slide = _is_sermon_slide
 claim_prompt = _yd_claim_prompt
 prompt_timeout_watchdog = _yd_prompt_timeout_watchdog
+drain_deferred_cleanups_async = drain_deferred_cleanups
