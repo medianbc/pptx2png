@@ -1,5 +1,14 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.6)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.7)
+# ==========================================
+# Изменения v3.7 (исправления по code review Qodo):
+#   • Bug #1: yd_task_cancel_callback не освобождает picker,
+#     если в нём остались живые sibling-задачи.
+#   • Bug #2: worker_task регистрируется сразу в _yd_prepare_files
+#     (не только в _yd_convert_and_upload). Отмена на стадии
+#     подготовки корректно отменяет/ожидает coroutine до cleanup.
+#   • Bug #3: asyncio.wait_for(asyncio.shield(worker)) — таймаут
+#     не инжектит повторную отмену в cleanup worker'а.
 # ==========================================
 # Изменения v3.6:
 #   • Реестр _deferred_cleanup_tasks + drain_deferred_cleanups
@@ -216,6 +225,26 @@ def _picker_is_active(picker: Optional[dict]) -> bool:
     if picker.get("processing"):
         return True
     for tid in picker.get("task_ids", []):
+        task_sess = sessions.get(tid)
+        if task_sess is not None and not task_sess.get("cancelled"):
+            return True
+    return False
+
+
+def _picker_has_live_tasks(picker_key: str, exclude_task_id: Optional[str] = None) -> bool:
+    """
+    Проверяет, есть ли у picker'а живые (не отменённые) задачи,
+    кроме exclude_task_id.
+
+    Используется при отмене одной задачи, чтобы не освобождать
+    yd_release, пока живы sibling-задачи (Bug #1).
+    """
+    picker = sessions.get(picker_key)
+    if picker is None:
+        return False
+    for tid in picker.get("task_ids", []):
+        if tid == exclude_task_id:
+            continue
         task_sess = sessions.get(tid)
         if task_sess is not None and not task_sess.get("cancelled"):
             return True
@@ -451,6 +480,10 @@ async def _yd_prepare_files(
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
 
+    # ✅ Bug #2: регистрируем worker_task СРАЗУ, чтобы yd_task_cancel_callback
+    # мог корректно отменить/дождаться preparation на любой стадии.
+    worker_task = asyncio.current_task()
+
     # ✅ Ранняя регистрация. Под локом — только in-memory операции.
     registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce"
 
@@ -476,6 +509,8 @@ async def _yd_prepare_files(
                 "nonce": nonce,
                 "created_at": time.time(),
                 "cancelled": False,
+                # ✅ Bug #2: регистрируем worker сразу.
+                "worker_task": worker_task,
             }
             yd_active_tasks.add(task_id)
 
@@ -527,6 +562,7 @@ async def _yd_prepare_files(
         f"[YD-PREP] Старт: task_id={task_id}, файлов={len(files_to_process)}"
     )
 
+    cleanup_done = False
     try:
         target_base = paths["target"]
         quality = user_mgr.get_user_config(owner_user_id)["quality"]
@@ -539,6 +575,7 @@ async def _yd_prepare_files(
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
                 logging.info(f"[YD-PREP] Задача {task_id} отменена — прерываем подготовку")
+                cleanup_done = True
                 await _yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
@@ -596,6 +633,7 @@ async def _yd_prepare_files(
                     f"[YD-PREP] Задача {task_id} отменена после скачивания "
                     f"{file_name} — прерываем"
                 )
+                cleanup_done = True
                 await _yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
@@ -653,6 +691,7 @@ async def _yd_prepare_files(
                     f"[YD-PREP] Задача {task_id} отменена после нормализации "
                     f"{file_name} — прерываем"
                 )
+                cleanup_done = True
                 await _yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
@@ -790,6 +829,7 @@ async def _yd_prepare_files(
 
         if cleanup_needed:
             logging.info(f"[YD-PREP] Задача {task_id} отменена до сохранения pending")
+            cleanup_done = True
             await _yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
@@ -810,6 +850,8 @@ async def _yd_prepare_files(
             for item in prepared:
                 if item.get("convert_mode") is None:
                     item["convert_mode"] = "both"
+            # ✅ Bug #2: _yd_convert_and_upload сам зарегистрирует worker
+            # (by identity), а наша регистрация будет сброшена в finally.
             await _yd_convert_and_upload(
                 bot=bot,
                 task_id=task_id,
@@ -824,13 +866,43 @@ async def _yd_prepare_files(
             needs_confirm=needs_confirm,
         )
 
+    except asyncio.CancelledError:
+        # ✅ Bug #2/#3: worker отменён внешне (yd_task_cancel_callback).
+        # Cleanup делаем здесь, чтобы гарантировать удаление session/task_dir.
+        logging.info(
+            f"[YD-PREP] Worker {task_id} отменён — выполняю cleanup"
+        )
+        cleanup_done = True
+        try:
+            await _yd_cleanup_task(
+                task_id, session_key, task_dir,
+                owner_user_id, chat_id, nonce,
+            )
+        except Exception as e:
+            logging.error(
+                f"[YD-PREP] cleanup после отмены упал: {e}", exc_info=True
+            )
+        raise
+
     except Exception as e:
         logging.error(f"[YD-PREP] Ошибка: {e}", exc_info=True)
+        cleanup_done = True
         await _yd_cleanup_task(
             task_id, session_key, task_dir,
             owner_user_id, chat_id, nonce,
             bot=bot, status_msg=status_msg, error=e,
         )
+
+    finally:
+        # ✅ Bug #2: снимаем регистрацию worker'а по identity.
+        # Если _yd_convert_and_upload уже перерегистрировал worker —
+        # не трогаем его регистрацию.
+        try:
+            sess = sessions.get(task_id)
+            if sess is not None and sess.get("worker_task") is worker_task:
+                sess["worker_task"] = None
+        except Exception:
+            pass
 
 
 async def _yd_ask_sermon_confirmation(
@@ -1369,7 +1441,9 @@ async def _yd_convert_and_upload(
     if not isinstance(pending, dict):
         return
 
-    # ✅ Регистрируем worker task для отмены из yd_task_cancel_callback.
+    # ✅ Bug #2: перерегистрируем worker_task по identity.
+    # Предыдущая регистрация (от _yd_prepare_files) будет сброшена в её finally,
+    # если она ещё не сброшена — здесь мы просто перезаписываем на текущий task.
     worker_task = asyncio.current_task()
     session["worker_task"] = worker_task
 
@@ -1788,6 +1862,24 @@ async def _yd_convert_and_upload(
             f"slides={total_slides_packed}, failed={total_failed}"
         )
 
+    except asyncio.CancelledError:
+        # ✅ Bug #3: worker отменён внешне (yd_task_cancel_callback
+        # или пользователь через /cancel_yd). Делаем cleanup сами.
+        logging.info(
+            f"[YD-UP] Worker {task_id} отменён — выполняю cleanup"
+        )
+        cleanup_done = True
+        try:
+            await _yd_cleanup_task(
+                task_id, session_key, task_dir,
+                owner_user_id, chat_id, nonce,
+            )
+        except Exception as e:
+            logging.error(
+                f"[YD-UP] cleanup после отмены упал: {e}", exc_info=True
+            )
+        raise
+
     except Exception as e:
         logging.error(f"[YD-UP] Ошибка: {e}", exc_info=True)
         cleanup_done = True
@@ -1798,7 +1890,7 @@ async def _yd_convert_and_upload(
         )
         return
     finally:
-        # ✅ Снимаем регистрацию worker'а
+        # ✅ Bug #2: снимаем регистрацию worker'а по identity.
         try:
             sess = sessions.get(task_id)
             if sess is not None and sess.get("worker_task") is worker_task:
@@ -2481,7 +2573,10 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
 
-    # ✅ Отменяем и дожидаемся worker'а ПЕРЕД yd_release.
+    # ✅ Bug #2: отменяем и дожидаемся worker'а (может быть как preparation,
+    # так и conversion) ПЕРЕД yd_release.
+    # ✅ Bug #3: используем asyncio.shield, чтобы таймаут wait_for не
+    # инжектил повторную отмену в cleanup worker'а.
     worker = session.get("worker_task")
     current_task = asyncio.current_task()
     if worker is not None and not worker.done() and worker is not current_task:
@@ -2493,44 +2588,59 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         except Exception as e:
             logging.debug(f"[YD-TASK-CANCEL] worker.cancel: {e}")
         try:
-            await asyncio.wait_for(worker, timeout=15.0)
+            # ✅ Bug #3: shield защищает worker от повторной отмены
+            # при таймауте ожидания.
+            await asyncio.wait_for(asyncio.shield(worker), timeout=15.0)
             logging.info(
                 f"[YD-TASK-CANCEL] worker {task_id} завершён"
             )
         except asyncio.TimeoutError:
             logging.warning(
                 f"[YD-TASK-CANCEL] worker {task_id} не завершился за 15s — "
-                f"продолжаем, но in-flight upload может продолжиться в фоне"
+                f"продолжаем, но in-flight upload может продолжиться в фоне "
+                f"(worker завершит cleanup сам)"
             )
         except asyncio.CancelledError:
+            # worker уже был отменён — это ожидаемое поведение
             pass
         except Exception as e:
             logging.debug(f"[YD-TASK-CANCEL] await worker: {e}")
 
-    # ✅ Освобождаем низкоуровневый session-lock.
+    # ✅ Bug #1: освобождаем yd_release, только если не осталось живых
+    # sibling-задач в том же picker'е.
     owner_chat_id = session.get("chat_id")
     owner_nonce = session.get("nonce")
     if owner_chat_id is not None and owner_nonce:
-        try:
-            released = await yd_release(
-                owner_user_id, owner_chat_id, owner_nonce
-            )
+        picker_key = f"yd_{owner_user_id}_{owner_chat_id}"
+        has_live_siblings = _picker_has_live_tasks(picker_key, exclude_task_id=task_id)
+        if has_live_siblings:
             logging.info(
-                f"[YD-TASK-CANCEL] yd_release для {task_id}: "
-                f"released={released}"
+                f"[YD-TASK-CANCEL] Не освобождаем picker {picker_key}: "
+                f"остались живые sibling-задачи"
             )
-        except Exception as e:
-            logging.error(
-                f"[YD-TASK-CANCEL] yd_release упал для {task_id}: {e}",
-                exc_info=True,
-            )
+        else:
+            try:
+                released = await yd_release(
+                    owner_user_id, owner_chat_id, owner_nonce
+                )
+                logging.info(
+                    f"[YD-TASK-CANCEL] yd_release для {task_id}: "
+                    f"released={released}"
+                )
+            except Exception as e:
+                logging.error(
+                    f"[YD-TASK-CANCEL] yd_release упал для {task_id}: {e}",
+                    exc_info=True,
+                )
 
     # ✅ Останавливаем спиннер ДО edit_text
     await _yd_stop_spinner(task_id)
 
     pending = session.get("pending")
 
-    # Случай 1: pending ещё не создан
+    # Случай 1: pending ещё не создан (отмена на стадии подготовки)
+    # ✅ Bug #2: worker уже отменён и дождался выше; _yd_prepare_files
+    # в своём CancelledError-блоке сам вызовет _yd_cleanup_task.
     if not isinstance(pending, dict):
         logging.info(
             f"[YD-TASK-CANCEL] Задача {task_id!r} отменена на стадии подготовки"
