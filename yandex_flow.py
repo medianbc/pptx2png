@@ -1,34 +1,31 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.7)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.8)
 # ==========================================
-# Изменения v3.7 (исправления по code review Qodo):
+# Изменения v3.8 (второй раунд аудита — сверх фиксов Qodo):
+#   • _cleaning_tasks — идемпотентность _yd_cleanup_task
+#   • _deferred_dirs — защита от двойного deferred cleanup
+#   • _yd_async_protected — защита сетевых корутин Яндекса
+#     (download_file, upload_file, ensure_folder) от внешней отмены
+#   • cleanup в except CancelledError обёрнут в shield
+#   • yd_release обёрнут в shield
+#   • /cancel_yd корректно отменяет и дожидается worker'ов
+#   • _picker_has_live_tasks вызывается под локом вместе с release
+#   • _yd_stop_spinner вызывается ДО worker.cancel()
+#   • yd_sermon_edit дожидается отмены старого watchdog
+#   • _active_ops очищается в _yd_cleanup_task
+# ==========================================
+# Изменения v3.7 (фиксы code review Qodo):
 #   • Bug #1: yd_task_cancel_callback не освобождает picker,
-#     если в нём остались живые sibling-задачи.
-#   • Bug #2: worker_task регистрируется сразу в _yd_prepare_files
-#     (не только в _yd_convert_and_upload). Отмена на стадии
-#     подготовки корректно отменяет/ожидает coroutine до cleanup.
-#   • Bug #3: asyncio.wait_for(asyncio.shield(worker)) — таймаут
-#     не инжектит повторную отмену в cleanup worker'а.
+#     если остались живые sibling-задачи.
+#   • Bug #2: worker_task регистрируется сразу в _yd_prepare_files.
+#   • Bug #3: wait_for(shield(worker)) — таймаут не инжектит повторную
+#     отмену в cleanup worker'а.
 # ==========================================
 # Изменения v3.6:
 #   • Реестр _deferred_cleanup_tasks + drain_deferred_cleanups
-#     Вызывается из bot.py::main()::finally — папки задач на /dev/shm
-#     удаляются до закрытия event loop.
 # ==========================================
 # Изменения v3.5:
-#   • _active_ops — реестр in-flight thread-операций
-#   • _yd_run_protected / _yd_to_thread — защита от отмены
-#   • _yd_deferred_task_dir_cleanup — отложенное удаление task_dir
-#   • convert_all_pngs, create_zip_stream, extract_speaker_notes,
-#     ppt_to_pptx_crossplatform, librenormalize_to_pptx — обёрнуты
-# ==========================================
-# Изменения v3.4:
-#   • _picker_is_active — единая семантика активной сессии
-#   • session_key в sessions[task_id]
-#   • cancel немедленно убирает task_id из picker
-#   • yd_release вызывается сразу при отмене
-#   • worker_task: cancel + await перед release
-#   • _yd_cleanup_task мутирует picker только при совпадении nonce
+#   • _active_ops, _yd_run_protected / _yd_to_thread
 # ==========================================
 
 import asyncio
@@ -186,16 +183,7 @@ def _count_slides_for_range(start, end, total):
 
 
 def _count_slides_in_ranges(ranges, total_slides: int) -> int:
-    """
-    Считает количество УНИКАЛЬНЫХ слайдов, попадающих в объединение диапазонов.
-
-    ranges: список кортежей (start, end) или None
-    total_slides: общее количество слайдов (для клиппинга)
-
-    Пример:
-        ranges=[(1,1),(10,10)], total=20 → 2
-        ranges=[(1,5),(3,8)],   total=20 → 8  (пересечение не двоится)
-    """
+    """Считает количество УНИКАЛЬНЫХ слайдов в объединении диапазонов."""
     if not ranges or total_slides <= 0:
         return 0
 
@@ -211,14 +199,7 @@ def _count_slides_in_ranges(ranges, total_slides: int) -> int:
 
 def _picker_is_active(picker: Optional[dict]) -> bool:
     """
-    Пикер считается активным, если:
-      • processing=True (yd_pick выбрал файл, но _yd_prepare_files
-        ещё не зарегистрировал task_id), ИЛИ
-      • есть живые (не отменённые) задачи в task_ids.
-
-    Отменённые задачи (session["cancelled"]=True) игнорируются:
-    cleanup доведёт их до конца в фоне, но новый /sunday они
-    блокировать не должны.
+    Пикер активен, если processing=True ИЛИ есть живые (не отменённые) задачи.
     """
     if not picker:
         return False
@@ -231,13 +212,12 @@ def _picker_is_active(picker: Optional[dict]) -> bool:
     return False
 
 
-def _picker_has_live_tasks(picker_key: str, exclude_task_id: Optional[str] = None) -> bool:
+def _picker_has_live_tasks_locked(
+    picker_key: str,
+    exclude_task_id: Optional[str] = None,
+) -> bool:
     """
-    Проверяет, есть ли у picker'а живые (не отменённые) задачи,
-    кроме exclude_task_id.
-
-    Используется при отмене одной задачи, чтобы не освобождать
-    yd_release, пока живы sibling-задачи (Bug #1).
+    Проверяет наличие живых sibling-задач. ДОЛЖНА вызываться под yd_session_lock.
     """
     picker = sessions.get(picker_key)
     if picker is None:
@@ -266,7 +246,6 @@ _active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 
 
 def _mode_label(mode: str) -> str:
-    """Человекочитаемая метка выбранного режима конвертации."""
     if mode == "skip":
         return "⏭ Пропущено"
     return _MODE_LABELS.get(mode, f"❓ {mode}")
@@ -285,7 +264,7 @@ async def _yd_progress_spinner(
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            return  # stop_event установлен
+            return
         except asyncio.TimeoutError:
             pass
 
@@ -307,29 +286,26 @@ async def _yd_progress_spinner(
 
 
 async def _yd_stop_spinner(task_id: str, wait_timeout: float = 2.0) -> None:
-    """
-    Останавливает активный спиннер задачи (если есть) и дожидается его выхода.
-    """
+    """Останавливает активный спиннер задачи (если есть) и дожидается его выхода."""
     entry = _active_spinners.pop(task_id, None)
     if entry is None:
         return
     stop_event, spinner_task = entry
     stop_event.set()
     try:
-        await asyncio.wait_for(spinner_task, timeout=wait_timeout)
+        await asyncio.wait_for(asyncio.shield(spinner_task), timeout=wait_timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         spinner_task.cancel()
         try:
             await spinner_task
         except (asyncio.CancelledError, Exception):
             pass
+    except Exception as e:
+        logging.debug(f"[YD-SPINNER] stop: {e}")
 
 
 async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
-    """
-    Запускает корутину `coro`, параллельно анимируя статусное сообщение.
-    Гарантированно останавливает спиннер и возвращает результат coro.
-    """
+    """Запускает корутину, параллельно анимируя статусное сообщение."""
     stop_event = asyncio.Event()
     spinner_task = asyncio.create_task(
         _yd_progress_spinner(status_msg, task_id, base_text, stop_event)
@@ -343,25 +319,32 @@ async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
             _active_spinners.pop(task_id, None)
         stop_event.set()
         try:
-            await asyncio.wait_for(spinner_task, timeout=2.0)
+            await asyncio.wait_for(asyncio.shield(spinner_task), timeout=2.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             spinner_task.cancel()
             try:
                 await spinner_task
             except (asyncio.CancelledError, Exception):
                 pass
+        except Exception as e:
+            logging.debug(f"[YD-SPINNER] finalize: {e}")
 
 
 # ==========================================
 # ЗАЩИТА IN-FLIGHT ОПЕРАЦИЙ
 # ==========================================
 
-# Реестр in-flight операций задачи (thread/async ops, которые НЕ
-# должны обрываться на полпути). task_id -> set[asyncio.Task]
+# Реестр in-flight операций задачи: task_id -> set[asyncio.Task]
 _active_ops: dict[str, set[asyncio.Task]] = {}
 
-# Реестр отложенных cleanup-задач — нужен для drain при shutdown
+# Реестр отложенных cleanup-задач — для drain при shutdown
 _deferred_cleanup_tasks: set[asyncio.Task] = set()
+
+# Реестр папок в очереди на deferred cleanup — защита от дублирования
+_deferred_dirs: set[Path] = set()
+
+# Реестр задач, для которых сейчас выполняется _yd_cleanup_task
+_cleaning_tasks: set[str] = set()
 
 
 async def _yd_run_protected(task_id: str, coro):
@@ -369,9 +352,7 @@ async def _yd_run_protected(task_id: str, coro):
     Запускает корутину как отдельный Task, регистрирует в _active_ops[task_id]
     и защищает от внешней отмены через asyncio.shield.
 
-    Зачем: при worker.cancel() обёртка умирает, но underlying-операция
-    (особенно executor-поток внутри asyncio.to_thread) продолжает жить.
-    Cleanup должен дождаться её завершения ПЕРЕД удалением task_dir.
+    Используется для CPU/IO-операций (to_thread, download/upload).
     """
     async def _runner():
         try:
@@ -385,7 +366,6 @@ async def _yd_run_protected(task_id: str, coro):
 
     op_task = asyncio.create_task(_runner())
     _active_ops.setdefault(task_id, set()).add(op_task)
-    # shield: внешняя отмена не убьёт op_task — cleanup дождётся его.
     return await asyncio.shield(op_task)
 
 
@@ -396,10 +376,33 @@ async def _yd_to_thread(task_id: str, fn, *args, **kwargs):
     )
 
 
+async def _yd_async_protected(task_id: str, coro):
+    """
+    Защита сетевых корутин Яндекса (download_file, upload_file, ensure_folder)
+    от внешней отмены через _active_ops + shield.
+
+    Это отдельная обёртка, семантически идентичная _yd_run_protected,
+    но используемая для нативных async-операций — чтобы явно отделить
+    «сетевые» от «thread» в логах и в будущем можно было добавлять
+    специфичную логику (например, retry).
+    """
+    async def _runner():
+        try:
+            return await coro
+        finally:
+            bucket = _active_ops.get(task_id)
+            if bucket is not None:
+                bucket.discard(asyncio.current_task())
+                if not bucket:
+                    _active_ops.pop(task_id, None)
+
+    op_task = asyncio.create_task(_runner())
+    _active_ops.setdefault(task_id, set()).add(op_task)
+    return await asyncio.shield(op_task)
+
+
 async def _yd_deferred_task_dir_cleanup(task_dir: Path, ops: list) -> None:
-    """
-    Фоновое удаление task_dir: ждём завершения in-flight ops, потом rmtree.
-    """
+    """Фоновое удаление task_dir: ждём завершения in-flight ops, потом rmtree."""
     try:
         await asyncio.gather(*ops, return_exceptions=True)
     except Exception as e:
@@ -414,25 +417,31 @@ async def _yd_deferred_task_dir_cleanup(task_dir: Path, ops: list) -> None:
 
 def _spawn_deferred_cleanup(task_dir: Path, ops: list) -> None:
     """
-    Создаёт deferred cleanup task и регистрирует его в _deferred_cleanup_tasks.
-    Использовать вместо голого asyncio.create_task — иначе задача потеряется
-    при shutdown.
+    Создаёт deferred cleanup task с защитой от дублирования по папке.
     """
+    if task_dir is None:
+        return
+    if task_dir in _deferred_dirs:
+        logging.info(
+            f"[YD-DEFERRED] {task_dir} уже в очереди на deferred cleanup — skip"
+        )
+        return
+    _deferred_dirs.add(task_dir)
+
     task = asyncio.create_task(
         _yd_deferred_task_dir_cleanup(task_dir, ops)
     )
     _deferred_cleanup_tasks.add(task)
-    task.add_done_callback(_deferred_cleanup_tasks.discard)
+
+    def _done(t: asyncio.Task):
+        _deferred_cleanup_tasks.discard(t)
+        _deferred_dirs.discard(task_dir)
+
+    task.add_done_callback(_done)
 
 
 async def drain_deferred_cleanups(timeout: float = 30.0) -> None:
-    """
-    Дожидается завершения всех отложенных cleanup-задач.
-    Вызывается из bot.py при shutdown, ДО закрытия session.
-
-    timeout — сколько ждать максимум, чтобы не блокировать выход,
-    если какой-то поток завис.
-    """
+    """Дожидается завершения всех отложенных cleanup-задач."""
     pending = [t for t in _deferred_cleanup_tasks if not t.done()]
     if not pending:
         return
@@ -469,8 +478,6 @@ async def _yd_prepare_files(
 ):
     """
     Первая фаза: скачивание + извлечение заметок + определение проповеди.
-    БЕЗ конвертации в PNG — она будет позже, после подтверждения режима.
-
     Сохраняет результат в sessions[task_id]["pending"].
     """
     status_msg = callback.message
@@ -480,12 +487,10 @@ async def _yd_prepare_files(
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
 
-    # ✅ Bug #2: регистрируем worker_task СРАЗУ, чтобы yd_task_cancel_callback
-    # мог корректно отменить/дождаться preparation на любой стадии.
+    # ✅ Bug #2 (v3.7): регистрируем worker_task сразу.
     worker_task = asyncio.current_task()
 
-    # ✅ Ранняя регистрация. Под локом — только in-memory операции.
-    registration_status = "ok"  # "ok" | "no_picker" | "wrong_nonce"
+    registration_status = "ok"
 
     async with yd_session_lock:
         picker = sessions.get(session_key)
@@ -509,7 +514,6 @@ async def _yd_prepare_files(
                 "nonce": nonce,
                 "created_at": time.time(),
                 "cancelled": False,
-                # ✅ Bug #2: регистрируем worker сразу.
                 "worker_task": worker_task,
             }
             yd_active_tasks.add(task_id)
@@ -526,7 +530,6 @@ async def _yd_prepare_files(
         )
         return
 
-    # mkdir ВНЕ лока.
     try:
         task_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -574,12 +577,14 @@ async def _yd_prepare_files(
 
             task_sess = sessions.get(task_id)
             if task_sess is None or task_sess.get("cancelled"):
-                logging.info(f"[YD-PREP] Задача {task_id} отменена — прерываем подготовку")
+                logging.info(
+                    f"[YD-PREP] Задача {task_id} отменена — прерываем подготовку"
+                )
                 cleanup_done = True
-                await _yd_cleanup_task(
+                await asyncio.shield(_yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
-                )
+                ))
                 return
 
             file_name = pptx_item["name"]
@@ -591,11 +596,9 @@ async def _yd_prepare_files(
                 f"{file_name!r} ({_format_size(file_size)})"
             )
 
-            # ✅ Уникальная подпапка на файл
             per_file_dir = task_dir / f"src_{f_idx}"
             per_file_dir.mkdir(exist_ok=True)
 
-            # Скачивание с кнопкой отмены + спиннером
             base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
                 status_msg,
@@ -605,12 +608,16 @@ async def _yd_prepare_files(
             )
 
             local_pptx = per_file_dir / file_name
+            # ✅ v3.8: сетевая операция защищена _yd_async_protected
             ok = await _yd_with_spinner(
                 status_msg,
                 task_id,
                 base_dl_text,
-                yandex_state.config.client.download_file(
-                    pptx_item["path"], local_pptx
+                _yd_async_protected(
+                    task_id,
+                    yandex_state.config.client.download_file(
+                        pptx_item["path"], local_pptx
+                    ),
                 ),
             )
             if not ok:
@@ -634,15 +641,16 @@ async def _yd_prepare_files(
                     f"{file_name} — прерываем"
                 )
                 cleanup_done = True
-                await _yd_cleanup_task(
+                await asyncio.shield(_yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
-                )
+                ))
                 return
 
-            # ✅ Нормализация .ppt → .pptx (через _yd_to_thread).
             if local_pptx.suffix.lower() == ".ppt":
-                base_norm_text = f"🔧 Готовлю .ppt → .pptx: <code>{file_name_esc}</code>"
+                base_norm_text = (
+                    f"🔧 Готовлю .ppt → .pptx: <code>{file_name_esc}</code>"
+                )
                 await _safe_edit(
                     status_msg,
                     base_norm_text,
@@ -692,13 +700,12 @@ async def _yd_prepare_files(
                     f"{file_name} — прерываем"
                 )
                 cleanup_done = True
-                await _yd_cleanup_task(
+                await asyncio.shield(_yd_cleanup_task(
                     task_id, session_key, task_dir,
                     owner_user_id, chat_id, nonce,
-                )
+                ))
                 return
 
-            # ✅ Считаем total_slides.
             total_slides = None
             try:
                 from pptx import Presentation
@@ -742,7 +749,6 @@ async def _yd_prepare_files(
                 })
                 continue
 
-            # ✅ Читаем заметки (через _yd_to_thread).
             await _safe_edit(
                 status_msg,
                 f"🔍 Читаю заметки докладчика: <code>{file_name_esc}</code>...",
@@ -798,7 +804,6 @@ async def _yd_prepare_files(
                 "convert_mode": None,
             })
 
-        # Публикуем pending
         cleanup_needed = False
         async with yd_session_lock:
             picker = sessions.get(session_key)
@@ -828,12 +833,14 @@ async def _yd_prepare_files(
                     }
 
         if cleanup_needed:
-            logging.info(f"[YD-PREP] Задача {task_id} отменена до сохранения pending")
+            logging.info(
+                f"[YD-PREP] Задача {task_id} отменена до сохранения pending"
+            )
             cleanup_done = True
-            await _yd_cleanup_task(
+            await asyncio.shield(_yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
-            )
+            ))
             return
 
         needs_confirm = [
@@ -850,8 +857,6 @@ async def _yd_prepare_files(
             for item in prepared:
                 if item.get("convert_mode") is None:
                     item["convert_mode"] = "both"
-            # ✅ Bug #2: _yd_convert_and_upload сам зарегистрирует worker
-            # (by identity), а наша регистрация будет сброшена в finally.
             await _yd_convert_and_upload(
                 bot=bot,
                 task_id=task_id,
@@ -867,17 +872,17 @@ async def _yd_prepare_files(
         )
 
     except asyncio.CancelledError:
-        # ✅ Bug #2/#3: worker отменён внешне (yd_task_cancel_callback).
-        # Cleanup делаем здесь, чтобы гарантировать удаление session/task_dir.
+        # ✅ v3.8: cleanup обёрнут в shield — иначе повторная отмена
+        # (например, из /cancel_yd) прервёт очистку на середине.
         logging.info(
             f"[YD-PREP] Worker {task_id} отменён — выполняю cleanup"
         )
         cleanup_done = True
         try:
-            await _yd_cleanup_task(
+            await asyncio.shield(_yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
-            )
+            ))
         except Exception as e:
             logging.error(
                 f"[YD-PREP] cleanup после отмены упал: {e}", exc_info=True
@@ -894,9 +899,6 @@ async def _yd_prepare_files(
         )
 
     finally:
-        # ✅ Bug #2: снимаем регистрацию worker'а по identity.
-        # Если _yd_convert_and_upload уже перерегистрировал worker —
-        # не трогаем его регистрацию.
         try:
             sess = sessions.get(task_id)
             if sess is not None and sess.get("worker_task") is worker_task:
@@ -979,9 +981,7 @@ async def _yd_render_sermon_prompt(
     status_msg,
     reply_fn=None,
 ) -> None:
-    """
-    Единая точка отрисовки промпта подтверждения проповеди.
-    """
+    """Единая точка отрисовки промпта подтверждения проповеди."""
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
@@ -1124,9 +1124,7 @@ async def _yd_render_sermon_prompt(
                 f"Для одной пометки авто-диапазон не строится."
             )
         else:
-            reason = (
-                "В заметках докладчика нет слова «проповедь»."
-            )
+            reason = "В заметках докладчика нет слова «проповедь»."
 
         text = (
             f"🤔 <b>Автоматически определить проповедь не удалось</b>\n\n"
@@ -1160,13 +1158,18 @@ async def _yd_render_sermon_prompt(
 
     sent_msg = None
     if reply_fn is not None:
-        sent_msg = await reply_fn(text, parse_mode="HTML", reply_markup=kb.as_markup())
+        sent_msg = await reply_fn(
+            text, parse_mode="HTML", reply_markup=kb.as_markup()
+        )
     elif status_msg is not None:
-        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
+        await status_msg.edit_text(
+            text, parse_mode="HTML", reply_markup=kb.as_markup()
+        )
         sent_msg = status_msg
     else:
         logging.warning(
-            f"_yd_render_sermon_prompt: нет ни reply_fn, ни status_msg для {task_id}"
+            f"_yd_render_sermon_prompt: нет ни reply_fn, ни status_msg "
+            f"для {task_id}"
         )
         return
 
@@ -1197,7 +1200,9 @@ async def _yd_render_sermon_prompt(
     pending["prompt_watchdog_nonce"] = prompt_nonce
 
 
-async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_nonce: str):
+async def _yd_prompt_timeout_watchdog(
+    task_id: str, timeout_sec: int, expected_nonce: str
+):
     """Если пользователь не ответил на промпт — уведомляем и очищаем."""
     try:
         await asyncio.sleep(timeout_sec)
@@ -1219,7 +1224,8 @@ async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_n
         prompt_message_id = pending.get("prompt_message_id")
 
         logging.info(
-            f"[YD-PROMPT] ⏰ Промпт {task_id} не подтверждён за {timeout_sec}s — очистка"
+            f"[YD-PROMPT] ⏰ Промпт {task_id} не подтверждён за {timeout_sec}s "
+            f"— очистка"
         )
 
         if bot is not None and chat_id is not None:
@@ -1247,10 +1253,11 @@ async def _yd_prompt_timeout_watchdog(task_id: str, timeout_sec: int, expected_n
             except Exception:
                 pass
 
-        await _yd_cleanup_task(
+        # ✅ v3.8: cleanup под shield, чтобы внешняя отмена не прервала
+        await asyncio.shield(_yd_cleanup_task(
             task_id, session_key, task_dir,
             owner_user_id, chat_id, nonce,
-        )
+        ))
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -1272,134 +1279,157 @@ async def _yd_cleanup_task(
     status_msg=None,
     error: Optional[Exception] = None,
 ):
-    """Идемпотентная очистка."""
-    logging.info(
-        f"[YD-CLEANUP] task_id={task_id}, session_key={session_key!r}, "
-        f"reason={'error' if error else 'normal'}"
-    )
-
-    # ✅ Гарантируем, что спиннер мёртв до редактирования сообщения
-    try:
-        await _yd_stop_spinner(task_id)
-    except Exception as e:
-        logging.debug(f"[YD-CLEANUP] _yd_stop_spinner: {e}")
-
-    # Снимаем клавиатуру со всех сообщений задачи
-    try:
-        session = sessions.get(task_id)
-        if session is not None:
-            pending = session.get("pending")
-            if isinstance(pending, dict):
-                task_bot = pending.get("bot")
-                task_chat_id = pending.get("chat_id")
-                if task_bot is not None and task_chat_id is not None:
-                    message_ids = []
-                    for key in ("prompt_message_id", "status_message_id"):
-                        mid = pending.get(key)
-                        if mid is not None and mid not in message_ids:
-                            message_ids.append(mid)
-
-                    for mid in message_ids:
-                        try:
-                            await task_bot.edit_message_reply_markup(
-                                chat_id=task_chat_id,
-                                message_id=mid,
-                                reply_markup=None,
-                            )
-                            logging.debug(
-                                f"[YD-CLEANUP] Снята клавиатура с сообщения {mid}"
-                            )
-                        except Exception as e:
-                            if "message is not modified" in str(e):
-                                logging.debug(
-                                    f"[YD-CLEANUP] {mid}: клавиатура уже снята"
-                                )
-                            else:
-                                logging.debug(
-                                    f"[YD-CLEANUP] Не удалось снять клавиатуру "
-                                    f"с {mid}: {e}"
-                                )
-    except Exception as e:
-        logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
-
-    # Папка задачи
-    in_flight_ops = _active_ops.get(task_id)
-    if in_flight_ops:
-        ops_snapshot = list(in_flight_ops)
-        logging.info(
-            f"[YD-CLEANUP] {len(ops_snapshot)} in-flight ops для {task_id} — "
-            f"откладываем удаление task_dir"
-        )
-        _spawn_deferred_cleanup(task_dir, ops_snapshot)
-    else:
-        try:
-            if task_dir and task_dir.exists():
-                shutil.rmtree(task_dir)
-                logging.info(f"🧹 Удалена папка задачи: {task_dir}")
-        except Exception as e:
-            logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
-
-    # Watchdog
-    try:
-        session = sessions.get(task_id)
-        if session is not None:
-            pending = session.get("pending")
-            if isinstance(pending, dict):
-                timeout_task = pending.get("prompt_timeout_task")
-                current_task = asyncio.current_task()
-                if (
-                    timeout_task is not None
-                    and not timeout_task.done()
-                    and timeout_task is not current_task
-                ):
-                    timeout_task.cancel()
-                pending["prompt_timeout_task"] = None
-                pending["prompt_watchdog_nonce"] = None
-    except Exception as e:
-        logging.error(f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True)
-
-    # Сессии
-    try:
-        async with yd_session_lock:
-            picker = sessions.get(session_key)
-            if picker is not None and picker.get("nonce") == nonce:
-                picker["processing"] = False
-                task_ids = picker.get("task_ids")
-                if isinstance(task_ids, list) and task_id in task_ids:
-                    task_ids.remove(task_id)
-                sessions.pop(session_key, None)
-            elif picker is not None:
-                task_ids = picker.get("task_ids")
-                if isinstance(task_ids, list) and task_id in task_ids:
-                    task_ids.remove(task_id)
-                    logging.warning(
-                        f"[YD-CLEANUP] task_id={task_id} оказался в чужом "
-                        f"picker'е (nonce={picker.get('nonce')!r}, "
-                        f"ожидался {nonce!r}) — удаляем"
-                    )
-
-            sessions.pop(task_id, None)
-            yd_active_tasks.discard(task_id)
-    except Exception as e:
-        logging.error(f"Ошибка очистки сессий для {task_id}: {e}", exc_info=True)
-
-    # yd_release
-    try:
-        await yd_release(owner_user_id, chat_id, nonce)
-    except Exception as e:
-        logging.error(f"Ошибка yd_release для {task_id}: {e}", exc_info=True)
-
-    # Сообщение об ошибке
-    if error is not None and bot is not None and status_msg is not None:
-        try:
-            await status_msg.edit_text(
-                f"❌ <b>Ошибка обработки</b>\n\n"
-                f"<code>{html_module.escape(str(error)[:200])}</code>\n\n"
-                f"Временные файлы удалены. Попробуйте снова.",
-                parse_mode="HTML",
+    """Идемпотентная очистка. Защищена реестром _cleaning_tasks."""
+    # ✅ v3.8: идемпотентность — если уже чистим, не дублируем
+    async with yd_session_lock:
+        if task_id in _cleaning_tasks:
+            logging.info(
+                f"[YD-CLEANUP] task_id={task_id} уже в процессе очистки — skip"
             )
+            return
+        _cleaning_tasks.add(task_id)
+
+    try:
+        logging.info(
+            f"[YD-CLEANUP] task_id={task_id}, session_key={session_key!r}, "
+            f"reason={'error' if error else 'normal'}"
+        )
+
+        try:
+            await _yd_stop_spinner(task_id)
         except Exception as e:
-            logging.error(f"Ошибка отправки сообщения для {task_id}: {e}")
+            logging.debug(f"[YD-CLEANUP] _yd_stop_spinner: {e}")
+
+        # Снимаем клавиатуру со всех сообщений задачи
+        try:
+            session = sessions.get(task_id)
+            if session is not None:
+                pending = session.get("pending")
+                if isinstance(pending, dict):
+                    task_bot = pending.get("bot")
+                    task_chat_id = pending.get("chat_id")
+                    if task_bot is not None and task_chat_id is not None:
+                        message_ids = []
+                        for key in ("prompt_message_id", "status_message_id"):
+                            mid = pending.get(key)
+                            if mid is not None and mid not in message_ids:
+                                message_ids.append(mid)
+
+                        for mid in message_ids:
+                            try:
+                                await task_bot.edit_message_reply_markup(
+                                    chat_id=task_chat_id,
+                                    message_id=mid,
+                                    reply_markup=None,
+                                )
+                                logging.debug(
+                                    f"[YD-CLEANUP] Снята клавиатура с сообщения {mid}"
+                                )
+                            except Exception as e:
+                                if "message is not modified" in str(e):
+                                    logging.debug(
+                                        f"[YD-CLEANUP] {mid}: клавиатура уже снята"
+                                    )
+                                else:
+                                    logging.debug(
+                                        f"[YD-CLEANUP] Не удалось снять "
+                                        f"клавиатуру с {mid}: {e}"
+                                    )
+        except Exception as e:
+            logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
+
+        # Папка задачи
+        in_flight_ops = _active_ops.get(task_id)
+        if in_flight_ops:
+            ops_snapshot = list(in_flight_ops)
+            logging.info(
+                f"[YD-CLEANUP] {len(ops_snapshot)} in-flight ops для {task_id} — "
+                f"откладываем удаление task_dir"
+            )
+            _spawn_deferred_cleanup(task_dir, ops_snapshot)
+        else:
+            try:
+                if task_dir and task_dir.exists():
+                    shutil.rmtree(task_dir)
+                    logging.info(f"🧹 Удалена папка задачи: {task_dir}")
+            except Exception as e:
+                logging.error(f"Ошибка удаления task_dir {task_dir}: {e}")
+
+        # Watchdog
+        try:
+            session = sessions.get(task_id)
+            if session is not None:
+                pending = session.get("pending")
+                if isinstance(pending, dict):
+                    timeout_task = pending.get("prompt_timeout_task")
+                    current_task = asyncio.current_task()
+                    if (
+                        timeout_task is not None
+                        and not timeout_task.done()
+                        and timeout_task is not current_task
+                    ):
+                        timeout_task.cancel()
+                    pending["prompt_timeout_task"] = None
+                    pending["prompt_watchdog_nonce"] = None
+        except Exception as e:
+            logging.error(
+                f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True
+            )
+
+        # Сессии
+        try:
+            async with yd_session_lock:
+                picker = sessions.get(session_key)
+                if picker is not None and picker.get("nonce") == nonce:
+                    picker["processing"] = False
+                    task_ids = picker.get("task_ids")
+                    if isinstance(task_ids, list) and task_id in task_ids:
+                        task_ids.remove(task_id)
+                    sessions.pop(session_key, None)
+                elif picker is not None:
+                    task_ids = picker.get("task_ids")
+                    if isinstance(task_ids, list) and task_id in task_ids:
+                        task_ids.remove(task_id)
+                        logging.warning(
+                            f"[YD-CLEANUP] task_id={task_id} оказался в чужом "
+                            f"picker'е (nonce={picker.get('nonce')!r}, "
+                            f"ожидался {nonce!r}) — удаляем"
+                        )
+
+                sessions.pop(task_id, None)
+                yd_active_tasks.discard(task_id)
+        except Exception as e:
+            logging.error(
+                f"Ошибка очистки сессий для {task_id}: {e}", exc_info=True
+            )
+
+        # ✅ v3.8: _active_ops очищаем после удаления sessions,
+        # чтобы deferred cleanup (если запущен) видел актуальный bucket.
+        _active_ops.pop(task_id, None)
+
+        # ✅ v3.8: yd_release под shield — иначе повторная отмена
+        # прервёт его на середине.
+        try:
+            await asyncio.shield(yd_release(owner_user_id, chat_id, nonce))
+        except Exception as e:
+            logging.error(f"Ошибка yd_release для {task_id}: {e}", exc_info=True)
+
+        # Сообщение об ошибке
+        if error is not None and bot is not None and status_msg is not None:
+            try:
+                await status_msg.edit_text(
+                    f"❌ <b>Ошибка обработки</b>\n\n"
+                    f"<code>{html_module.escape(str(error)[:200])}</code>\n\n"
+                    f"Временные файлы удалены. Попробуйте снова.",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.error(
+                    f"Ошибка отправки сообщения для {task_id}: {e}"
+                )
+    finally:
+        async with yd_session_lock:
+            _cleaning_tasks.discard(task_id)
 
 
 # ==========================================
@@ -1411,10 +1441,7 @@ async def _yd_convert_and_upload(
     task_id: str,
     status_msg,
 ):
-    """
-    Вторая фаза: конвертация PNG + упаковка в ZIP + upload.
-    Вызывается после выбора режима в yd_sermon_mode.
-    """
+    """Вторая фаза: конвертация PNG + упаковка в ZIP + upload."""
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
@@ -1427,23 +1454,20 @@ async def _yd_convert_and_upload(
         logging.info(f"[YD-UP] Задача {task_id} отменена — upload пропущен")
         pending = session.get("pending")
         if isinstance(pending, dict):
-            await _yd_cleanup_task(
+            await asyncio.shield(_yd_cleanup_task(
                 task_id,
                 pending.get("session_key"),
                 pending.get("task_dir"),
                 pending.get("owner_user_id"),
                 pending.get("chat_id"),
                 pending.get("nonce"),
-            )
+            ))
         return
 
     pending = session["pending"]
     if not isinstance(pending, dict):
         return
 
-    # ✅ Bug #2: перерегистрируем worker_task по identity.
-    # Предыдущая регистрация (от _yd_prepare_files) будет сброшена в её finally,
-    # если она ещё не сброшена — здесь мы просто перезаписываем на текущий task.
     worker_task = asyncio.current_task()
     session["worker_task"] = worker_task
 
@@ -1490,7 +1514,9 @@ async def _yd_convert_and_upload(
 
             if item.get("convert_mode") == "skip":
                 logging.info(f"[YD-UP] {file_name}: пропущен пользователем")
-                report_lines.append(f"⏭ {file_name_esc} — пропущен пользователем")
+                report_lines.append(
+                    f"⏭ {file_name_esc} — пропущен пользователем"
+                )
                 continue
 
             if item.get("failed_at_stage"):
@@ -1548,7 +1574,6 @@ async def _yd_convert_and_upload(
             temp_png_dir = task_dir / f"png_{f_idx}"
             temp_png_dir.mkdir(exist_ok=True)
 
-            # ✅ convert_all_pngs через _yd_run_protected
             try:
                 pngs, used_pptx = await _yd_with_spinner(
                     status_msg,
@@ -1566,7 +1591,9 @@ async def _yd_convert_and_upload(
                     f"[YD-UP] {file_name}: ошибка конвертации: {e}",
                     exc_info=True,
                 )
-                report_lines.append(f"❌ {file_name_esc} — ошибка конвертации")
+                report_lines.append(
+                    f"❌ {file_name_esc} — ошибка конвертации"
+                )
                 total_failed += 1
                 continue
 
@@ -1601,7 +1628,11 @@ async def _yd_convert_and_upload(
             need_sermon_folder = convert_mode in ("sermon", "both")
 
             if need_pptx2png_folder:
-                ok1 = await yandex_state.config.client.ensure_folder(pptx2png_dir)
+                # ✅ v3.8: ensure_folder защищён _yd_async_protected
+                ok1 = await _yd_async_protected(
+                    task_id,
+                    yandex_state.config.client.ensure_folder(pptx2png_dir),
+                )
                 if not ok1:
                     logging.error(
                         f"[YD-UP] {file_name}: не удалось создать {pptx2png_dir!r}"
@@ -1613,7 +1644,10 @@ async def _yd_convert_and_upload(
                     continue
 
             if need_sermon_folder and sermon_pngs:
-                ok2 = await yandex_state.config.client.ensure_folder(sermon_dir)
+                ok2 = await _yd_async_protected(
+                    task_id,
+                    yandex_state.config.client.ensure_folder(sermon_dir),
+                )
                 if not ok2:
                     logging.error(
                         f"[YD-UP] {file_name}: не удалось создать {sermon_dir!r}"
@@ -1674,12 +1708,16 @@ async def _yd_convert_and_upload(
                     _safe_unlink(sermon_zip_path)
                     return
 
+                # ✅ v3.8: upload_file защищён _yd_async_protected
                 ok = await _yd_with_spinner(
                     status_msg,
                     task_id,
                     base_upload_text,
-                    yandex_state.config.client.upload_file(
-                        sermon_zip_path, remote_path
+                    _yd_async_protected(
+                        task_id,
+                        yandex_state.config.client.upload_file(
+                            sermon_zip_path, remote_path
+                        ),
                     ),
                 )
 
@@ -1688,7 +1726,8 @@ async def _yd_convert_and_upload(
                     total_slides_packed += len(sermon_pngs)
                     links_by_folder[sermon_dir] = "🎯 Проповедь"
                     sermon_info = (
-                        f"🎯 Проповедь ({ranges_text}): {len(sermon_pngs)} слайдов → "
+                        f"🎯 Проповедь ({ranges_text}): "
+                        f"{len(sermon_pngs)} слайдов → "
                         f"<code>{html_module.escape(yandex_state.config.sermon_folder)}/"
                         f"{html_module.escape(sermon_zip_name)}</code> "
                         f"({_format_size(sermon_zip_size)})"
@@ -1734,7 +1773,9 @@ async def _yd_convert_and_upload(
                     )
                     total_failed += 1
                     if sermon_info:
-                        report_lines.append(f"{f_idx}. 📄 <b>{file_name_esc}</b>")
+                        report_lines.append(
+                            f"{f_idx}. 📄 <b>{file_name_esc}</b>"
+                        )
                         report_lines.append(f"   • {sermon_info}")
                     continue
 
@@ -1766,8 +1807,11 @@ async def _yd_convert_and_upload(
                     status_msg,
                     task_id,
                     base_upload_text,
-                    yandex_state.config.client.upload_file(
-                        other_zip_path, remote_path
+                    _yd_async_protected(
+                        task_id,
+                        yandex_state.config.client.upload_file(
+                            other_zip_path, remote_path
+                        ),
                     ),
                 )
 
@@ -1863,17 +1907,15 @@ async def _yd_convert_and_upload(
         )
 
     except asyncio.CancelledError:
-        # ✅ Bug #3: worker отменён внешне (yd_task_cancel_callback
-        # или пользователь через /cancel_yd). Делаем cleanup сами.
         logging.info(
             f"[YD-UP] Worker {task_id} отменён — выполняю cleanup"
         )
         cleanup_done = True
         try:
-            await _yd_cleanup_task(
+            await asyncio.shield(_yd_cleanup_task(
                 task_id, session_key, task_dir,
                 owner_user_id, chat_id, nonce,
-            )
+            ))
         except Exception as e:
             logging.error(
                 f"[YD-UP] cleanup после отмены упал: {e}", exc_info=True
@@ -1890,7 +1932,6 @@ async def _yd_convert_and_upload(
         )
         return
     finally:
-        # ✅ Bug #2: снимаем регистрацию worker'а по identity.
         try:
             sess = sessions.get(task_id)
             if sess is not None and sess.get("worker_task") is worker_task:
@@ -1953,7 +1994,9 @@ async def _yd_send_report(
             delivered += 1
             first_delivered = True
         except Exception as e:
-            logging.error(f"Ошибка edit_text первой части: {e}", exc_info=True)
+            logging.error(
+                f"Ошибка edit_text первой части: {e}", exc_info=True
+            )
             try:
                 await bot.send_message(
                     chat_id=chat_id,
@@ -1964,17 +2007,24 @@ async def _yd_send_report(
                 delivered += 1
                 first_delivered = True
             except Exception as e2:
-                logging.error(f"Не удалось отправить первую часть: {e2}", exc_info=True)
+                logging.error(
+                    f"Не удалось отправить первую часть: {e2}", exc_info=True
+                )
                 failed_chunks.append(1)
 
     if not first_delivered:
         try:
-            fallback = f"⚠️ Не удалось показать полный отчёт.\n📊 Загружено: {total_uploaded}"
+            fallback = (
+                f"⚠️ Не удалось показать полный отчёт.\n"
+                f"📊 Загружено: {total_uploaded}"
+            )
             if total_failed:
                 fallback += f"\n❌ Ошибок: {total_failed}"
             await bot.send_message(chat_id=chat_id, text=fallback)
         except Exception as e:
-            logging.error(f"Не удалось отправить fallback-отчёт: {e}", exc_info=True)
+            logging.error(
+                f"Не удалось отправить fallback-отчёт: {e}", exc_info=True
+            )
 
     for i, chunk in enumerate(chunks[1:], start=2):
         try:
@@ -2012,11 +2062,15 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         return
 
     if yandex_state.config.client is None:
-        await message.reply("❌ Яндекс.Диск не настроен. Обратитесь к администратору.")
+        await message.reply(
+            "❌ Яндекс.Диск не настроен. Обратитесь к администратору."
+        )
         return
 
     if not yandex_state.config.base_path:
-        await message.reply("❌ Не задан base_path Яндекс.Диска в settings.ini.")
+        await message.reply(
+            "❌ Не задан base_path Яндекс.Диска в settings.ini."
+        )
         return
 
     logging.info(
@@ -2068,7 +2122,8 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         await status_msg.edit_text(
             f"✅ Яндекс.Диск доступен\n"
-            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>\n"
+            f"📅 Ближайшее воскресенье: "
+            f"<b>{html_module.escape(sunday_str)}</b>\n"
             f"📁 Ожидаемая папка: "
             f"<code>{html_module.escape(f'{month_str}/{sunday_str}')}</code>\n\n"
             f"🔍 Проверяю структуру папок...",
@@ -2118,7 +2173,8 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
             await status_msg.edit_text(
                 f"📅 Ближайшее воскресенье: "
                 f"<b>{html_module.escape(sunday_str)}</b>\n"
-                f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>\n\n"
+                f"📍 Папка: "
+                f"<code>{html_module.escape(paths['source'])}</code>\n\n"
                 f"❌ <b>pptx-файлы не найдены.</b>\n\n"
                 f"Положите pptx с датой <code>{sunday:%d.%m.%y}</code> "
                 f"в папку <code>{src_esc}</code> и попробуйте снова.",
@@ -2128,7 +2184,8 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         MAX_LEN = 3500
         header_lines = [
-            f"📅 Ближайшее воскресенье: <b>{html_module.escape(sunday_str)}</b>",
+            f"📅 Ближайшее воскресенье: "
+            f"<b>{html_module.escape(sunday_str)}</b>",
             f"📍 Папка: <code>{html_module.escape(paths['source'])}</code>",
             "",
             f"📄 <b>Найдено файлов: {len(pptx_files)}</b>",
@@ -2148,12 +2205,16 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
         if omitted > 0:
             body_lines.append("")
-            body_lines.append(f"…и ещё <b>{omitted}</b> файл(ов) не показано.")
+            body_lines.append(
+                f"…и ещё <b>{omitted}</b> файл(ов) не показано."
+            )
 
         body_lines.append("")
         body_lines.append("🎬 Выберите файл для обработки:")
 
-        if not await yd_is_active(message.from_user.id, message.chat.id, nonce):
+        if not await yd_is_active(
+            message.from_user.id, message.chat.id, nonce
+        ):
             logging.info(
                 f"[YD] Сессия {message.from_user.id}:{message.chat.id} "
                 f"была отменена во время выполнения"
@@ -2212,12 +2273,16 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
             prefix = "🎯" if "служение" in f["name"].lower() else "📄"
             kb.row(InlineKeyboardButton(
                 text=f"{prefix} {f['name']}",
-                callback_data=f"yd_pick:{message.from_user.id}:{nonce}:{idx}",
+                callback_data=(
+                    f"yd_pick:{message.from_user.id}:{nonce}:{idx}"
+                ),
             ))
         if len(pptx_files) > 1:
             kb.row(InlineKeyboardButton(
                 text="📁 Все подряд",
-                callback_data=f"yd_pick:{message.from_user.id}:{nonce}:all",
+                callback_data=(
+                    f"yd_pick:{message.from_user.id}:{nonce}:all"
+                ),
             ))
         kb.row(InlineKeyboardButton(
             text="❌ Отмена",
@@ -2242,7 +2307,8 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         try:
             if status_msg:
                 await status_msg.edit_text(
-                    f"❌ Ошибка: <code>{html_module.escape(str(e)[:200])}</code>",
+                    f"❌ Ошибка: "
+                    f"<code>{html_module.escape(str(e)[:200])}</code>",
                     parse_mode="HTML",
                 )
             else:
@@ -2251,7 +2317,9 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
             pass
     finally:
         if not session_created:
-            released = await yd_release(message.from_user.id, message.chat.id, nonce)
+            released = await yd_release(
+                message.from_user.id, message.chat.id, nonce
+            )
             if released:
                 logging.info(
                     f"[YD] 🔓 Сессия {message.from_user.id}:{message.chat.id} "
@@ -2281,7 +2349,9 @@ async def yd_pick(
     file_selector = parts[3]
 
     if callback.from_user.id != owner_user_id:
-        await callback.answer("❌ Только автор запроса может выбрать файл.", show_alert=True)
+        await callback.answer(
+            "❌ Только автор запроса может выбрать файл.", show_alert=True
+        )
         return
 
     session_key = f"yd_{owner_user_id}_{callback.message.chat.id}"
@@ -2313,7 +2383,9 @@ async def yd_pick(
                 files_to_process = [files[idx]]
             except ValueError:
                 session.pop("processing", None)
-                await callback.answer("❌ Некорректный выбор.", show_alert=True)
+                await callback.answer(
+                    "❌ Некорректный выбор.", show_alert=True
+                )
                 return
 
     try:
@@ -2379,7 +2451,8 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
 
     if callback.from_user.id != owner_user_id:
         await callback.answer(
-            "❌ Только автор запроса может отменить операцию.", show_alert=True
+            "❌ Только автор запроса может отменить операцию.",
+            show_alert=True,
         )
         return
 
@@ -2436,11 +2509,41 @@ async def cmd_cancel_yd(message: types.Message, check_access):
             task_ids_to_cancel = list(session.get("task_ids", []))
             sessions.pop(session_key, None)
 
+    # ✅ v3.8: помечаем задачи и собираем worker'ов под локом
+    workers_to_cancel = []
     for tid in task_ids_to_cancel:
         async with yd_session_lock:
             task_sess = sessions.get(tid)
             if task_sess is not None:
                 task_sess["cancelled"] = True
+                w = task_sess.get("worker_task")
+                if w is not None:
+                    workers_to_cancel.append((tid, w))
+
+    # ✅ v3.8: отменяем и дожидаемся worker'ов через shield
+    current_task = asyncio.current_task()
+    for tid, w in workers_to_cancel:
+        if w is None or w.done() or w is current_task:
+            continue
+        logging.info(
+            f"[YD-CANCEL_YD] Отменяем worker {tid}"
+        )
+        try:
+            w.cancel()
+        except Exception as e:
+            logging.debug(f"[YD-CANCEL_YD] cancel {tid}: {e}")
+        try:
+            await asyncio.wait_for(asyncio.shield(w), timeout=15.0)
+            logging.info(f"[YD-CANCEL_YD] worker {tid} завершён")
+        except asyncio.TimeoutError:
+            logging.warning(
+                f"[YD-CANCEL_YD] worker {tid} не завершился за 15s — "
+                f"продолжаем, worker завершит cleanup сам"
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.debug(f"[YD-CANCEL_YD] await {tid}: {e}")
 
     released = await yd_release(message.from_user.id, message.chat.id)
 
@@ -2512,7 +2615,9 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
     ]
 
     if remaining:
-        await _yd_render_sermon_prompt(task_id, remaining[0], callback.message)
+        await _yd_render_sermon_prompt(
+            task_id, remaining[0], callback.message
+        )
         return
 
     await _yd_convert_and_upload(
@@ -2560,6 +2665,10 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         )
         return
 
+    # ✅ v3.8: сначала останавливаем спиннер — иначе он продолжит
+    # редактировать статус-сообщение, пока мы ждём worker.
+    await _yd_stop_spinner(task_id)
+
     # ✅ Ставим cancelled=True ВСЕГДА
     session["cancelled"] = True
 
@@ -2573,10 +2682,7 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
 
-    # ✅ Bug #2: отменяем и дожидаемся worker'а (может быть как preparation,
-    # так и conversion) ПЕРЕД yd_release.
-    # ✅ Bug #3: используем asyncio.shield, чтобы таймаут wait_for не
-    # инжектил повторную отмену в cleanup worker'а.
+    # ✅ Bug #2 + v3.8: отменяем и дожидаемся worker'а через shield.
     worker = session.get("worker_task")
     current_task = asyncio.current_task()
     if worker is not None and not worker.done() and worker is not current_task:
@@ -2588,8 +2694,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         except Exception as e:
             logging.debug(f"[YD-TASK-CANCEL] worker.cancel: {e}")
         try:
-            # ✅ Bug #3: shield защищает worker от повторной отмены
-            # при таймауте ожидания.
             await asyncio.wait_for(asyncio.shield(worker), timeout=15.0)
             logging.info(
                 f"[YD-TASK-CANCEL] worker {task_id} завершён"
@@ -2597,22 +2701,23 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         except asyncio.TimeoutError:
             logging.warning(
                 f"[YD-TASK-CANCEL] worker {task_id} не завершился за 15s — "
-                f"продолжаем, но in-flight upload может продолжиться в фоне "
-                f"(worker завершит cleanup сам)"
+                f"продолжаем, worker завершит cleanup сам"
             )
         except asyncio.CancelledError:
-            # worker уже был отменён — это ожидаемое поведение
             pass
         except Exception as e:
             logging.debug(f"[YD-TASK-CANCEL] await worker: {e}")
 
-    # ✅ Bug #1: освобождаем yd_release, только если не осталось живых
-    # sibling-задач в том же picker'е.
+    # ✅ Bug #1 + v3.8: release только если нет живых sibling'ов.
+    # Проверка и release — в одном критическом участке.
     owner_chat_id = session.get("chat_id")
     owner_nonce = session.get("nonce")
     if owner_chat_id is not None and owner_nonce:
         picker_key = f"yd_{owner_user_id}_{owner_chat_id}"
-        has_live_siblings = _picker_has_live_tasks(picker_key, exclude_task_id=task_id)
+        async with yd_session_lock:
+            has_live_siblings = _picker_has_live_tasks_locked(
+                picker_key, exclude_task_id=task_id
+            )
         if has_live_siblings:
             logging.info(
                 f"[YD-TASK-CANCEL] Не освобождаем picker {picker_key}: "
@@ -2620,8 +2725,8 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
             )
         else:
             try:
-                released = await yd_release(
-                    owner_user_id, owner_chat_id, owner_nonce
+                released = await asyncio.shield(
+                    yd_release(owner_user_id, owner_chat_id, owner_nonce)
                 )
                 logging.info(
                     f"[YD-TASK-CANCEL] yd_release для {task_id}: "
@@ -2633,14 +2738,9 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                     exc_info=True,
                 )
 
-    # ✅ Останавливаем спиннер ДО edit_text
-    await _yd_stop_spinner(task_id)
-
     pending = session.get("pending")
 
-    # Случай 1: pending ещё не создан (отмена на стадии подготовки)
-    # ✅ Bug #2: worker уже отменён и дождался выше; _yd_prepare_files
-    # в своём CancelledError-блоке сам вызовет _yd_cleanup_task.
+    # Случай 1: pending ещё не создан
     if not isinstance(pending, dict):
         logging.info(
             f"[YD-TASK-CANCEL] Задача {task_id!r} отменена на стадии подготовки"
@@ -2695,14 +2795,14 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         except Exception:
             pass
 
-        await _yd_cleanup_task(
+        await asyncio.shield(_yd_cleanup_task(
             task_id=task_id,
             session_key=pending.get("session_key"),
             task_dir=pending.get("task_dir"),
             owner_user_id=owner_user_id,
             chat_id=pending.get("chat_id"),
             nonce=pending.get("nonce"),
-        )
+        ))
     else:
         try:
             await callback.message.edit_text(
@@ -2768,15 +2868,19 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         if len(matches) > 20:
             preview += f" …и ещё {len(matches) - 20}"
         context_lines.append(
-            f"📌 <b>Найдены пометки на слайдах:</b> <code>{preview}</code>"
+            f"📌 <b>Найдены пометки на слайдах:</b> "
+            f"<code>{preview}</code>"
         )
         if start is not None and end is not None:
             ranges_text = _format_ranges_text(ranges, start, end)
             context_lines.append(
-                f"📊 <b>Предложенный диапазон:</b> <code>{ranges_text}</code>"
+                f"📊 <b>Предложенный диапазон:</b> "
+                f"<code>{ranges_text}</code>"
             )
     elif not notes_ok:
-        context_lines.append("⚠️ <i>Заметки докладчика не удалось прочитать.</i>")
+        context_lines.append(
+            "⚠️ <i>Заметки докладчика не удалось прочитать.</i>"
+        )
     elif incomplete:
         context_lines.append("⚠️ <i>Заметки прочитаны частично.</i>")
     else:
@@ -2806,7 +2910,8 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             f"{context_block}\n\n"
             f"<b>Формат:</b> <code>5-30</code> или <code>5,7,10-15</code>\n"
             f"Отправьте текстом в чат (ответом на это сообщение).\n"
-            f"<i>Отправьте <code>отмена</code> или <code>0</code>, чтобы пропустить файл.</i>",
+            f"<i>Отправьте <code>отмена</code> или <code>0</code>, "
+            f"чтобы пропустить файл.</i>",
             parse_mode="HTML",
             reply_markup=cancel_kb.as_markup(),
         )
@@ -2815,7 +2920,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             f"yd_sermon_edit: edit_text упал для {task_id}: {e}",
             exc_info=True,
         )
-        await _yd_cleanup_task(
+        await asyncio.shield(_yd_cleanup_task(
             task_id,
             pending.get("session_key"),
             pending.get("task_dir"),
@@ -2825,7 +2930,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             bot=bot,
             status_msg=None,
             error=None,
-        )
+        ))
         try:
             await bot.send_message(
                 chat_id=callback.message.chat.id,
@@ -2849,9 +2954,17 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         )
         return
 
+    # ✅ v3.8: дожидаемся отмены старого watchdog перед созданием нового
     old_timeout = pending.get("prompt_timeout_task")
     if old_timeout is not None and not old_timeout.done():
         old_timeout.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(old_timeout), timeout=5.0
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
+    pending["prompt_timeout_task"] = None
 
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(
