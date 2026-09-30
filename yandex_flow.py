@@ -1,21 +1,26 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.9)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.10)
+# ==========================================
+# Изменения v3.10 (по логам test-прогона):
+#   • _safe_answer — глотает TelegramBadRequest «query is too old»
+#     и «query ID is invalid». Используется во ВСЕХ callback-хендлерах.
+#   • callback.answer вызывается СРАЗУ в начале хендлера, до любых
+#     долгих операций (worker.cancel, wait_for, edit_text).
+#   • _cancel_worker_async — отмена и ожидание worker'а В ФОНЕ,
+#     не блокирует event loop, не задерживает следующие апдейты.
+#   • yd_task_cancel_callback: worker отменяется через
+#     asyncio.create_task(_cancel_worker_async(...)) без ожидания.
+#   • cmd_cancel_yd: worker'ы отменяются в фоне (тоже без блокировки).
+#   • _safe_edit различает «query is too old» от «message is not modified».
 # ==========================================
 # Изменения v3.9 (третий раунд аудита):
 #   • Watchdog: атомарная перепроверка prompt_nonce под локом
-#     непосредственно перед _yd_cleanup_task (устранена гонка
-#     с ручным вводом диапазона).
+#     непосредственно перед _yd_cleanup_task.
 #   • yd_sermon_edit: дожидается отмены старого watchdog'а.
-#   • _normalize_item_ranges: единый источник правды для
-#     ranges vs start/end — исключает рассинхрон.
-#   • _ranges_to_start_end: пересчёт start/end из ranges.
-#   • _yd_cleanup_task: сброс awaiting_range_for_idx,
-#     prompt_nonce, prompt_idx в pending.
-#   • TelegramBadRequest вместо строкового матчинга
-#     "message is not modified".
-#   • _yd_prepare_files: полный rollback регистрации task_id
-#     при ошибке в блоке ранней регистрации
-#     (sessions + picker.task_ids + yd_active_tasks + task_dir).
+#   • _normalize_item_ranges: единый источник правды ranges vs start/end.
+#   • _yd_cleanup_task: сброс awaiting_range_for_idx, prompt_nonce, prompt_idx.
+#   • TelegramBadRequest вместо строкового матчинга.
+#   • _yd_prepare_files: полный rollback регистрации при ошибке mkdir.
 # ==========================================
 # Изменения v3.8 (второй раунд аудита):
 #   • _cleaning_tasks — идемпотентность _yd_cleanup_task
@@ -118,20 +123,52 @@ def _safe_unlink(path: Path):
 
 
 async def _safe_edit(msg, text: str, **kwargs) -> bool:
-    """Безопасный edit_text с логированием ошибок."""
+    """
+    Безопасный edit_text.
+    Различает 'message is not modified' (штатное), 'query is too old'
+    (устаревший callback) и прочие ошибки.
+    """
     if msg is None:
         return False
     try:
         await msg.edit_text(text, **kwargs)
         return True
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
+        s = str(e)
+        if "message is not modified" in s:
+            return False
+        if "query is too old" in s or "query ID is invalid" in s:
+            logging.debug(f"[YD-EDIT] query устарел: {e}")
             return False
         logging.warning(f"TelegramBadRequest в edit_text: {e}")
         return False
     except Exception as e:
-        logging.warning(f"Не удалось обновить статус-сообщение: {e}", exc_info=True)
+        logging.warning(
+            f"Не удалось обновить статус-сообщение: {e}", exc_info=True
+        )
         return False
+
+
+async def _safe_answer(
+    callback: types.CallbackQuery,
+    text: str = "",
+    show_alert: bool = False,
+) -> None:
+    """
+    Безопасный callback.answer.
+    Глотает TelegramBadRequest «query is too old» / «query ID is invalid»,
+    которые возникают, когда хендлер отвечает слишком поздно (>15 сек).
+    """
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        s = str(e)
+        if "query is too old" in s or "query ID is invalid" in s:
+            logging.info(f"[YD-ANSWER] callback устарел: {e}")
+        else:
+            logging.warning(f"[YD-ANSWER] TelegramBadRequest: {e}")
+    except Exception as e:
+        logging.warning(f"[YD-ANSWER] не удалось ответить на callback: {e}")
 
 
 def _format_ranges_text(ranges, start=None, end=None) -> str:
@@ -150,9 +187,6 @@ def _format_ranges_text(ranges, start=None, end=None) -> str:
 def _ranges_to_start_end(ranges):
     """
     Возвращает (start, end) как min/max объединения ranges или (None, None).
-
-    Единая точка правды: если есть ranges, start/end всегда пересчитываются
-    из них. Используется для консистентности item["ranges"] vs item["start"].
     """
     if not ranges:
         return None, None
@@ -170,9 +204,6 @@ def _normalize_item_ranges(item: dict) -> None:
       • если есть ranges, start/end пересчитываются из них;
       • если ranges нет, но есть start/end, формируется ranges=[(start, end)];
       • иначе — обнуляет оба поля.
-
-    Вызывается после любого обновления ranges/start/end (ручной ввод,
-    автодетект, изменение режима).
     """
     ranges = item.get("ranges")
     start = item.get("start")
@@ -182,16 +213,12 @@ def _normalize_item_ranges(item: dict) -> None:
         s2, e2 = _ranges_to_start_end(ranges)
         item["start"] = s2
         item["end"] = e2
-        # Схлопываем ranges до одного диапазона, если он единственный
-        # и совпадает с min/max — оставляем как есть, чтобы не терять
-        # разрывы (например, [(1,1),(5,5)]).
         return
 
     if start is not None and end is not None and start <= end:
         item["ranges"] = [(start, end)]
         return
 
-    # Мусор — зануляем
     item["start"] = None
     item["end"] = None
     item["ranges"] = None
@@ -411,13 +438,14 @@ _deferred_dirs: set[Path] = set()
 # Реестр задач, для которых сейчас выполняется _yd_cleanup_task
 _cleaning_tasks: set[str] = set()
 
+# ✅ v3.10: реестр фоновых cancel-задач — чтобы их можно было drain'ить.
+_background_cancel_tasks: set[asyncio.Task] = set()
+
 
 async def _yd_run_protected(task_id: str, coro):
     """
     Запускает корутину как отдельный Task, регистрирует в _active_ops[task_id]
     и защищает от внешней отмены через asyncio.shield.
-
-    Используется для CPU/IO-операций (to_thread).
     """
     async def _runner():
         try:
@@ -491,6 +519,42 @@ def _spawn_deferred_cleanup(task_dir: Path, ops: list) -> None:
         _deferred_dirs.discard(task_dir)
 
     task.add_done_callback(_done)
+
+
+async def _cancel_worker_async(
+    worker: asyncio.Task,
+    task_id: str,
+    timeout: float = 15.0,
+) -> None:
+    """
+    ✅ v3.10: фоновый cancel worker'а.
+    Не блокирует event loop → следующие Telegram-апдейты обрабатываются
+    вовремя, callback.answer не устаревает.
+    """
+    if worker is None or worker.done() or worker is asyncio.current_task():
+        return
+    try:
+        worker.cancel()
+    except Exception as e:
+        logging.debug(f"[YD-CANCEL-ASYNC] cancel {task_id}: {e}")
+    try:
+        await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+        logging.info(f"[YD-CANCEL-ASYNC] worker {task_id} завершён")
+    except asyncio.TimeoutError:
+        logging.warning(
+            f"[YD-CANCEL-ASYNC] worker {task_id} не завершился за {timeout}s"
+        )
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logging.debug(f"[YD-CANCEL-ASYNC] await {task_id}: {e}")
+
+
+def _spawn_cancel_worker(worker: asyncio.Task, task_id: str) -> None:
+    """Запускает фоновую отмену worker'а и регистрирует задачу в реестре."""
+    t = asyncio.create_task(_cancel_worker_async(worker, task_id))
+    _background_cancel_tasks.add(t)
+    t.add_done_callback(_background_cancel_tasks.discard)
 
 
 async def drain_deferred_cleanups(timeout: float = 30.0) -> None:
@@ -589,7 +653,6 @@ async def _yd_prepare_files(
             f"[YD-PREP] mkdir упал для {task_id}: {e}",
             exc_info=True,
         )
-        # ✅ v3.9: полный rollback регистрации.
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
@@ -977,35 +1040,35 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     """Атомарно проверяет и 'потребляет' промпт."""
     parts = callback.data.split(":")
     if len(parts) < 4:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return None
     task_id = parts[1]
     try:
         idx = int(parts[2])
     except ValueError:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return None
     nonce = parts[3]
 
     session = sessions.get(task_id)
     if not session or "pending" not in session:
-        await callback.answer("❌ Сессия неактивна.", show_alert=True)
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
         return None
     if session.get("cancelled"):
-        await callback.answer("❌ Задача отменена.", show_alert=True)
+        await _safe_answer(callback, "❌ Задача отменена.", show_alert=True)
         return None
 
     pending = session["pending"]
     if not isinstance(pending, dict):
-        await callback.answer("❌ Сессия неактивна.", show_alert=True)
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
         return None
 
     if pending.get("prompt_nonce") != nonce or pending.get("prompt_idx") != idx:
-        await callback.answer("⏳ Промпт уже обработан.", show_alert=True)
+        await _safe_answer(callback, "⏳ Промпт уже обработан.", show_alert=True)
         return None
 
     if callback.from_user.id != pending["owner_user_id"]:
-        await callback.answer("❌ Только автор.", show_alert=True)
+        await _safe_answer(callback, "❌ Только автор.", show_alert=True)
         return None
 
     timeout_task = pending.get("prompt_timeout_task")
@@ -1017,7 +1080,6 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     pending["prompt_nonce"] = None
     pending["prompt_idx"] = None
     pending["prompt_message_id"] = None
-    # ✅ v3.9: сбрасываем флаг ручного ввода при подтверждении промпта.
     pending["awaiting_range_for_idx"] = None
 
     try:
@@ -1062,7 +1124,6 @@ async def _yd_render_sermon_prompt(
         pending["prompt_nonce"] = secrets.token_hex(4)
     prompt_nonce = pending["prompt_nonce"]
 
-    # ✅ v3.9: нормализуем item — ranges и start/end всегда согласованы.
     _normalize_item_ranges(item)
 
     matches = item.get("matches", []) or []
@@ -1264,10 +1325,6 @@ async def _yd_prompt_timeout_watchdog(
     try:
         await asyncio.sleep(timeout_sec)
 
-        # ✅ v3.9: атомарная перепроверка nonce под локом ПЕРЕД cleanup.
-        # Это закрывает гонку: watchdog прошёл sleep, но конкурентно
-        # (yd_sermon_edit) уже сменил prompt_nonce на новый — старый
-        # watchdog не должен чистить живую задачу.
         snapshot = None
         async with yd_session_lock:
             session = sessions.get(task_id)
@@ -1283,7 +1340,6 @@ async def _yd_prompt_timeout_watchdog(
                     f"actual={pending.get('prompt_nonce')!r}) — skip"
                 )
                 return
-            # Снимаем снимок для операций вне лока.
             snapshot = {
                 "chat_id": pending.get("chat_id"),
                 "bot": pending.get("bot"),
@@ -1382,7 +1438,6 @@ async def _yd_cleanup_task(
         except Exception as e:
             logging.debug(f"[YD-CLEANUP] _yd_stop_spinner: {e}")
 
-        # Снимаем клавиатуру со всех сообщений задачи
         try:
             session = sessions.get(task_id)
             if session is not None:
@@ -1422,7 +1477,6 @@ async def _yd_cleanup_task(
         except Exception as e:
             logging.debug(f"[YD-CLEANUP] Ошибка снятия клавиатуры: {e}")
 
-        # Папка задачи
         in_flight_ops = _active_ops.get(task_id)
         if in_flight_ops:
             ops_snapshot = list(in_flight_ops)
@@ -1434,7 +1488,6 @@ async def _yd_cleanup_task(
         else:
             _safe_delete_task_dir(task_dir)
 
-        # Watchdog + флаги pending
         try:
             session = sessions.get(task_id)
             if session is not None:
@@ -1450,7 +1503,6 @@ async def _yd_cleanup_task(
                         timeout_task.cancel()
                     pending["prompt_timeout_task"] = None
                     pending["prompt_watchdog_nonce"] = None
-                    # ✅ v3.9: сброс флага ручного ввода и связанных полей.
                     pending["awaiting_range_for_idx"] = None
                     pending["prompt_nonce"] = None
                     pending["prompt_idx"] = None
@@ -1459,7 +1511,6 @@ async def _yd_cleanup_task(
                 f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True
             )
 
-        # Сессии
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
@@ -1582,8 +1633,6 @@ async def _yd_convert_and_upload(
         for f_idx, item in enumerate(prepared, start=1):
             _touch_task(task_dir)
 
-            # ✅ v3.9: нормализуем ranges/start/end перед использованием —
-            # на случай, если они были изменены вручную и рассинхронизированы.
             _normalize_item_ranges(item)
 
             if _is_cancelled():
@@ -2419,21 +2468,23 @@ async def yd_pick(
 ):
     parts = callback.data.split(":")
     if len(parts) != 4:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     try:
         owner_user_id = int(parts[1])
     except ValueError:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     callback_nonce = parts[2]
     file_selector = parts[3]
 
     if callback.from_user.id != owner_user_id:
-        await callback.answer(
-            "❌ Только автор запроса может выбрать файл.", show_alert=True
+        await _safe_answer(
+            callback,
+            "❌ Только автор запроса может выбрать файл.",
+            show_alert=True,
         )
         return
 
@@ -2442,11 +2493,11 @@ async def yd_pick(
     async with yd_session_lock:
         session = sessions.get(session_key)
         if not session or session.get("nonce") != callback_nonce:
-            await callback.answer("❌ Сессия неактивна.", show_alert=True)
+            await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
             return
 
         if _picker_is_active(session):
-            await callback.answer("⏳ Обработка уже запущена.", show_alert=True)
+            await _safe_answer(callback, "⏳ Обработка уже запущена.", show_alert=True)
             return
 
         session["processing"] = True
@@ -2461,21 +2512,21 @@ async def yd_pick(
                 idx = int(file_selector)
                 if idx < 0 or idx >= len(files):
                     session.pop("processing", None)
-                    await callback.answer("❌ Файл не найден.", show_alert=True)
+                    await _safe_answer(callback, "❌ Файл не найден.", show_alert=True)
                     return
                 files_to_process = [files[idx]]
             except ValueError:
                 session.pop("processing", None)
-                await callback.answer(
-                    "❌ Некорректный выбор.", show_alert=True
+                await _safe_answer(
+                    callback, "❌ Некорректный выбор.", show_alert=True
                 )
                 return
 
     try:
         if file_selector == "all":
-            await callback.answer("⏳ Обрабатываю все файлы...")
+            await _safe_answer(callback, "⏳ Обрабатываю все файлы...")
         else:
-            await callback.answer("⏳ Начинаю обработку...")
+            await _safe_answer(callback, "⏳ Начинаю обработку...")
 
         await _yd_prepare_files(
             callback=callback,
@@ -2521,19 +2572,20 @@ async def yd_pick(
 async def yd_cancel_callback(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     if len(parts) != 3:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     try:
         owner_user_id = int(parts[1])
     except ValueError:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     callback_nonce = parts[2]
 
     if callback.from_user.id != owner_user_id:
-        await callback.answer(
+        await _safe_answer(
+            callback,
             "❌ Только автор запроса может отменить операцию.",
             show_alert=True,
         )
@@ -2560,14 +2612,22 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
             await callback.message.edit_text("❌ Сессия уже неактивна.")
         except Exception:
             pass
-        await callback.answer("❌ Сессия уже неактивна.", show_alert=True)
+        await _safe_answer(callback, "❌ Сессия уже неактивна.", show_alert=True)
         return
 
+    workers_to_cancel = []
     for tid in task_ids_to_cancel:
         async with yd_session_lock:
             task_sess = sessions.get(tid)
             if task_sess is not None:
                 task_sess["cancelled"] = True
+                w = task_sess.get("worker_task")
+                if w is not None:
+                    workers_to_cancel.append((tid, w))
+
+    for tid, w in workers_to_cancel:
+        if w is not None and not w.done() and w is not asyncio.current_task():
+            _spawn_cancel_worker(w, tid)
 
     await yd_release(owner_user_id, callback.message.chat.id, callback_nonce)
 
@@ -2575,7 +2635,7 @@ async def yd_cancel_callback(callback: types.CallbackQuery):
         await callback.message.edit_text("❌ Операция отменена.")
     except Exception:
         pass
-    await callback.answer()
+    await _safe_answer(callback)
 
 
 @router.message(Command("cancel_yd"))
@@ -2604,27 +2664,10 @@ async def cmd_cancel_yd(message: types.Message, check_access):
                 if w is not None:
                     workers_to_cancel.append((tid, w))
 
-    current_task = asyncio.current_task()
+    # ✅ v3.10: worker'ы отменяются в фоне, не блокируем event loop.
     for tid, w in workers_to_cancel:
-        if w is None or w.done() or w is current_task:
-            continue
-        logging.info(f"[YD-CANCEL_YD] Отменяем worker {tid}")
-        try:
-            w.cancel()
-        except Exception as e:
-            logging.debug(f"[YD-CANCEL_YD] cancel {tid}: {e}")
-        try:
-            await asyncio.wait_for(asyncio.shield(w), timeout=15.0)
-            logging.info(f"[YD-CANCEL_YD] worker {tid} завершён")
-        except asyncio.TimeoutError:
-            logging.warning(
-                f"[YD-CANCEL_YD] worker {tid} не завершился за 15s — "
-                f"продолжаем, worker завершит cleanup сам"
-            )
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logging.debug(f"[YD-CANCEL_YD] await {tid}: {e}")
+        if w is not None and not w.done() and w is not asyncio.current_task():
+            _spawn_cancel_worker(w, tid)
 
     released = await yd_release(message.from_user.id, message.chat.id)
 
@@ -2644,25 +2687,25 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
     """Пользователь выбрал режим конвертации."""
     parts = callback.data.split(":")
     if len(parts) != 5:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     task_id = parts[1]
     try:
         idx = int(parts[2])
     except ValueError:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
     nonce = parts[3]
     mode = parts[4]
 
     if mode not in ("sermon", "other", "both"):
-        await callback.answer("❌ Неизвестный режим.", show_alert=True)
+        await _safe_answer(callback, "❌ Неизвестный режим.", show_alert=True)
         return
 
     session = sessions.get(task_id)
     if not session or "pending" not in session:
-        await callback.answer("❌ Сессия неактивна.", show_alert=True)
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
         return
 
     claimed = await _yd_claim_prompt(callback)
@@ -2672,14 +2715,13 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
     item = pending["prepared"][idx]
 
-    # ✅ v3.9: нормализация перед проверкой — если ranges задан вручную
-    # через текстовый ввод, start/end пересчитаются из него.
     _normalize_item_ranges(item)
 
     if mode in ("sermon", "both") and (
         item.get("start") is None or item.get("end") is None
     ):
-        await callback.answer(
+        await _safe_answer(
+            callback,
             "❌ Диапазон не задан. Укажите его вручную.",
             show_alert=True,
         )
@@ -2689,10 +2731,7 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
     item["convert_mode"] = mode
     item["confirmed"] = True
 
-    try:
-        await callback.answer("⏳ Принято, начинаю конвертацию...")
-    except Exception:
-        pass
+    await _safe_answer(callback, "⏳ Принято, начинаю конвертацию...")
 
     remaining = [
         p for p in pending["prepared"]
@@ -2718,13 +2757,24 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("yd_task_cancel:"))
 async def yd_task_cancel_callback(callback: types.CallbackQuery):
-    """Отмена текущей Yandex-задачи."""
+    """
+    Отмена текущей Yandex-задачи.
+
+    ✅ v3.10:
+      • callback.answer вызывается СРАЗУ, до долгих операций —
+        query не устаревает.
+      • worker отменяется в фоне через _spawn_cancel_worker —
+        не блокируем event loop.
+    """
     parts = callback.data.split(":")
     if len(parts) != 2:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
 
     task_id = parts[1]
+
+    # ✅ Отвечаем сразу, пока query жив.
+    await _safe_answer(callback, "❌ Отмена запрошена…")
 
     session = sessions.get(task_id)
     if not session:
@@ -2735,23 +2785,16 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-
-        await callback.answer(
-            "ℹ️ Эта задача уже завершена или отменена.",
-            show_alert=True,
-        )
         return
 
     owner_user_id = session.get("user_id")
     if callback.from_user.id != owner_user_id:
-        await callback.answer(
-            "❌ Только автор задачи может её отменить.",
-            show_alert=True,
+        logging.info(
+            f"[YD-TASK-CANCEL] Пользователь {callback.from_user.id} "
+            f"не владелец задачи {task_id}"
         )
         return
 
-    # ✅ v3.8: сначала останавливаем спиннер — иначе он продолжит
-    # редактировать статус-сообщение, пока мы ждём worker.
     await _yd_stop_spinner(task_id)
 
     session["cancelled"] = True
@@ -2765,32 +2808,19 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
                 if isinstance(task_ids, list) and task_id in task_ids:
                     task_ids.remove(task_id)
 
+    # ✅ v3.10: отменяем worker В ФОНЕ, не блокируем хендлер.
     worker = session.get("worker_task")
-    current_task = asyncio.current_task()
-    if worker is not None and not worker.done() and worker is not current_task:
+    if (
+        worker is not None
+        and not worker.done()
+        and worker is not asyncio.current_task()
+    ):
         logging.info(
-            f"[YD-TASK-CANCEL] Отменяем worker {task_id} перед yd_release"
+            f"[YD-TASK-CANCEL] Запускаем фоновую отмену worker {task_id}"
         )
-        try:
-            worker.cancel()
-        except Exception as e:
-            logging.debug(f"[YD-TASK-CANCEL] worker.cancel: {e}")
-        try:
-            await asyncio.wait_for(asyncio.shield(worker), timeout=15.0)
-            logging.info(
-                f"[YD-TASK-CANCEL] worker {task_id} завершён"
-            )
-        except asyncio.TimeoutError:
-            logging.warning(
-                f"[YD-TASK-CANCEL] worker {task_id} не завершился за 15s — "
-                f"продолжаем, worker завершит cleanup сам"
-            )
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logging.debug(f"[YD-TASK-CANCEL] await worker: {e}")
+        _spawn_cancel_worker(worker, task_id)
 
-    # ✅ Bug #1 + v3.8: release только если нет живых sibling'ов.
+    # ✅ Bug #1: release только если нет живых sibling'ов.
     owner_chat_id = session.get("chat_id")
     owner_nonce = session.get("nonce")
     if owner_chat_id is not None and owner_nonce:
@@ -2825,12 +2855,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         logging.info(
             f"[YD-TASK-CANCEL] Задача {task_id!r} отменена на стадии подготовки"
         )
-
-        try:
-            await callback.answer("❌ Отмена запрошена")
-        except Exception:
-            pass
-
         try:
             await callback.message.edit_text(
                 "⏳ <b>Отмена запрошена…</b>\n\n"
@@ -2841,7 +2865,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
             )
         except Exception:
             pass
-
         return
 
     logging.info(
@@ -2849,17 +2872,11 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         f"отменил задачу {task_id}"
     )
 
-    try:
-        await callback.answer("❌ Задача отменена")
-    except Exception:
-        pass
-
     timeout_task = pending.get("prompt_timeout_task")
     if timeout_task is not None and not timeout_task.done():
         timeout_task.cancel()
     pending["prompt_timeout_task"] = None
     pending["prompt_watchdog_nonce"] = None
-    # ✅ v3.9: сброс флага ручного ввода.
     pending["awaiting_range_for_idx"] = None
 
     prompt_active = pending.get("prompt_nonce") is not None
@@ -2905,13 +2922,13 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
 async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     parts = callback.data.split(":")
     if len(parts) != 4:
-        await callback.answer("❌ Некорректный запрос.", show_alert=True)
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
         return
     task_id = parts[1]
 
     session = sessions.get(task_id)
     if not session or "pending" not in session:
-        await callback.answer("❌ Сессия неактивна.", show_alert=True)
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
         return
 
     claimed = await _yd_claim_prompt(callback)
@@ -2984,8 +3001,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
     sent_msg = None
     try:
-        await callback.answer()
-        sent_msg = await callback.message.edit_text(
+        await callback.message.edit_text(
             f"✏️ <b>Введите диапазон проповеди</b>\n\n"
             f"📄 Файл: <code>{file_name_esc}</code>\n"
             f"📊 Всего слайдов: <b>{total_slides}</b>"
@@ -2997,6 +3013,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             parse_mode="HTML",
             reply_markup=cancel_kb.as_markup(),
         )
+        sent_msg = callback.message
     except Exception as e:
         logging.error(
             f"yd_sermon_edit: edit_text упал для {task_id}: {e}",
@@ -3036,8 +3053,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         )
         return
 
-    # ✅ v3.9: дожидаемся отмены старого watchdog'а, чтобы он не успел
-    # сработать в промежутке и не почистил живую задачу.
     old_timeout = pending.get("prompt_timeout_task")
     if old_timeout is not None and not old_timeout.done():
         old_timeout.cancel()
@@ -3070,3 +3085,4 @@ is_sermon_slide = _is_sermon_slide
 claim_prompt = _yd_claim_prompt
 prompt_timeout_watchdog = _yd_prompt_timeout_watchdog
 drain_deferred_cleanups_async = drain_deferred_cleanups
+safe_answer = _safe_answer
