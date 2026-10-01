@@ -97,6 +97,10 @@ def setup_environment():
     yandex_target_folder = settings_config.get("YandexDisk", "target_folder", fallback="Трансляция").strip()
     yandex_pptx2png_folder = settings_config.get("YandexDisk", "pptx2png_folder", fallback="pptx2png").strip()
     yandex_sermon_folder = settings_config.get("YandexDisk", "sermon_folder", fallback="проповедь - png").strip()
+    yandex_opening_folder = settings_config.get(
+        "YandexDisk", "opening_folder",
+        fallback="Место из Слова Божьего перед служением",
+    ).strip()
     yandex_sermon_keyword = settings_config.get("YandexDisk", "sermon_keyword", fallback="проповед").strip()
     if not yandex_sermon_keyword:
         logging.warning(
@@ -180,6 +184,7 @@ def setup_environment():
         "yandex_target_folder": yandex_target_folder,
         "yandex_pptx2png_folder": yandex_pptx2png_folder,
         "yandex_sermon_folder": yandex_sermon_folder,
+        "yandex_opening_folder": yandex_opening_folder,  # ✅ НОВОЕ
         "yandex_sermon_keyword": yandex_sermon_keyword,
         "yandex_template_file": yandex_template_file,
         # ✅ Таймауты
@@ -302,6 +307,7 @@ def create_bot_and_dispatcher(cfg: dict):
         yandex_state.config.target_folder = cfg["yandex_target_folder"]
         yandex_state.config.pptx2png_folder = cfg["yandex_pptx2png_folder"]
         yandex_state.config.sermon_folder = cfg["yandex_sermon_folder"]
+        yandex_state.config.opening_folder = cfg["yandex_opening_folder"]  # ✅ НОВОЕ
         yandex_state.config.sermon_keyword = cfg["yandex_sermon_keyword"]
         yandex_state.config.template_file = cfg["yandex_template_file"]
         logging.info(f"✅ Яндекс.Диск инициализирован: {cfg['yandex_base_path']}")
@@ -333,13 +339,36 @@ def create_bot_and_dispatcher(cfg: dict):
         q_2k = "✅ 2K" if c["quality"] == "2k" else "2K"
         q_4k = "✅ 4K" if c["quality"] == "4k" else "4K"
         pdf_status = "✅ Да (ZIP + PDF)" if c["keep_pdf"] else "❌ Нет (Только ZIP)"
+
+        # ✅ Тогглы категорий (по аналогии с PDF)
+        sermon_status = "✅" if c.get("process_sermon", True) else "❌"
+        opening_status = "✅" if c.get("process_opening", True) else "❌"
+        other_status = "✅" if c.get("process_other", False) else "❌"
+
         b = InlineKeyboardBuilder()
         b.row(
             InlineKeyboardButton(text=q_std, callback_data="set_q_standard"),
             InlineKeyboardButton(text=q_2k, callback_data="set_q_2k"),
             InlineKeyboardButton(text=q_4k, callback_data="set_q_4k")
         )
-        b.row(InlineKeyboardButton(text=f"Возвращать PDF: {pdf_status}", callback_data="toggle_pdf"))
+        b.row(InlineKeyboardButton(
+            text=f"Возвращать PDF: {pdf_status}",
+            callback_data="toggle_pdf",
+        ))
+        b.row(
+            InlineKeyboardButton(
+                text=f"🎯 Проповедь: {sermon_status}",
+                callback_data="toggle_cat_sermon",
+            ),
+            InlineKeyboardButton(
+                text=f"🎬 Начало: {opening_status}",
+                callback_data="toggle_cat_opening",
+            ),
+            InlineKeyboardButton(
+                text=f"📄 Остальные: {other_status}",
+                callback_data="toggle_cat_other",
+            ),
+        )
         return b.as_markup()
 
     async def check_access_by_user(user: types.User, bot: Bot) -> bool:
