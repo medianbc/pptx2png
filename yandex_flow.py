@@ -1,5 +1,5 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.11)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.11.1)
 # ==========================================
 # Изменения v3.11 (по логам v3.10):
 #   • _run_worker_detached — общий запуск worker'а в фоне.
@@ -287,17 +287,30 @@ def _picker_is_active(picker: Optional[dict]) -> bool:
       • _draft=True (cmd_sunday в окне YD API запросов), ИЛИ
       • есть живые (не отменённые) task_id.
     """
+    return _picker_status(picker) != "idle"
+
+
+def _picker_status(picker: Optional[dict]) -> str:
+    """
+    Возвращает состояние пикера:
+      • "none"    — сессии нет;
+      • "draft"   — cmd_sunday в окне YD API запросов (сессия ещё
+                    не готова, показывать список файлов нельзя);
+      • "working" — есть активная задача (task_ids) или selected-окно;
+      • "idle"    — сессия готова, ждём выбора пользователя.
+                    Можно перезаписать новым /sunday.
+    """
     if not picker:
-        return False
-    if picker.get("processing"):
-        return True
+        return "none"
     if picker.get("_draft"):
-        return True
+        return "draft"
+    if picker.get("processing"):
+        return "working"
     for tid in picker.get("task_ids", []):
         task_sess = sessions.get(tid)
         if task_sess is not None and not task_sess.get("cancelled"):
-            return True
-    return False
+            return "working"
+    return "idle"
 
 
 def _picker_has_live_tasks_locked(
@@ -2283,11 +2296,23 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
-    # ✅ v3.11: атомарная draft-регистрация под локом.
-    # Защищает от параллельного /sunday в окне YD API запросов (до 21 сек).
+    # ✅ v3.11.1: атомарная draft-регистрация под локом с раздельной
+    # диагностикой (draft / working / idle).
     async with yd_session_lock:
         existing = sessions.get(session_key)
-        if _picker_is_active(existing):
+        status = _picker_status(existing)
+
+        if status == "draft":
+            # Параллельный /sunday, пока первый ещё собирает структуру.
+            await message.reply(
+                "⏳ <b>Проверяю Яндекс.Диск, подождите…</b>\n\n"
+                "Первая команда ещё выполняется. "
+                "Список файлов появится через несколько секунд.",
+                parse_mode="HTML",
+            )
+            return
+
+        if status == "working":
             await message.reply(
                 "⚠️ <b>У вас уже есть активная задача.</b>\n\n"
                 "Дождитесь её завершения или отмените командой /cancel_yd, "
@@ -2296,7 +2321,7 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
             )
             return
 
-        # Занимаем place-holder — блокирует повторный /sunday.
+        # status == "idle" или "none" — можно занять слот.
         sessions[session_key] = {
             "user_id": message.from_user.id,
             "chat_id": message.chat.id,
@@ -2442,16 +2467,26 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                 pass
             return
 
-        # ✅ v3.11: заменяем draft-сессию полной.
+        # ✅ v3.11.1: заменяем draft-сессию полной.
+        # Старая сессия может быть в состоянии "idle" (пользователь жмёт
+        # /sunday повторно, не выбрав файл) — это нормально, перезаписываем.
         race_detected = False
         async with yd_session_lock:
             old_picker = sessions.get(session_key)
-            # Draft наш — можно перезаписать. Если появились task_ids/processing —
-            # значит что-то странное, отказываемся.
-            if old_picker is not None and not old_picker.get("_draft"):
+            old_status = _picker_status(old_picker)
+
+            # Перезаписываем ТОЛЬКО если старая сессия наша draft или idle.
+            # Если она working/draft-чужая — отказ.
+            if old_status in ("working",):
                 logging.warning(
-                    f"[YD] Race: picker {session_key!r} "
-                    f"больше не draft — отказ"
+                    f"[YD] Race: picker {session_key!r} в состоянии "
+                    f"{old_status!r} — отказ"
+                )
+                race_detected = True
+            elif old_status == "draft" and old_picker.get("nonce") not in (None, nonce):
+                # Чужой draft (другая параллельная команда) — отказ.
+                logging.warning(
+                    f"[YD] Race: picker {session_key!r} — чужой draft, отказ"
                 )
                 race_detected = True
 
@@ -2523,7 +2558,9 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         except Exception:
             pass
     finally:
-        # ✅ v3.11: убираем draft, если он ещё есть.
+        # ✅ v3.11.1: убираем draft, если он ещё есть.
+        # Сессия в состоянии idle (готовая, без задач) НЕ удаляется —
+        # пусть пользователь выберет файл или нажмёт «Отмена».
         async with yd_session_lock:
             existing = sessions.get(session_key)
             if existing is not None and existing.get("_draft"):
