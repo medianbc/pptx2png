@@ -23,6 +23,7 @@ class YandexConfig:
         self.target_folder: str = "Трансляция"
         self.pptx2png_folder: str = "pptx2png"
         self.sermon_folder: str = "проповедь - png"
+        self.opening_folder: str = "Место из Слова Божьего перед служением"   # ✅ НОВОЕ
         self.sermon_keyword: str = "проповед"
         self.template_file: str = "template.yaml"
 
