@@ -423,6 +423,15 @@ async def main():
         logging.error(f"❌ Критическая ошибка в поллинге: {e}", exc_info=True)
         raise
     finally:
+        # ✅ Дожидаемся отложенных cleanup из yandex_flow, чтобы
+        # папки задач на /dev/shm были удалены, а не брошены.
+        # Делаем это ДО закрытия session.
+        try:
+            from yandex_flow import drain_deferred_cleanups_async
+            await drain_deferred_cleanups_async(timeout=30.0)
+        except Exception as e:
+            logging.warning(f"Ошибка drain отложенных cleanup: {e}")
+
         await http_session.close()
         await bot.session.close()
         logging.info("✅ Бот завершил работу")

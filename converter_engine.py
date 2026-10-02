@@ -151,6 +151,34 @@ def ppt_to_pptx_crossplatform(ppt_path: Path, output_dir: Path) -> Path:
     )
     return output_dir / f"{ppt_path.stem}.pptx"
 
+def librenormalize_to_pptx(
+    src_pptx: Path, work_dir: Path
+) -> Optional[Tuple[Path, int]]:
+    """
+    Нормализует .pptx через LibreOffice так, чтобы его можно было
+    открыть python-pptx.
+
+    Зачем: некоторые .pptx (сделанные редкими редакторами) python-pptx
+    не читает, а LibreOffice рендерит. Прогоняем через soffice --convert-to pptx
+    — на выходе обычно уже валидный OOXML.
+
+    Возвращает (путь к новому .pptx, число слайдов) или None,
+    если ни LibreOffice-конвертация, ни чтение результата не удались.
+    """
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        normalized = ppt_to_pptx_crossplatform(src_pptx, work_dir)
+        if not normalized or not Path(normalized).exists():
+            return None
+        # Проверяем, что python-pptx теперь его открывает
+        prs = Presentation(str(normalized))
+        count = len(prs.slides._sldIdLst)
+        if count <= 0:
+            return None
+        return Path(normalized), count
+    except Exception as e:
+        logging.warning(f"librenormalize_to_pptx({src_pptx}): {e}")
+        return None
 
 def count_slides_via_libreoffice(
     pptx_path: Path, work_dir: Path
