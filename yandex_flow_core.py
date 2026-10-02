@@ -1488,6 +1488,16 @@ async def _yd_render_category_prompt(
         if existing_nonce == prompt_nonce:
             return
         existing_task.cancel()
+        # ✅ v4.0.1: дожидаемся реальной отмены — старый watchdog
+        # может успеть дойти до _yd_cleanup_task.
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(existing_task), timeout=5.0
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception as e:
+            logging.debug(f"render_category_prompt: await old: {e}")
         pending["prompt_timeout_task"] = None
         pending["prompt_watchdog_nonce"] = None
 

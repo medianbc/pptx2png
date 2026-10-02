@@ -59,6 +59,7 @@ from yandex_flow_core import (
     _yd_prepare_files,
     _yd_convert_and_upload,
     _yd_cleanup_task,
+    _yd_prompt_timeout_watchdog,   # ✅ v4.0.1: вынес из proxy
 )
 
 
@@ -618,6 +619,12 @@ async def yd_cat_toggle(callback: types.CallbackQuery, bot: Bot):
         await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
         return
 
+    # ✅ v4.0.1: задача могла быть отменена, но ещё не удалена из sessions
+    # (worker завершается в фоне). Не даём toggle менять состояние.
+    if session.get("cancelled"):
+        await _safe_answer(callback, "❌ Задача отменена.", show_alert=True)
+        return
+
     pending = session["pending"]
     if not isinstance(pending, dict):
         await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
@@ -654,23 +661,30 @@ async def yd_cat_toggle(callback: types.CallbackQuery, bot: Bot):
         if "message is not modified" not in str(e):
             logging.warning(f"[YD-CAT-TOGGLE] edit_text: {e}")
 
+    # ✅ v4.0.1: дожидаемся отмены старого watchdog'а, чтобы он не успел
+    # дойти до _yd_cleanup_task между cancel() и созданием нового.
     existing_task = pending.get("prompt_timeout_task")
     if existing_task is not None and not existing_task.done():
         existing_task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(existing_task), timeout=5.0
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception as e:
+            logging.debug(f"yd_cat_toggle: await old_timeout: {e}")
+    pending["prompt_timeout_task"] = None
+
+    from yandex_flow_core import _yd_prompt_timeout_watchdog
     pending["prompt_timeout_task"] = asyncio.create_task(
-        _yd_prompt_timeout_watchdog_proxy(
+        _yd_prompt_timeout_watchdog(
             task_id, yandex_state.config.prompt_timeout_sec, nonce
         )
     )
     pending["prompt_watchdog_nonce"] = nonce
 
     await _safe_answer(callback)
-
-
-def _yd_prompt_timeout_watchdog_proxy(task_id, timeout_sec, nonce):
-    """Ленивый импорт watchdog из core (чтобы избежать цикла)."""
-    from yandex_flow_core import _yd_prompt_timeout_watchdog
-    return _yd_prompt_timeout_watchdog(task_id, timeout_sec, nonce)
 
 
 # ==========================================

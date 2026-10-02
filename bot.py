@@ -47,14 +47,21 @@ def setup_environment():
     settings_config = configparser.ConfigParser()
 
     if not config_path.exists():
-        sys.exit(f"❌ Ошибка: Файл секретов config.ini не найден по пути: {config_path}")
+        # ✅ v4.0.1: код возврата 1 — чтобы systemd/supervisor отличили
+        # ошибку bootstrap'а от штатного завершения.
+        print(
+            f"❌ Ошибка: Файл секретов config.ini не найден по пути: {config_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     config.read(config_path, encoding='utf-8')
 
     try:
         bot_token = config.get("Telegram", "BOT_TOKEN").strip()
         admin_id = int(config.get("Telegram", "ADMIN_ID").strip())
     except Exception as e:
-        sys.exit(f"❌ Ошибка в config.ini: {e}")
+        print(f"❌ Ошибка в config.ini: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if settings_path.exists():
         settings_config.read(settings_path, encoding='utf-8')
@@ -137,10 +144,12 @@ def setup_environment():
             f"Timeouts.cleanup_max_age_sec={cleanup_max_age_sec} (нужно > 0)"
         )
     if _invalid:
-        sys.exit(
+        msg = (
             "❌ Ошибка в settings.ini, секция [Timeouts]:\n  "
             + "\n  ".join(_invalid)
         )
+        print(msg, file=sys.stderr)
+        sys.exit(1)
 
     # ✅ Категории слайдов (settings.ini, секция [SlideCategories])
     def _parse_keywords(raw: str) -> list:
