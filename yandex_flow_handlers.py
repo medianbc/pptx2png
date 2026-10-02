@@ -676,7 +676,6 @@ async def yd_cat_toggle(callback: types.CallbackQuery, bot: Bot):
             logging.debug(f"yd_cat_toggle: await old_timeout: {e}")
     pending["prompt_timeout_task"] = None
 
-    from yandex_flow_core import _yd_prompt_timeout_watchdog
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(
             task_id, yandex_state.config.prompt_timeout_sec, nonce
@@ -1155,7 +1154,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             logging.debug(f"yd_sermon_edit: await old_timeout: {e}")
     pending["prompt_timeout_task"] = None
 
-    from yandex_flow_core import _yd_prompt_timeout_watchdog
     pending["prompt_timeout_task"] = asyncio.create_task(
         _yd_prompt_timeout_watchdog(
             task_id, yandex_state.config.prompt_timeout_sec, manual_nonce
