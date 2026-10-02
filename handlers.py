@@ -1131,6 +1131,77 @@ async def handle_toggle_pdf(callback: types.CallbackQuery, user_mgr,
         logging.error(f"Error toggling PDF keyboard: {e}")
         await callback.answer("❌ Ошибка обновления PDF", show_alert=True)
 
+# ==========================================
+# 9.1. ТОГГЛЫ КАТЕГОРИЙ СЛАЙДОВ
+# ==========================================
+
+async def _toggle_user_flag(
+    callback: types.CallbackQuery,
+    user_mgr,
+    get_settings_keyboard,
+    check_access_by_user,
+    bot: Bot,
+    key: str,
+    label: str,
+):
+    """
+    Общий хелпер: переключает boolean-флаг в настройках пользователя
+    и обновляет клавиатуру.
+    """
+    if not await check_access_by_user(callback.from_user, bot):
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    current = user_mgr.get_user_config(user_id)
+    new_value = not current.get(key, False)
+    user_mgr.update_user_config(user_id, key, new_value)
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=get_settings_keyboard(user_id)
+        )
+        status = "включено" if new_value else "выключено"
+        await callback.answer(f"{label}: {status}")
+    except Exception as e:
+        logging.error(f"[handlers] toggle {key}: {e}")
+        await callback.answer("❌ Ошибка обновления настроек", show_alert=True)
+
+
+@router.callback_query(F.data == "toggle_cat_sermon")
+async def handle_toggle_cat_sermon(
+    callback: types.CallbackQuery, user_mgr,
+    get_settings_keyboard, check_access_by_user, bot: Bot,
+):
+    await _toggle_user_flag(
+        callback, user_mgr, get_settings_keyboard,
+        check_access_by_user, bot,
+        key="process_sermon", label="🎯 Проповедь",
+    )
+
+
+@router.callback_query(F.data == "toggle_cat_opening")
+async def handle_toggle_cat_opening(
+    callback: types.CallbackQuery, user_mgr,
+    get_settings_keyboard, check_access_by_user, bot: Bot,
+):
+    await _toggle_user_flag(
+        callback, user_mgr, get_settings_keyboard,
+        check_access_by_user, bot,
+        key="process_opening", label="🎬 Начало",
+    )
+
+
+@router.callback_query(F.data == "toggle_cat_other")
+async def handle_toggle_cat_other(
+    callback: types.CallbackQuery, user_mgr,
+    get_settings_keyboard, check_access_by_user, bot: Bot,
+):
+    await _toggle_user_flag(
+        callback, user_mgr, get_settings_keyboard,
+        check_access_by_user, bot,
+        key="process_other", label="📄 Остальные",
+    )
 
 # ==========================================
 # 10. ОБРАБОТЧИКИ ФАЙЛОВ
