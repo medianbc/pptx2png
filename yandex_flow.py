@@ -1,18 +1,32 @@
 # ==========================================
-# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v3.11.1)
+# yandex_flow.py — ОРКЕСТРАЦИЯ ЯНДЕКС.ДИСКА (v4.0)
+# ==========================================
+# Изменения v4.0 (категории):
+#   • 4 категории: opening > prayer > sermon (+ "остальные").
+#     Порядок = приоритет при пересечении, задан в yandex_state.
+#   • item["categories"] — новая структура: {cat: {ranges, matches,
+#     found, manual}}.
+#   • item["selected_categories"] — set из выбранных пользователем
+#     в промпте категорий (opening, prayer, sermon, other).
+#   • Новая клавиатура промпта с toggle-кнопками (yd_cat_toggle:*)
+#     и кнопкой запуска (yd_cat_convert:*).
+#   • Дефолтные галки — из user_config (process_opening/prayer/
+#     sermon/other).
+#   • Конвертация N+1 ZIP: по одному на выбранную категорию + один
+#     на "остальные". Каждая категория — в свою папку первого
+#     уровня под target_base.
+#   • Старые yd_sermon_mode / yd_sermon_edit / _yd_render_sermon_prompt
+#     сохранены для обратной совместимости (fallback, используется
+#     handlers.py для ручного ввода диапазона проповеди).
+#   • _is_sermon_slide оставлена как обёртка для совместимости.
 # ==========================================
 # Изменения v3.11 (по логам v3.10):
 #   • _run_worker_detached — общий запуск worker'а в фоне.
-#     Хендлер yd_pick/yd_sermon_mode возвращается мгновенно,
-#     aiogram не ждёт 79 секунд конвертации.
-#   • _yd_prepare_files / _yd_convert_and_upload запускаются как
-#     detached task. session["worker_task"] = этот task.
-#   • CancelledError, брошенный worker'ом, НЕ долетает до aiogram
-#     (проглатывается в _run_worker_detached).
-#   • cmd_sunday: draft-сессия под локом — защита от параллельного
-#     /sunday в окне YD API запросов (было до 21 сек).
+#   • _yd_prepare_files / _yd_convert_and_upload — detached task.
+#   • CancelledError не долетает до aiogram.
+#   • cmd_sunday: draft-сессия под локом.
 #   • _picker_is_active учитывает _draft-сессию.
-#   • cmd_cancel_yd и yd_cancel_callback отменяют detached worker'ы.
+#   • cmd_cancel_yd / yd_cancel_callback отменяют detached worker'ы.
 # ==========================================
 # Изменения v3.10 (по логам v3.9):
 #   • _safe_answer — глотает «query is too old».
@@ -47,7 +61,7 @@ import tempfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, List, Dict, Tuple
 
 from aiogram import Router, F, types, Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -87,6 +101,67 @@ router = Router()
 
 
 # ==========================================
+# МЕТАДАННЫЕ КАТЕГОРИЙ
+# ==========================================
+
+# Порядок из yandex_state.config (порядок = приоритет при пересечении).
+# Если config ещё не инициализирован (edge-case), используем дефолт.
+_DEFAULT_CATEGORY_ORDER = ["opening", "prayer", "sermon"]
+
+_DEFAULT_CATEGORY_META = {
+    "opening": {
+        "name": "Начало",
+        "emoji": "🌅",
+        "folder_attr": "opening_folder",
+        "zip_suffix": "начало",
+        "settings_flag": "process_opening",
+    },
+    "prayer": {
+        "name": "Молитва",
+        "emoji": "🙏",
+        "folder_attr": "prayer_folder",
+        "zip_suffix": "молитва",
+        "settings_flag": "process_prayer",
+    },
+    "sermon": {
+        "name": "Проповедь",
+        "emoji": "🎯",
+        "folder_attr": "sermon_folder",
+        "zip_suffix": "проповедь",
+        "settings_flag": "process_sermon",
+    },
+}
+
+
+def _cat_order() -> List[str]:
+    """Возвращает актуальный порядок категорий."""
+    return getattr(
+        yandex_state.config, "category_order", _DEFAULT_CATEGORY_ORDER
+    ) or _DEFAULT_CATEGORY_ORDER
+
+
+def _cat_meta() -> Dict[str, dict]:
+    """Возвращает актуальные метаданные категорий."""
+    return getattr(
+        yandex_state.config, "category_meta", _DEFAULT_CATEGORY_META
+    ) or _DEFAULT_CATEGORY_META
+
+
+def _cat_folder_path(cat: str, target_base: str) -> str:
+    """Возвращает полный путь папки категории под target_base."""
+    meta = _cat_meta().get(cat, {})
+    folder_attr = meta.get("folder_attr")
+    folder_name = (
+        getattr(yandex_state.config, folder_attr, "")
+        if folder_attr else ""
+    )
+    if not folder_name:
+        # Fallback — имя из метаданных
+        folder_name = meta.get("name", cat)
+    return f"{target_base}/{folder_name}"
+
+
+# ==========================================
 # УТИЛИТЫ
 # ==========================================
 
@@ -121,10 +196,7 @@ def _safe_unlink(path: Path):
 
 
 async def _safe_edit(msg, text: str, **kwargs) -> bool:
-    """
-    Безопасный edit_text.
-    Различает 'message is not modified', 'query is too old' и прочие.
-    """
+    """Безопасный edit_text. Различает служебные TelegramBadRequest."""
     if msg is None:
         return False
     try:
@@ -151,10 +223,7 @@ async def _safe_answer(
     text: str = "",
     show_alert: bool = False,
 ) -> None:
-    """
-    Безопасный callback.answer.
-    Глотает TelegramBadRequest «query is too old» / «query ID is invalid».
-    """
+    """Безопасный callback.answer — глотает 'query is too old'."""
     try:
         await callback.answer(text, show_alert=show_alert)
     except TelegramBadRequest as e:
@@ -194,10 +263,9 @@ def _ranges_to_start_end(ranges):
 
 def _normalize_item_ranges(item: dict) -> None:
     """
-    Приводит item к консистентному виду:
-      • если есть ranges, start/end пересчитываются из них;
-      • если ranges нет, но есть start/end, формируется ranges=[(start, end)];
-      • иначе — обнуляет оба поля.
+    Приводит item к консистентному виду.
+    Для v4.0 обновляет ТОЛЬКО "плоские" start/end/ranges (совместимость
+    со старым yd_sermon_edit). Категории не трогает.
     """
     ranges = item.get("ranges")
     start = item.get("start")
@@ -219,7 +287,7 @@ def _normalize_item_ranges(item: dict) -> None:
 
 
 def _is_sermon_slide(item: dict, slide_idx: int) -> bool:
-    """Проверяет, относится ли слайд к проповеди."""
+    """Совместимость со старым кодом. Проверяет плоские ranges."""
     ranges = item.get("ranges")
     if ranges:
         return any(s <= slide_idx <= e for s, e in ranges)
@@ -280,54 +348,137 @@ def _count_slides_in_ranges(ranges, total_slides: int) -> int:
     return len(unique_slides)
 
 
-def _picker_is_active(picker: Optional[dict]) -> bool:
-    """
-    Пикер активен, если:
-      • processing=True (yd_pick в окне до регистрации task_id), ИЛИ
-      • _draft=True (cmd_sunday в окне YD API запросов), ИЛИ
-      • есть живые (не отменённые) task_id.
-    """
-    return _picker_status(picker) != "idle"
+# ==========================================
+# КАТЕГОРИИ — ЯДРО v4.0
+# ==========================================
 
-
-def _picker_status(picker: Optional[dict]) -> str:
+def _detect_all_categories(
+    notes,
+    notes_ok: bool,
+    incomplete: bool,
+) -> Dict[str, dict]:
     """
-    Возвращает состояние пикера:
-      • "none"    — сессии нет;
-      • "draft"   — cmd_sunday в окне YD API запросов (сессия ещё
-                    не готова, показывать список файлов нельзя);
-      • "working" — есть активная задача (task_ids) или selected-окно;
-      • "idle"    — сессия готова, ждём выбора пользователя.
-                    Можно перезаписать новым /sunday.
+    Детектит все категории в заметках.
+    Возвращает: {cat: {"ranges": ..., "matches": [...], "found": bool}}
+    Порядок ключей соответствует _cat_order().
     """
-    if not picker:
-        return "none"
-    if picker.get("_draft"):
-        return "draft"
-    if picker.get("processing"):
-        return "working"
-    for tid in picker.get("task_ids", []):
-        task_sess = sessions.get(tid)
-        if task_sess is not None and not task_sess.get("cancelled"):
-            return "working"
-    return "idle"
+    result: Dict[str, dict] = {}
 
+    if not notes_ok or incomplete or not notes:
+        for cat in _cat_order():
+            result[cat] = {"ranges": None, "matches": [], "found": False}
+        return result
 
-def _picker_has_live_tasks_locked(
-    picker_key: str,
-    exclude_task_id: Optional[str] = None,
-) -> bool:
-    """Проверяет наличие живых sibling-задач. Вызывать под yd_session_lock."""
-    picker = sessions.get(picker_key)
-    if picker is None:
-        return False
-    for tid in picker.get("task_ids", []):
-        if tid == exclude_task_id:
+    # Маппинг категория → ключевые слова из config
+    kw_map = {
+        "opening": getattr(yandex_state.config, "opening_keywords", []),
+        "prayer":  getattr(yandex_state.config, "prayer_keywords", []),
+        "sermon":  getattr(yandex_state.config, "sermon_keywords", []),
+    }
+
+    for cat in _cat_order():
+        kws = kw_map.get(cat) or []
+        if not kws:
+            result[cat] = {"ranges": None, "matches": [], "found": False}
             continue
-        task_sess = sessions.get(tid)
-        if task_sess is not None and not task_sess.get("cancelled"):
-            return True
-    return False
+
+        try:
+            start, end, matches = find_sermon_range(notes, kws)
+        except Exception as e:
+            logging.error(
+                f"[YD-CAT] find_sermon_range({cat}) упал: {e}",
+                exc_info=True,
+            )
+            result[cat] = {"ranges": None, "matches": [], "found": False}
+            continue
+
+        # Одна пометка — авто-диапазон не строим
+        if matches and len(matches) == 1:
+            start, end = None, None
+
+        ranges = [(start, end)] if start is not None else None
+        result[cat] = {
+            "ranges": ranges,
+            "matches": list(matches) if matches else [],
+            "found": bool(ranges or matches),
+        }
+
+    logging.debug(
+        f"[YD-CAT] detect: "
+        + ", ".join(
+            f"{cat}={'ok' if result[cat]['found'] else 'no'}"
+            for cat in _cat_order()
+        )
+    )
+    return result
+
+
+def _classify_slide(item: dict, slide_idx: int) -> Optional[str]:
+    """
+    Определяет, к какой категории относится слайд.
+    Приоритет = порядок _cat_order() (opening > prayer > sermon).
+    Возвращает имя категории или None.
+    """
+    cats = item.get("categories", {})
+    for cat in _cat_order():
+        cat_data = cats.get(cat)
+        if not cat_data or not cat_data.get("found"):
+            continue
+        ranges = cat_data.get("ranges") or []
+        if any(s <= slide_idx <= e for s, e in ranges):
+            return cat
+    return None
+
+
+def _count_category_slides(item: dict) -> Dict[str, int]:
+    """
+    Возвращает {cat: slide_count, "other": n, "total": total}.
+    При пересечении слайд считается только в первую (приоритетную) категорию.
+    """
+    total = item.get("total_slides", 0)
+    counts = {cat: 0 for cat in _cat_order()}
+    counts["other"] = 0
+    counts["total"] = total
+
+    if total <= 0:
+        return counts
+
+    for slide_idx in range(1, total + 1):
+        cat = _classify_slide(item, slide_idx)
+        if cat is None:
+            counts["other"] += 1
+        else:
+            counts[cat] += 1
+
+    return counts
+
+
+def _get_default_selected_categories(
+    item: dict,
+    user_config: dict,
+) -> set:
+    """
+    Возвращает set категорий, отмеченных по умолчанию:
+      • found=True И settings_flag=True → в selected
+      • "other" → в selected, если process_other=True И other_count > 0
+    """
+    selected = set()
+    cats = item.get("categories", {})
+    meta = _cat_meta()
+
+    for cat in _cat_order():
+        cat_data = cats.get(cat)
+        if not cat_data or not cat_data.get("found"):
+            continue
+        flag = meta.get(cat, {}).get("settings_flag", f"process_{cat}")
+        if user_config.get(flag, True):
+            selected.add(cat)
+
+    counts = _count_category_slides(item)
+    if user_config.get("process_other", False) and counts.get("other", 0) > 0:
+        selected.add("other")
+
+    return selected
 
 
 # ==========================================
@@ -347,6 +498,10 @@ _active_spinners: dict[str, tuple[asyncio.Event, asyncio.Task]] = {}
 def _mode_label(mode: str) -> str:
     if mode == "skip":
         return "⏭ Пропущено"
+    # v4.0: cat-моды имеют метки из category_meta
+    meta = _cat_meta().get(mode)
+    if meta:
+        return f"{meta['emoji']} {meta['name']}"
     return _MODE_LABELS.get(mode, f"❓ {mode}")
 
 
@@ -436,19 +591,10 @@ async def _yd_with_spinner(status_msg, task_id: str, base_text: str, coro):
 # ЗАЩИТА IN-FLIGHT ОПЕРАЦИЙ
 # ==========================================
 
-# Реестр in-flight операций: task_id -> set[asyncio.Task]
 _active_ops: dict[str, set[asyncio.Task]] = {}
-
-# Реестр отложенных cleanup-задач
 _deferred_cleanup_tasks: set[asyncio.Task] = set()
-
-# Реестр папок в очереди на deferred cleanup
 _deferred_dirs: set[Path] = set()
-
-# Реестр задач, для которых сейчас выполняется _yd_cleanup_task
 _cleaning_tasks: set[str] = set()
-
-# ✅ v3.11: реестр detached worker'ов — для drain при shutdown.
 _detached_workers: set[asyncio.Task] = set()
 
 
@@ -507,15 +653,11 @@ def _spawn_deferred_cleanup(task_dir: Path, ops: list) -> None:
     if task_dir is None:
         return
     if task_dir in _deferred_dirs:
-        logging.info(
-            f"[YD-DEFERRED] {task_dir} уже в очереди — skip"
-        )
+        logging.info(f"[YD-DEFERRED] {task_dir} уже в очереди — skip")
         return
     _deferred_dirs.add(task_dir)
 
-    task = asyncio.create_task(
-        _yd_deferred_task_dir_cleanup(task_dir, ops)
-    )
+    task = asyncio.create_task(_yd_deferred_task_dir_cleanup(task_dir, ops))
     _deferred_cleanup_tasks.add(task)
 
     def _done(t: asyncio.Task):
@@ -530,10 +672,7 @@ async def _cancel_worker_async(
     task_id: str,
     timeout: float = 15.0,
 ) -> None:
-    """
-    Фоновый cancel worker'а.
-    Не блокирует event loop.
-    """
+    """Фоновая отмена worker'а."""
     if worker is None or worker.done() or worker is asyncio.current_task():
         return
     try:
@@ -566,21 +705,12 @@ async def _run_worker_detached(
     *,
     name: str = "yd_worker",
 ) -> asyncio.Task:
-    """
-    ✅ v3.11: запускает worker в отдельном task'е, регистрирует в
-    session[task_id]["worker_task"], возвращает управление сразу.
-
-    Гарантии:
-      • CancelledError, брошенный worker'ом, не долетает до aiogram.
-      • worker завершает cleanup сам (в своих except CancelledError).
-      • _deferred_cleanup_tasks пополняется — drain при shutdown.
-    """
+    """Запускает worker в отдельном task'е, регистрирует в session, возвращает сразу."""
     async def _wrapper():
         try:
             await coro_factory()
         except asyncio.CancelledError:
             logging.info(f"[YD-WORKER] {name} {task_id} отменён")
-            # cleanup уже сделан внутри корутины в её except CancelledError.
         except Exception as e:
             logging.error(
                 f"[YD-WORKER] {name} {task_id} упал: {e}", exc_info=True
@@ -591,14 +721,12 @@ async def _run_worker_detached(
 
     def _done(t: asyncio.Task):
         _detached_workers.discard(t)
-        # Снимаем ссылку из сессии, если она всё ещё указывает на нас.
         sess = sessions.get(task_id)
         if sess is not None and sess.get("worker_task") is t:
             sess["worker_task"] = None
 
     worker.add_done_callback(_done)
 
-    # Регистрируем worker в сессии, если она есть.
     async with yd_session_lock:
         sess = sessions.get(task_id)
         if sess is not None:
@@ -608,7 +736,7 @@ async def _run_worker_detached(
 
 
 async def drain_deferred_cleanups(timeout: float = 30.0) -> None:
-    """Дожидается завершения всех отложенных cleanup-задач и detached worker'ов."""
+    """Дожидается завершения отложенных cleanup-задач и detached worker'ов."""
     pending_cleanups = [t for t in _deferred_cleanup_tasks if not t.done()]
     pending_workers = [t for t in _detached_workers if not t.done()]
 
@@ -649,10 +777,7 @@ async def _yd_prepare_files_impl(
     session_key: str,
     nonce: str,
 ):
-    """
-    Первая фаза: скачивание + извлечение заметок + определение проповеди.
-    Вызывается внутри detached worker'а.
-    """
+    """Первая фаза: скачивание + извлечение заметок + детект категорий."""
     status_msg = callback.message
     owner_user_id = callback.from_user.id
     chat_id = callback.message.chat.id
@@ -683,7 +808,7 @@ async def _yd_prepare_files_impl(
                 "nonce": nonce,
                 "created_at": time.time(),
                 "cancelled": False,
-                "worker_task": None,  # заполнит _run_worker_detached
+                "worker_task": None,
             }
             yd_active_tasks.add(task_id)
 
@@ -736,7 +861,8 @@ async def _yd_prepare_files_impl(
     cleanup_done = False
     try:
         target_base = paths["target"]
-        quality = user_mgr.get_user_config(owner_user_id)["quality"]
+        user_config = user_mgr.get_user_config(owner_user_id)
+        quality = user_config.get("quality", "2k")
 
         prepared = []
 
@@ -922,49 +1048,67 @@ async def _yd_prepare_files_impl(
                 task_id, extract_speaker_notes, str(normalized_pptx)
             )
 
+            # ✅ v4.0: детектим все категории
+            categories = _detect_all_categories(
+                notes, notes_ok, incomplete
+            )
+
             if not notes_ok:
-                start, end, matches = None, None, []
                 incomplete_warning = (
                     "⚠️ Не удалось прочитать заметки докладчика."
                 )
             elif incomplete:
-                start, end, matches = None, None, []
                 incomplete_warning = (
                     "⚠️ Заметки прочитаны частично, "
-                    "проповедь не определена автоматически."
+                    "категории не определены автоматически."
                 )
             else:
-                keywords = yandex_state.config.sermon_keywords or [
-                    yandex_state.config.sermon_keyword
-                ]
-                start, end, matches = find_sermon_range(notes, keywords)
-                if matches and len(matches) == 1:
-                    start, end = None, None
                 incomplete_warning = None
 
             logging.info(
                 f"[YD-PREP] {file_name}: заметок={len(notes)}, "
-                f"matches={len(matches)}, start={start}, end={end}, "
-                f"notes_ok={notes_ok}, incomplete={incomplete}"
+                f"categories="
+                + ", ".join(
+                    f"{c}({categories[c]['found']})"
+                    for c in _cat_order()
+                )
+                + f", notes_ok={notes_ok}, incomplete={incomplete}"
             )
 
-            item_ranges = [(start, end)] if start is not None else None
+            # Совместимость со старым кодом: плоские ranges/start/end
+            # = sermon (для yd_sermon_edit и handlers.py)
+            sermon_data = categories.get("sermon") or {}
+            legacy_ranges = sermon_data.get("ranges")
+            legacy_start, legacy_end = _ranges_to_start_end(legacy_ranges)
 
-            prepared.append({
+            item = {
                 "file_name": file_name,
                 "file_slug": safe_folder_name(file_name),
                 "file_path": normalized_pptx,
                 "total_slides": total_slides,
-                "start": start,
-                "end": end,
-                "ranges": item_ranges,
-                "matches": matches,
+                # ✅ v4.0: категории
+                "categories": categories,
+                # Совместимость со старым
+                "start": legacy_start,
+                "end": legacy_end,
+                "ranges": legacy_ranges,
+                "matches": sermon_data.get("matches", []),
                 "notes_ok": notes_ok,
                 "incomplete": incomplete,
                 "incomplete_warning": incomplete_warning,
                 "confirmed": False,
                 "convert_mode": None,
-            })
+                # ✅ v4.0: дефолтные галки и конфиг пользователя
+                "selected_categories": None,  # заполним при рендере
+                "_user_config": dict(user_config),
+            }
+
+            # Дефолтные галки
+            item["selected_categories"] = _get_default_selected_categories(
+                item, user_config
+            )
+
+            prepared.append(item)
 
         cleanup_needed = False
         async with yd_session_lock:
@@ -1017,10 +1161,11 @@ async def _yd_prepare_files_impl(
         )
 
         if not needs_confirm:
+            # Все файлы уже подтверждены (не должно случаться на новом коде)
             for item in prepared:
-                if item.get("convert_mode") is None:
-                    item["convert_mode"] = "both"
-            # ✅ v3.11: запускаем convert как detached worker.
+                if not item.get("selected_categories"):
+                    item["selected_categories"] = {"other"} if "file_path" in item else set()
+                item["confirmed"] = True
             await _run_worker_detached(
                 task_id,
                 lambda: _yd_convert_and_upload_impl(
@@ -1032,11 +1177,10 @@ async def _yd_prepare_files_impl(
             )
             return
 
-        await _yd_ask_sermon_confirmation(
-            callback=callback,
+        await _yd_render_category_prompt(
             task_id=task_id,
+            item=needs_confirm[0],
             status_msg=status_msg,
-            needs_confirm=needs_confirm,
         )
 
     except asyncio.CancelledError:
@@ -1076,12 +1220,7 @@ async def _yd_prepare_files(
     session_key: str,
     nonce: str,
 ) -> asyncio.Task:
-    """
-    ✅ v3.11: запускает _yd_prepare_files_impl как detached worker.
-    Возвращает Task. Хендлер yd_pick не ждёт.
-    """
-    # task_id создаётся внутри impl, но нам он нужен для именования worker'а.
-    # Генерируем временный — перезапишется в impl.
+    """Запускает _yd_prepare_files_impl как detached worker."""
     temp_task_id = f"yd_pending_{secrets.token_hex(4)}"
 
     async def _factory():
@@ -1102,19 +1241,8 @@ async def _yd_prepare_files(
     )
 
 
-async def _yd_ask_sermon_confirmation(
-    callback: types.CallbackQuery,
-    task_id: str,
-    status_msg,
-    needs_confirm: list,
-):
-    if not needs_confirm:
-        return
-    await _yd_render_sermon_prompt(task_id, needs_confirm[0], status_msg)
-
-
 # ==========================================
-# ПРОМПТЫ
+# ПРОМПТЫ — СТАРЫЙ (fallback) и НОВЫЙ (v4.0)
 # ==========================================
 
 async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
@@ -1174,13 +1302,285 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     return pending
 
 
+# ------------------------------------------------------------
+# НОВЫЙ ПРОМПТ v4.0 — toggle-клавиатура категорий
+# ------------------------------------------------------------
+
+def _render_category_toggle_keyboard(
+    task_id: str, idx: int, nonce: str,
+    item: dict,
+    selected: set,
+    total_slides: int,
+) -> InlineKeyboardBuilder:
+    """
+    Клавиатура с toggle-кнопками категорий.
+
+    Для каждой категории (opening, prayer, sermon):
+      ✅ 🌅 Начало (1–5, 5 с.)       [если found и в selected]
+      ⬜ 🌅 Начало (1–5, 5 с.)       [если found и не в selected]
+      ⚫ 🌅 Начало — не найдено       [если !found, disabled]
+
+    «Остальные»:
+      ✅ 📄 Остальные (194 с.)        [если в selected]
+      ⬜ 📄 Остальные (194 с.)        [если не в selected и > 0]
+
+    Плюс:
+      ✏️ Изменить диапазон категории
+      ✅ Конвертировать выбранные (N с.)
+      ❌ Отменить
+    """
+    kb = InlineKeyboardBuilder()
+    counts = _count_category_slides(item)
+    cats = item.get("categories", {})
+    meta = _cat_meta()
+
+    for cat in _cat_order():
+        cat_meta = meta.get(cat, {})
+        emoji = cat_meta.get("emoji", "❓")
+        name = cat_meta.get("name", cat)
+        cat_data = cats.get(cat) or {}
+        found = bool(cat_data.get("found"))
+        count = counts.get(cat, 0)
+
+        if not found:
+            kb.row(InlineKeyboardButton(
+                text=f"⚫ {emoji} {name} — не найдено",
+                callback_data=f"yd_cat_noop:{task_id}:{idx}:{nonce}:{cat}",
+            ))
+            continue
+
+        ranges = cat_data.get("ranges") or []
+        ranges_text = _format_ranges_text(ranges)
+        check = "✅" if cat in selected else "⬜"
+        if count > 0:
+            text = f"{check} {emoji} {name} ({ranges_text}, {count} с.)"
+        else:
+            text = f"{check} {emoji} {name} ({ranges_text})"
+
+        kb.row(InlineKeyboardButton(
+            text=text,
+            callback_data=f"yd_cat_toggle:{task_id}:{idx}:{nonce}:{cat}",
+        ))
+
+    # Остальные
+    other_count = counts.get("other", 0)
+    if other_count > 0:
+        check = "✅" if "other" in selected else "⬜"
+        kb.row(InlineKeyboardButton(
+            text=f"{check} 📄 Остальные ({other_count} с.)",
+            callback_data=f"yd_cat_toggle:{task_id}:{idx}:{nonce}:other",
+        ))
+
+    # Изменить диапазон
+    kb.row(InlineKeyboardButton(
+        text="✏️ Изменить диапазон категории",
+        callback_data=f"yd_cat_edit:{task_id}:{idx}:{nonce}",
+    ))
+
+    # Итоговое количество слайдов
+    total_selected = 0
+    for cat in _cat_order():
+        if cat in selected:
+            total_selected += counts.get(cat, 0)
+    if "other" in selected:
+        total_selected += other_count
+
+    # Конвертировать (если что-то выбрано)
+    if total_selected > 0:
+        kb.row(InlineKeyboardButton(
+            text=f"✅ Конвертировать выбранные ({total_selected} с.)",
+            callback_data=f"yd_cat_convert:{task_id}:{idx}:{nonce}",
+        ))
+    else:
+        kb.row(InlineKeyboardButton(
+            text="✅ Конвертировать выбранные",
+            callback_data=f"yd_cat_noop:{task_id}:{idx}:{nonce}:empty",
+        ))
+
+    kb.row(InlineKeyboardButton(
+        text="❌ Отменить задачу",
+        callback_data=f"yd_task_cancel:{task_id}",
+    ))
+
+    return kb
+
+
+def _render_category_prompt_text(item: dict, selected: set) -> str:
+    """Формирует текст промпта категорий."""
+    file_name = item.get("file_name", "")
+    file_esc = html_module.escape(file_name)
+    total_slides = item.get("total_slides", 0)
+    cats = item.get("categories", {})
+    meta = _cat_meta()
+    counts = _count_category_slides(item)
+
+    lines = [
+        f"🎬 <b>Выбор категорий для конвертации</b>",
+        "",
+        f"📄 Файл: <code>{file_esc}</code>",
+        f"📌 Всего слайдов: <b>{total_slides}</b>",
+        "",
+    ]
+
+    # Информация по найденным
+    found_lines = []
+    for cat in _cat_order():
+        cat_data = cats.get(cat) or {}
+        if not cat_data.get("found"):
+            continue
+        cat_meta = meta.get(cat, {})
+        emoji = cat_meta.get("emoji", "❓")
+        name = cat_meta.get("name", cat)
+        count = counts.get(cat, 0)
+        ranges = cat_data.get("ranges") or []
+        ranges_text = _format_ranges_text(ranges)
+        manual = " (вручную)" if cat_data.get("manual") else ""
+        found_lines.append(
+            f"{emoji} {name}{manual}: <b>{ranges_text}</b> ({count} с.)"
+        )
+
+    if found_lines:
+        lines.extend(found_lines)
+        lines.append("")
+    else:
+        lines.append("⚠️ <i>Ни одна категория не найдена автоматически.</i>")
+        lines.append("")
+
+    # Про остальные
+    other_count = counts.get("other", 0)
+    if other_count > 0:
+        lines.append(f"📄 Остальные: <b>{other_count} с.</b>")
+        lines.append("")
+
+    lines.append("🎯 <b>Отметьте категории для конвертации:</b>")
+
+    # Предупреждение, если ничего не отмечено
+    if not selected:
+        lines.append("")
+        lines.append(
+            "⚠️ <i>Ничего не выбрано. Отметьте хотя бы одну категорию.</i>"
+        )
+
+    return "\n".join(lines)
+
+
+async def _yd_render_category_prompt(
+    task_id: str,
+    item: dict,
+    status_msg,
+    reply_fn=None,
+) -> None:
+    """Рендер нового промпта категорий."""
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        return
+    if session.get("cancelled"):
+        return
+    pending = session["pending"]
+    if not isinstance(pending, dict):
+        return
+
+    try:
+        idx = pending["prepared"].index(item)
+    except (ValueError, KeyError):
+        logging.error(
+            f"_yd_render_category_prompt: item не найден для {task_id}"
+        )
+        return
+
+    pending["prompt_idx"] = idx
+
+    if pending.get("prompt_nonce") is None:
+        pending["prompt_nonce"] = secrets.token_hex(4)
+    prompt_nonce = pending["prompt_nonce"]
+
+    total_slides = item.get("total_slides", 0)
+    if total_slides == 0:
+        file_path = item.get("file_path")
+        if file_path and Path(file_path).exists():
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(file_path))
+                total_slides = len(prs.slides._sldIdLst)
+                item["total_slides"] = total_slides
+            except Exception as e:
+                logging.warning(
+                    f"Не удалось определить число слайдов: {e}"
+                )
+
+    # Дефолтные галки, если ещё не заданы
+    if item.get("selected_categories") is None:
+        item["selected_categories"] = _get_default_selected_categories(
+            item, item.get("_user_config", {})
+        )
+    selected = set(item.get("selected_categories") or set())
+
+    text = _render_category_prompt_text(item, selected)
+    kb = _render_category_toggle_keyboard(
+        task_id, idx, prompt_nonce, item, selected, total_slides
+    )
+
+    sent_msg = None
+    if reply_fn is not None:
+        sent_msg = await reply_fn(
+            text, parse_mode="HTML", reply_markup=kb.as_markup()
+        )
+    elif status_msg is not None:
+        await status_msg.edit_text(
+            text, parse_mode="HTML", reply_markup=kb.as_markup()
+        )
+        sent_msg = status_msg
+    else:
+        logging.warning(
+            f"_yd_render_category_prompt: нет ни reply_fn, ни status_msg "
+            f"для {task_id}"
+        )
+        return
+
+    if pending.get("prompt_nonce") != prompt_nonce:
+        logging.info(
+            f"_yd_render_category_prompt: nonce изменён конкурентно"
+        )
+        return
+
+    if sent_msg is not None and hasattr(sent_msg, "message_id"):
+        pending["prompt_message_id"] = sent_msg.message_id
+
+    # Watchdog
+    existing_task = pending.get("prompt_timeout_task")
+    existing_nonce = pending.get("prompt_watchdog_nonce")
+
+    if existing_task is not None and not existing_task.done():
+        if existing_nonce == prompt_nonce:
+            return
+        existing_task.cancel()
+        pending["prompt_timeout_task"] = None
+        pending["prompt_watchdog_nonce"] = None
+
+    pending["prompt_timeout_task"] = asyncio.create_task(
+        _yd_prompt_timeout_watchdog(
+            task_id, yandex_state.config.prompt_timeout_sec, prompt_nonce
+        )
+    )
+    pending["prompt_watchdog_nonce"] = prompt_nonce
+
+
+# ------------------------------------------------------------
+# СТАРЫЙ ПРОМПТ (fallback для yd_sermon_edit и handlers.py)
+# ------------------------------------------------------------
+
 async def _yd_render_sermon_prompt(
     task_id: str,
     item: dict,
     status_msg,
     reply_fn=None,
 ) -> None:
-    """Единая точка отрисовки промпта подтверждения проповеди."""
+    """
+    Старый промпт с 3 кнопками (sermon / other / both).
+    Используется:
+      • handlers.py после ручного ввода диапазона проповеди;
+      • как fallback, если v4.0-промпт недоступен.
+    """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
         return
@@ -1229,12 +1629,6 @@ async def _yd_render_sermon_prompt(
     has_valid_range = (
         bool(ranges)
         or (start is not None and end is not None and start <= end)
-    )
-
-    logging.debug(
-        f"[YD-PROMPT] task_id={task_id}, idx={idx}, file={file_name!r}, "
-        f"matches={len(matches)}, start={start}, end={end}, ranges={ranges}, "
-        f"has_valid_range={has_valid_range}, total_slides={total_slides}"
     )
 
     if has_valid_range:
@@ -1373,7 +1767,7 @@ async def _yd_render_sermon_prompt(
 
     if pending.get("prompt_nonce") != prompt_nonce:
         logging.info(
-            f"_yd_render_sermon_prompt: nonce изменён конкурентно для {task_id}"
+            f"_yd_render_sermon_prompt: nonce изменён конкурентно"
         )
         return
 
@@ -1401,7 +1795,7 @@ async def _yd_render_sermon_prompt(
 async def _yd_prompt_timeout_watchdog(
     task_id: str, timeout_sec: int, expected_nonce: str
 ):
-    """Если пользователь не ответил на промпт — уведомляем и очищаем."""
+    """Если пользователь не ответил — уведомляем и очищаем."""
     try:
         await asyncio.sleep(timeout_sec)
 
@@ -1495,7 +1889,7 @@ async def _yd_cleanup_task(
     status_msg=None,
     error: Optional[Exception] = None,
 ):
-    """Идемпотентная очистка. Защищена реестром _cleaning_tasks."""
+    """Идемпотентная очистка."""
     async with yd_session_lock:
         if task_id in _cleaning_tasks:
             logging.info(
@@ -1515,6 +1909,7 @@ async def _yd_cleanup_task(
         except Exception as e:
             logging.debug(f"[YD-CLEANUP] _yd_stop_spinner: {e}")
 
+        # Снимаем клавиатуру
         try:
             session = sessions.get(task_id)
             if session is not None:
@@ -1565,6 +1960,7 @@ async def _yd_cleanup_task(
         else:
             _safe_delete_task_dir(task_dir)
 
+        # Watchdog
         try:
             session = sessions.get(task_id)
             if session is not None:
@@ -1588,6 +1984,7 @@ async def _yd_cleanup_task(
                 f"Ошибка отмены watchdog для {task_id}: {e}", exc_info=True
             )
 
+        # Сессии
         try:
             async with yd_session_lock:
                 picker = sessions.get(session_key)
@@ -1638,7 +2035,7 @@ async def _yd_cleanup_task(
 
 
 # ==========================================
-# КОНВЕРТАЦИЯ + UPLOAD (внутренняя реализация)
+# КОНВЕРТАЦИЯ + UPLOAD (v4.0 — N+1 ZIP)
 # ==========================================
 
 async def _yd_convert_and_upload_impl(
@@ -1647,8 +2044,9 @@ async def _yd_convert_and_upload_impl(
     status_msg,
 ):
     """
-    Вторая фаза: конвертация PNG + упаковка в ZIP + upload.
-    Вызывается как detached worker.
+    Вторая фаза v4.0: конвертация PNG + N+1 ZIP + upload.
+    Для каждой выбранной категории — свой ZIP в свою папку.
+    Для «остальных» — ZIP в pptx2png/{file_slug}/.
     """
     session = sessions.get(task_id)
     if not session or "pending" not in session:
@@ -1692,7 +2090,7 @@ async def _yd_convert_and_upload_impl(
     cleanup_done = False
 
     logging.info(
-        f"[YD-UP] Старт: task_id={task_id}, файлов={len(prepared)}, "
+        f"[YD-UP] Старт v4.0: task_id={task_id}, файлов={len(prepared)}, "
         f"target_base={target_base!r}"
     )
 
@@ -1705,9 +2103,11 @@ async def _yd_convert_and_upload_impl(
         total_failed = 0
         report_lines = [f"📁 Обработано файлов: <b>{len(prepared)}</b>\n"]
         links_by_folder: dict[str, str] = {}
+        meta = _cat_meta()
 
         for f_idx, item in enumerate(prepared, start=1):
             _touch_task(task_dir)
+            # Совместимость — синхронизируем плоские поля с sermon
             _normalize_item_ranges(item)
 
             if _is_cancelled():
@@ -1717,13 +2117,6 @@ async def _yd_convert_and_upload_impl(
             file_name = item["file_name"]
             file_name_esc = html_module.escape(file_name)
             file_slug = item["file_slug"]
-
-            if item.get("convert_mode") == "skip":
-                logging.info(f"[YD-UP] {file_name}: пропущен пользователем")
-                report_lines.append(
-                    f"⏭ {file_name_esc} — пропущен пользователем"
-                )
-                continue
 
             if item.get("failed_at_stage"):
                 stage = item["failed_at_stage"]
@@ -1745,31 +2138,41 @@ async def _yd_convert_and_upload_impl(
                 total_failed += 1
                 continue
 
-            start = item.get("start")
-            end = item.get("end")
-            ranges = item.get("ranges")
-            convert_mode = item.get("convert_mode", "both")
-            incomplete_warning = item.get("incomplete_warning")
+            selected = set(item.get("selected_categories") or set())
+            if not selected:
+                logging.warning(
+                    f"[YD-UP] {file_name}: ничего не выбрано — пропускаем"
+                )
+                report_lines.append(
+                    f"⏭ {file_name_esc} — ничего не выбрано"
+                )
+                continue
+
+            # Формируем шапку статуса
+            selected_labels = []
+            for cat in _cat_order():
+                if cat in selected:
+                    cm = meta.get(cat, {})
+                    selected_labels.append(
+                        f"{cm.get('emoji','❓')} {cm.get('name',cat)}"
+                    )
+            if "other" in selected:
+                selected_labels.append("📄 Остальные")
+            label_line = " + ".join(selected_labels) if selected_labels else "—"
 
             logging.info(
                 f"[YD-UP] Файл #{f_idx}: {file_name!r}, "
-                f"convert_mode={convert_mode}, ranges={ranges}, "
-                f"start={start}, end={end}"
+                f"selected={sorted(selected)}"
             )
 
-            mode_label = _mode_label(convert_mode)
-            ranges_str = _format_ranges_text(ranges, start, end)
-
             header_lines = [
-                f"🎬 <b>{mode_label}</b>",
+                f"🎬 <b>Выбранные категории:</b> {label_line}",
                 f"📄 Файл: <code>{file_name_esc}</code>",
+                "",
             ]
-            if ranges or (start is not None and end is not None):
-                header_lines.append(f"📊 Диапазон: <code>{ranges_str}</code>")
-            header_lines.append("")
             header = "\n".join(header_lines)
 
-            base_convert_text = f"{header}\n⚙️ Конвертирую в PNG"
+            base_convert_text = f"{header}⚙️ Конвертирую в PNG"
 
             await _safe_edit(
                 status_msg,
@@ -1781,6 +2184,7 @@ async def _yd_convert_and_upload_impl(
             temp_png_dir = task_dir / f"png_{f_idx}"
             temp_png_dir.mkdir(exist_ok=True)
 
+            # === Конвертация PNG ===
             try:
                 pngs, used_pptx = await _yd_with_spinner(
                     status_msg,
@@ -1816,252 +2220,282 @@ async def _yd_convert_and_upload_impl(
                 logging.info(f"[YD-UP] Отмена после конвертации {file_name}")
                 return
 
-            sermon_pngs = []
-            other_pngs = []
+            # === Классификация по категориям (приоритет opening>prayer>sermon) ===
+            pngs_by_cat: Dict[str, List[Path]] = {
+                cat: [] for cat in _cat_order()
+            }
+            pngs_by_cat["other"] = []
+
             for slide_idx, png_path in enumerate(pngs_sorted, start=1):
-                if _is_sermon_slide(item, slide_idx):
-                    sermon_pngs.append(png_path)
+                cat = _classify_slide(item, slide_idx)
+                if cat is None:
+                    pngs_by_cat["other"].append(png_path)
                 else:
-                    other_pngs.append(png_path)
+                    pngs_by_cat[cat].append(png_path)
 
-            ranges_text = ranges_str
+            logging.debug(
+                f"[YD-UP] {file_name}: классификация "
+                + ", ".join(
+                    f"{c}={len(pngs_by_cat[c])}"
+                    for c in list(_cat_order()) + ["other"]
+                )
+            )
 
+            # === Подготовка папок ===
             pptx2png_dir = (
                 f"{target_base}/{yandex_state.config.pptx2png_folder}/{file_slug}"
             )
-            sermon_dir = f"{target_base}/{yandex_state.config.sermon_folder}"
 
-            need_pptx2png_folder = convert_mode in ("other", "both")
-            need_sermon_folder = convert_mode in ("sermon", "both")
+            need_other = (
+                "other" in selected and pngs_by_cat["other"]
+            )
 
-            if need_pptx2png_folder:
-                ok1 = await _yd_async_protected(
+            if need_other:
+                ok0 = await _yd_async_protected(
                     task_id,
                     yandex_state.config.client.ensure_folder(pptx2png_dir),
                 )
-                if not ok1:
+                if not ok0:
                     logging.error(
                         f"[YD-UP] {file_name}: не удалось создать {pptx2png_dir!r}"
                     )
                     report_lines.append(
-                        f"❌ {file_name_esc} — не удалось создать папки"
+                        f"❌ {file_name_esc} — не удалось создать папку остальных"
                     )
                     total_failed += 1
                     continue
 
-            if need_sermon_folder and sermon_pngs:
-                ok2 = await _yd_async_protected(
+            cat_folders_ok = {}
+            for cat in _cat_order():
+                if cat not in selected or not pngs_by_cat[cat]:
+                    continue
+                folder = _cat_folder_path(cat, target_base)
+                ok = await _yd_async_protected(
                     task_id,
-                    yandex_state.config.client.ensure_folder(sermon_dir),
+                    yandex_state.config.client.ensure_folder(folder),
                 )
-                if not ok2:
+                cat_folders_ok[cat] = ok
+                if not ok:
                     logging.error(
-                        f"[YD-UP] {file_name}: не удалось создать {sermon_dir!r}"
+                        f"[YD-UP] {file_name}: не удалось создать {folder!r}"
                     )
-                    report_lines.append(
-                        f"❌ {file_name_esc} — не удалось создать папку проповеди"
-                    )
-                    total_failed += 1
-                    continue
 
-            # === Архив с проповедью ===
-            sermon_info = None
-            if need_sermon_folder and sermon_pngs:
-                if _is_cancelled():
-                    logging.info(f"[YD-UP] Отмена перед ZIP проповеди")
-                    return
-
-                sermon_zip_name = f"{file_slug}_проповедь.zip"
-                sermon_zip_path = zip_tmp_dir / sermon_zip_name
-
-                try:
-                    await _yd_to_thread(
-                        task_id,
-                        create_zip_stream, sermon_pngs, sermon_zip_path,
-                    )
-                except Exception as e:
-                    logging.error(
-                        f"[YD-UP] {file_name}: ошибка ZIP проповеди: {e}",
-                        exc_info=True,
-                    )
-                    report_lines.append(
-                        f"❌ {file_name_esc} — ошибка упаковки проповеди"
-                    )
-                    total_failed += 1
-                    continue
-
-                if _is_cancelled():
-                    _safe_unlink(sermon_zip_path)
-                    return
-
-                sermon_zip_size = sermon_zip_path.stat().st_size
-                remote_path = f"{sermon_dir}/{sermon_zip_name}"
-
-                base_upload_text = (
-                    f"{header}\n"
-                    f"📤 Загружаю архив проповеди "
-                    f"(<code>{file_name_esc}</code>)"
-                )
-
-                await _safe_edit(
-                    status_msg,
-                    base_upload_text,
-                    parse_mode="HTML",
-                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
-                )
-
-                if _is_cancelled():
-                    _safe_unlink(sermon_zip_path)
-                    return
-
-                ok = await _yd_with_spinner(
-                    status_msg,
-                    task_id,
-                    base_upload_text,
-                    _yd_async_protected(
-                        task_id,
-                        yandex_state.config.client.upload_file(
-                            sermon_zip_path, remote_path
-                        ),
-                    ),
-                )
-
-                if ok:
-                    total_uploaded_zip += 1
-                    total_slides_packed += len(sermon_pngs)
-                    links_by_folder[sermon_dir] = "🎯 Проповедь"
-                    sermon_info = (
-                        f"🎯 Проповедь ({ranges_text}): "
-                        f"{len(sermon_pngs)} слайдов → "
-                        f"<code>{html_module.escape(yandex_state.config.sermon_folder)}/"
-                        f"{html_module.escape(sermon_zip_name)}</code> "
-                        f"({_format_size(sermon_zip_size)})"
-                    )
-                    logging.info(
-                        f"[YD-UP] {file_name}: sermon ZIP загружен"
-                    )
-                else:
-                    total_failed += 1
-                    sermon_info = (
-                        f"❌ Проповедь ({ranges_text}): "
-                        f"не удалось загрузить ZIP"
-                    )
-                    logging.error(f"[YD-UP] {file_name}: sermon ZIP failed")
-
-                _safe_unlink(sermon_zip_path)
-                for png in sermon_pngs:
-                    _safe_unlink(png)
-
-            # === Архив с остальными слайдами ===
-            other_info = None
-            if need_pptx2png_folder and other_pngs:
-                if _is_cancelled():
-                    logging.info(f"[YD-UP] Отмена перед ZIP слайдов")
-                    return
-
-                other_zip_name = f"{file_slug}_слайды.zip"
-                other_zip_path = zip_tmp_dir / other_zip_name
-
-                try:
-                    await _yd_to_thread(
-                        task_id,
-                        create_zip_stream, other_pngs, other_zip_path,
-                    )
-                except Exception as e:
-                    logging.error(
-                        f"[YD-UP] {file_name}: ошибка ZIP слайдов: {e}",
-                        exc_info=True,
-                    )
-                    report_lines.append(
-                        f"❌ {file_name_esc} — ошибка упаковки слайдов"
-                    )
-                    total_failed += 1
-                    if sermon_info:
-                        report_lines.append(
-                            f"{f_idx}. 📄 <b>{file_name_esc}</b>"
-                        )
-                        report_lines.append(f"   • {sermon_info}")
-                    continue
-
-                if _is_cancelled():
-                    _safe_unlink(other_zip_path)
-                    return
-
-                other_zip_size = other_zip_path.stat().st_size
-                remote_path = f"{pptx2png_dir}/{other_zip_name}"
-
-                base_upload_text = (
-                    f"{header}\n"
-                    f"📤 Загружаю архив слайдов "
-                    f"(<code>{file_name_esc}</code>)"
-                )
-
-                await _safe_edit(
-                    status_msg,
-                    base_upload_text,
-                    parse_mode="HTML",
-                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
-                )
-
-                if _is_cancelled():
-                    _safe_unlink(other_zip_path)
-                    return
-
-                ok = await _yd_with_spinner(
-                    status_msg,
-                    task_id,
-                    base_upload_text,
-                    _yd_async_protected(
-                        task_id,
-                        yandex_state.config.client.upload_file(
-                            other_zip_path, remote_path
-                        ),
-                    ),
-                )
-
-                other_folder_short = (
-                    f"{yandex_state.config.pptx2png_folder}/{file_slug}"
-                )
-
-                if ok:
-                    total_uploaded_zip += 1
-                    total_slides_packed += len(other_pngs)
-                    links_by_folder[pptx2png_dir] = "📄 Остальные слайды"
-                    other_info = (
-                        f"📄 Остальные: {len(other_pngs)} слайдов → "
-                        f"<code>{html_module.escape(other_folder_short)}/"
-                        f"{html_module.escape(other_zip_name)}</code> "
-                        f"({_format_size(other_zip_size)})"
-                    )
-                    logging.info(
-                        f"[YD-UP] {file_name}: slides ZIP загружен"
-                    )
-                else:
-                    total_failed += 1
-                    other_info = (
-                        "❌ Остальные слайды: не удалось загрузить ZIP"
-                    )
-                    logging.error(f"[YD-UP] {file_name}: slides ZIP failed")
-
-                _safe_unlink(other_zip_path)
-                for png in other_pngs:
-                    _safe_unlink(png)
-
-            if not sermon_info and not other_info:
-                if convert_mode == "sermon" and not sermon_pngs:
-                    other_info = "ℹ️ Проповедь не найдена в этом файле"
-                elif convert_mode == "other" and not other_pngs:
-                    other_info = "ℹ️ Все слайды относятся к проповеди"
-                else:
-                    other_info = "ℹ️ Нет слайдов для конвертации"
-
+            # === Формирование и загрузка ZIP по категориям ===
             entry_lines = [f"{f_idx}. 📄 <b>{file_name_esc}</b>"]
-            if sermon_info:
-                entry_lines.append(f"   • {sermon_info}")
-            if other_info:
-                entry_lines.append(f"   • {other_info}")
+            file_uploaded = 0
+            file_slides = 0
+
+            for cat in _cat_order():
+                if cat not in selected:
+                    continue
+                pngs_list = pngs_by_cat[cat]
+                if not pngs_list:
+                    continue
+                if not cat_folders_ok.get(cat):
+                    entry_lines.append(
+                        f"   • ❌ {meta.get(cat,{}).get('emoji','❓')} "
+                        f"{meta.get(cat,{}).get('name',cat)}: "
+                        f"папка не создана"
+                    )
+                    total_failed += 1
+                    continue
+
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед ZIP {cat}")
+                    return
+
+                cat_meta = meta.get(cat, {})
+                emoji = cat_meta.get("emoji", "❓")
+                name = cat_meta.get("name", cat)
+                zip_suffix = cat_meta.get("zip_suffix", cat)
+                folder_path = _cat_folder_path(cat, target_base)
+                cat_data = item.get("categories", {}).get(cat) or {}
+                ranges = cat_data.get("ranges") or []
+                ranges_text = _format_ranges_text(ranges)
+
+                zip_name = f"{file_slug}_{zip_suffix}.zip"
+                zip_path = zip_tmp_dir / zip_name
+
+                try:
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, pngs_list, zip_path,
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-UP] {file_name}: ZIP {cat} упал: {e}",
+                        exc_info=True,
+                    )
+                    entry_lines.append(
+                        f"   • ❌ {emoji} {name}: ошибка упаковки"
+                    )
+                    total_failed += 1
+                    continue
+
+                if _is_cancelled():
+                    _safe_unlink(zip_path)
+                    return
+
+                zip_size = zip_path.stat().st_size
+                remote_path = f"{folder_path}/{zip_name}"
+
+                base_upload_text = (
+                    f"{header}"
+                    f"📤 Загружаю {emoji} {name} "
+                    f"(<code>{file_name_esc}</code>)"
+                )
+
+                await _safe_edit(
+                    status_msg,
+                    base_upload_text,
+                    parse_mode="HTML",
+                    reply_markup=_get_cancel_keyboard(task_id).as_markup(),
+                )
+
+                if _is_cancelled():
+                    _safe_unlink(zip_path)
+                    return
+
+                ok = await _yd_with_spinner(
+                    status_msg,
+                    task_id,
+                    base_upload_text,
+                    _yd_async_protected(
+                        task_id,
+                        yandex_state.config.client.upload_file(
+                            zip_path, remote_path
+                        ),
+                    ),
+                )
+
+                if ok:
+                    total_uploaded_zip += 1
+                    total_slides_packed += len(pngs_list)
+                    file_uploaded += 1
+                    file_slides += len(pngs_list)
+                    links_by_folder[folder_path] = f"{emoji} {name}"
+                    folder_short = folder_path.rsplit("/", 1)[-1]
+                    entry_lines.append(
+                        f"   • {emoji} {name} ({ranges_text}): "
+                        f"{len(pngs_list)} с. → "
+                        f"<code>{html_module.escape(folder_short)}/"
+                        f"{html_module.escape(zip_name)}</code> "
+                        f"({_format_size(zip_size)})"
+                    )
+                    logging.info(
+                        f"[YD-UP] {file_name}: {cat} ZIP загружен "
+                        f"({len(pngs_list)} с.)"
+                    )
+                else:
+                    total_failed += 1
+                    entry_lines.append(
+                        f"   • ❌ {emoji} {name}: не удалось загрузить"
+                    )
+                    logging.error(f"[YD-UP] {file_name}: {cat} ZIP failed")
+
+                _safe_unlink(zip_path)
+                for png in pngs_list:
+                    _safe_unlink(png)
+
+            # === Остальные ===
+            if need_other:
+                pngs_list = pngs_by_cat["other"]
+                if _is_cancelled():
+                    logging.info(f"[YD-UP] Отмена перед ZIP other")
+                    return
+
+                zip_name = f"{file_slug}_слайды.zip"
+                zip_path = zip_tmp_dir / zip_name
+
+                try:
+                    await _yd_to_thread(
+                        task_id,
+                        create_zip_stream, pngs_list, zip_path,
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"[YD-UP] {file_name}: ZIP other упал: {e}",
+                        exc_info=True,
+                    )
+                    entry_lines.append(
+                        "   • ❌ 📄 Остальные: ошибка упаковки"
+                    )
+                    total_failed += 1
+                else:
+                    if _is_cancelled():
+                        _safe_unlink(zip_path)
+                        return
+
+                    zip_size = zip_path.stat().st_size
+                    remote_path = f"{pptx2png_dir}/{zip_name}"
+
+                    base_upload_text = (
+                        f"{header}"
+                        f"📤 Загружаю 📄 Остальные "
+                        f"(<code>{file_name_esc}</code>)"
+                    )
+
+                    await _safe_edit(
+                        status_msg,
+                        base_upload_text,
+                        parse_mode="HTML",
+                        reply_markup=_get_cancel_keyboard(task_id).as_markup(),
+                    )
+
+                    if _is_cancelled():
+                        _safe_unlink(zip_path)
+                        return
+
+                    ok = await _yd_with_spinner(
+                        status_msg,
+                        task_id,
+                        base_upload_text,
+                        _yd_async_protected(
+                            task_id,
+                            yandex_state.config.client.upload_file(
+                                zip_path, remote_path
+                            ),
+                        ),
+                    )
+
+                    folder_short = (
+                        f"{yandex_state.config.pptx2png_folder}/{file_slug}"
+                    )
+
+                    if ok:
+                        total_uploaded_zip += 1
+                        total_slides_packed += len(pngs_list)
+                        file_uploaded += 1
+                        file_slides += len(pngs_list)
+                        links_by_folder[pptx2png_dir] = "📄 Остальные"
+                        entry_lines.append(
+                            f"   • 📄 Остальные: {len(pngs_list)} с. → "
+                            f"<code>{html_module.escape(folder_short)}/"
+                            f"{html_module.escape(zip_name)}</code> "
+                            f"({_format_size(zip_size)})"
+                        )
+                        logging.info(
+                            f"[YD-UP] {file_name}: other ZIP загружен "
+                            f"({len(pngs_list)} с.)"
+                        )
+                    else:
+                        total_failed += 1
+                        entry_lines.append(
+                            "   • ❌ 📄 Остальные: не удалось загрузить"
+                        )
+
+                    _safe_unlink(zip_path)
+                    for png in pngs_list:
+                        _safe_unlink(png)
+
+            # Если ничего не загружено
+            if file_uploaded == 0:
+                entry_lines.append("   • ℹ️ Ничего не загружено")
+
+            incomplete_warning = item.get("incomplete_warning")
             if incomplete_warning:
                 entry_lines.append(f"   • {incomplete_warning}")
+
             report_lines.append("\n".join(entry_lines))
 
         if _is_cancelled():
@@ -2107,14 +2541,12 @@ async def _yd_convert_and_upload_impl(
         )
 
         logging.info(
-            f"[YD-UP] Итог: zip={total_uploaded_zip}, "
+            f"[YD-UP] Итог v4.0: zip={total_uploaded_zip}, "
             f"slides={total_slides_packed}, failed={total_failed}"
         )
 
     except asyncio.CancelledError:
-        logging.info(
-            f"[YD-UP] Worker {task_id} отменён — выполняю cleanup"
-        )
+        logging.info(f"[YD-UP] Worker {task_id} отменён — выполняю cleanup")
         cleanup_done = True
         try:
             await asyncio.shield(_yd_cleanup_task(
@@ -2159,10 +2591,7 @@ async def _yd_convert_and_upload(
     task_id: str,
     status_msg,
 ) -> asyncio.Task:
-    """
-    ✅ v3.11: запускает _yd_convert_and_upload_impl как detached worker.
-    Возвращает Task. Хендлер yd_sermon_mode не ждёт.
-    """
+    """Запускает _yd_convert_and_upload_impl как detached worker."""
     return await _run_worker_detached(
         task_id,
         lambda: _yd_convert_and_upload_impl(
@@ -2296,14 +2725,11 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
 
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
 
-    # ✅ v3.11.1: атомарная draft-регистрация под локом с раздельной
-    # диагностикой (draft / working / idle).
     async with yd_session_lock:
         existing = sessions.get(session_key)
         status = _picker_status(existing)
 
         if status == "draft":
-            # Параллельный /sunday, пока первый ещё собирает структуру.
             await message.reply(
                 "⏳ <b>Проверяю Яндекс.Диск, подождите…</b>\n\n"
                 "Первая команда ещё выполняется. "
@@ -2321,12 +2747,13 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
             )
             return
 
-        # status == "idle" или "none" — можно занять слот.
+        draft_id = secrets.token_hex(4)
         sessions[session_key] = {
             "user_id": message.from_user.id,
             "chat_id": message.chat.id,
             "processing": False,
             "_draft": True,
+            "_draft_id": draft_id,
             "task_ids": [],
             "cancelled": False,
             "created_at": time.time(),
@@ -2467,28 +2894,23 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                 pass
             return
 
-        # ✅ v3.11.1: заменяем draft-сессию полной.
-        # Старая сессия может быть в состоянии "idle" (пользователь жмёт
-        # /sunday повторно, не выбрав файл) — это нормально, перезаписываем.
         race_detected = False
         async with yd_session_lock:
             old_picker = sessions.get(session_key)
             old_status = _picker_status(old_picker)
 
-            # Перезаписываем ТОЛЬКО если старая сессия наша draft или idle.
-            # Если она working/draft-чужая — отказ.
-            if old_status in ("working",):
+            if old_status == "working":
                 logging.warning(
                     f"[YD] Race: picker {session_key!r} в состоянии "
-                    f"{old_status!r} — отказ"
+                    f"'working' — отказ"
                 )
                 race_detected = True
-            elif old_status == "draft" and old_picker.get("nonce") not in (None, nonce):
-                # Чужой draft (другая параллельная команда) — отказ.
-                logging.warning(
-                    f"[YD] Race: picker {session_key!r} — чужой draft, отказ"
-                )
-                race_detected = True
+            elif old_status == "draft":
+                if old_picker.get("_draft_id") != draft_id:
+                    logging.warning(
+                        f"[YD] Race: picker {session_key!r} — чужой draft, отказ"
+                    )
+                    race_detected = True
 
             if not race_detected:
                 sessions[session_key] = {
@@ -2503,7 +2925,6 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                     "task_ids": [],
                     "cancelled": False,
                     "processing": False,
-                    # _draft не ставим — сессия готова к работе
                 }
 
         if race_detected:
@@ -2558,12 +2979,13 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         except Exception:
             pass
     finally:
-        # ✅ v3.11.1: убираем draft, если он ещё есть.
-        # Сессия в состоянии idle (готовая, без задач) НЕ удаляется —
-        # пусть пользователь выберет файл или нажмёт «Отмена».
         async with yd_session_lock:
             existing = sessions.get(session_key)
-            if existing is not None and existing.get("_draft"):
+            if (
+                existing is not None
+                and existing.get("_draft")
+                and existing.get("_draft_id") == draft_id
+            ):
                 sessions.pop(session_key, None)
 
         if nonce is not None and not session_created:
@@ -2640,8 +3062,6 @@ async def yd_pick(
                 )
                 return
 
-    # ✅ v3.11: запускаем подготовку как detached worker.
-    # Хендлер возвращается мгновенно, aiogram не блокируется.
     if file_selector == "all":
         await _safe_answer(callback, "⏳ Обрабатываю все файлы...")
     else:
@@ -2788,12 +3208,199 @@ async def cmd_cancel_yd(message: types.Message, check_access):
 
 
 # ==========================================
-# ВЫБОР РЕЖИМА КОНВЕРТАЦИИ
+# НОВЫЕ ХЕНДЛЕРЫ v4.0 — toggle и convert
+# ==========================================
+
+@router.callback_query(F.data.startswith("yd_cat_toggle:"))
+async def yd_cat_toggle(callback: types.CallbackQuery, bot: Bot):
+    """Переключение галки категории."""
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+
+    task_id = parts[1]
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+    nonce = parts[3]
+    cat = parts[4]
+
+    valid_cats = set(_cat_order()) | {"other"}
+    if cat not in valid_cats:
+        await _safe_answer(callback, "❌ Неизвестная категория.", show_alert=True)
+        return
+
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+
+    pending = session["pending"]
+    if not isinstance(pending, dict):
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+
+    if pending.get("prompt_nonce") != nonce or pending.get("prompt_idx") != idx:
+        await _safe_answer(callback, "⏳ Промпт уже обработан.", show_alert=True)
+        return
+
+    if callback.from_user.id != pending["owner_user_id"]:
+        await _safe_answer(callback, "❌ Только автор.", show_alert=True)
+        return
+
+    item = pending["prepared"][idx]
+    selected = set(item.get("selected_categories") or set())
+
+    if cat in selected:
+        selected.discard(cat)
+    else:
+        selected.add(cat)
+
+    item["selected_categories"] = selected
+
+    # Перерисовываем промпт (без claim — nonce тот же)
+    try:
+        await callback.message.edit_text(
+            _render_category_prompt_text(item, selected),
+            parse_mode="HTML",
+            reply_markup=_render_category_toggle_keyboard(
+                task_id, idx, nonce, item, selected,
+                item.get("total_slides", 0),
+            ).as_markup(),
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logging.warning(f"[YD-CAT-TOGGLE] edit_text: {e}")
+
+    # Обновляем watchdog
+    existing_task = pending.get("prompt_timeout_task")
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
+    pending["prompt_timeout_task"] = asyncio.create_task(
+        _yd_prompt_timeout_watchdog(
+            task_id, yandex_state.config.prompt_timeout_sec, nonce
+        )
+    )
+    pending["prompt_watchdog_nonce"] = nonce
+
+    await _safe_answer(callback)
+
+
+@router.callback_query(F.data.startswith("yd_cat_convert:"))
+async def yd_cat_convert(callback: types.CallbackQuery, bot: Bot):
+    """Запуск конвертации с выбранными категориями."""
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+
+    task_id = parts[1]
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+    nonce = parts[3]
+
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+
+    claimed = await _yd_claim_prompt(callback)
+    if claimed is None:
+        return
+    pending = claimed
+
+    item = pending["prepared"][idx]
+    selected = set(item.get("selected_categories") or set())
+
+    if not selected:
+        await _safe_answer(
+            callback,
+            "❌ Выберите хотя бы одну категорию.",
+            show_alert=True,
+        )
+        # Возвращаем промпт (claim уже сбросил nonce — рендерим заново)
+        await _yd_render_category_prompt(
+            task_id=task_id, item=item, status_msg=callback.message,
+        )
+        return
+
+    item["confirmed"] = True
+
+    await _safe_answer(callback, "⏳ Принято, начинаю конвертацию...")
+
+    # Остались ли неподтверждённые файлы?
+    remaining = [
+        p for p in pending["prepared"]
+        if "file_path" in p and not p.get("confirmed")
+    ]
+
+    if remaining:
+        await _yd_render_category_prompt(
+            task_id=task_id,
+            item=remaining[0],
+            status_msg=callback.message,
+        )
+        return
+
+    try:
+        await _yd_convert_and_upload(
+            bot=bot,
+            task_id=task_id,
+            status_msg=callback.message,
+        )
+    except Exception as e:
+        logging.error(
+            f"[YD-CAT-CONVERT] ошибка запуска: {e}", exc_info=True,
+        )
+
+
+@router.callback_query(F.data.startswith("yd_cat_edit:"))
+async def yd_cat_edit(callback: types.CallbackQuery, bot: Bot):
+    """
+    v4.0: заглушка. Ручное редактирование диапазона по категориям — v4.1.
+    Пока говорим пользователю «в разработке».
+    """
+    await _safe_answer(
+        callback,
+        "✏️ Ручное редактирование диапазона по категориям — в следующем "
+        "обновлении. Пока используйте автоматические диапазоны.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data.startswith("yd_cat_noop:"))
+async def yd_cat_noop(callback: types.CallbackQuery):
+    """Disabled-кнопки (не найдено / empty)."""
+    parts = callback.data.split(":")
+    reason = parts[-1] if len(parts) >= 1 else ""
+
+    if reason == "empty":
+        await _safe_answer(
+            callback,
+            "❌ Ничего не выбрано. Отметьте хотя бы одну категорию.",
+            show_alert=True,
+        )
+    else:
+        await _safe_answer(
+            callback,
+            "ℹ️ Категория не найдена в заметках.",
+            show_alert=True,
+        )
+
+
+# ==========================================
+# СТАРЫЕ ХЕНДЛЕРЫ (fallback)
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_sermon_mode:"))
 async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
-    """Пользователь выбрал режим конвертации."""
+    """Старый хендлер выбора режима (fallback)."""
     parts = callback.data.split(":")
     if len(parts) != 5:
         await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
@@ -2823,7 +3430,6 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
     pending = claimed
 
     item = pending["prepared"][idx]
-
     _normalize_item_ranges(item)
 
     if mode in ("sermon", "both") and (
@@ -2837,8 +3443,16 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         await _yd_render_sermon_prompt(task_id, item, callback.message)
         return
 
-    item["convert_mode"] = mode
+    # Конвертируем старую mode → selected_categories
+    if mode == "sermon":
+        item["selected_categories"] = {"sermon"}
+    elif mode == "other":
+        item["selected_categories"] = {"other"}
+    else:  # both
+        item["selected_categories"] = {"sermon", "other"}
+
     item["confirmed"] = True
+    item["convert_mode"] = mode
 
     await _safe_answer(callback, "⏳ Принято, начинаю конвертацию...")
 
@@ -2853,23 +3467,15 @@ async def yd_sermon_mode(callback: types.CallbackQuery, bot: Bot):
         )
         return
 
-    # ✅ v3.11: запускаем конвертацию как detached worker.
-    # Хендлер возвращается мгновенно, aiogram не ждёт 79 секунд.
     try:
         await _yd_convert_and_upload(
-            bot=bot,
-            task_id=task_id,
-            status_msg=callback.message,
+            bot=bot, task_id=task_id, status_msg=callback.message,
         )
     except Exception as e:
         logging.error(
             f"[YD-MODE] ошибка запуска конвертации: {e}", exc_info=True,
         )
 
-
-# ==========================================
-# ОТМЕНА ТЕКУЩЕЙ ЗАДАЧИ
-# ==========================================
 
 @router.callback_query(F.data.startswith("yd_task_cancel:"))
 async def yd_task_cancel_callback(callback: types.CallbackQuery):
@@ -2881,7 +3487,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
 
     task_id = parts[1]
 
-    # ✅ Отвечаем сразу, пока query жив.
     await _safe_answer(callback, "❌ Отмена запрошена…")
 
     session = sessions.get(task_id)
@@ -2907,7 +3512,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
 
     session["cancelled"] = True
 
-    # ✅ v3.11: worker отменяется в фоне.
     worker = session.get("worker_task")
     if (
         worker is not None
@@ -2919,7 +3523,6 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
         )
         _spawn_cancel_worker(worker, task_id)
 
-    # ✅ Bug #1: release только если нет живых sibling'ов.
     owner_chat_id = session.get("chat_id")
     owner_nonce = session.get("nonce")
     if owner_chat_id is not None and owner_nonce:
@@ -3013,12 +3616,12 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
             pass
 
 
-# ==========================================
-# ИЗМЕНЕНИЕ ДИАПАЗОНА ПРОПОВЕДИ
-# ==========================================
-
 @router.callback_query(F.data.startswith("yd_sermon_edit:"))
 async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
+    """
+    Старое ручное редактирование диапазона (только для sermon).
+    Работает через handlers.py (текстовый ввод).
+    """
     parts = callback.data.split(":")
     if len(parts) != 4:
         await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
@@ -3057,8 +3660,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
     start = current.get("start")
     end = current.get("end")
     ranges = current.get("ranges")
-    notes_ok = current.get("notes_ok", True)
-    incomplete = current.get("incomplete", False)
 
     context_lines = []
     if matches:
@@ -3066,21 +3667,13 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         if len(matches) > 20:
             preview += f" …и ещё {len(matches) - 20}"
         context_lines.append(
-            f"📌 <b>Найдены пометки на слайдах:</b> "
-            f"<code>{preview}</code>"
+            f"📌 <b>Найдены пометки на слайдах:</b> <code>{preview}</code>"
         )
         if start is not None and end is not None:
             ranges_text = _format_ranges_text(ranges, start, end)
             context_lines.append(
-                f"📊 <b>Предложенный диапазон:</b> "
-                f"<code>{ranges_text}</code>"
+                f"📊 <b>Предложенный диапазон:</b> <code>{ranges_text}</code>"
             )
-    elif not notes_ok:
-        context_lines.append(
-            "⚠️ <i>Заметки докладчика не удалось прочитать.</i>"
-        )
-    elif incomplete:
-        context_lines.append("⚠️ <i>Заметки прочитаны частично.</i>")
     else:
         context_lines.append(
             "📌 <i>Автоматических пометок «проповедь» не найдено.</i>"
@@ -3129,15 +3722,6 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             status_msg=None,
             error=None,
         ))
-        try:
-            await bot.send_message(
-                chat_id=callback.message.chat.id,
-                text=(
-                    "❌ Не удалось показать форму ввода. Задача сброшена."
-                ),
-            )
-        except Exception:
-            pass
         return
 
     pending["awaiting_range_for_idx"] = idx
@@ -3147,9 +3731,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         pending["prompt_message_id"] = sent_msg.message_id
 
     if pending.get("prompt_nonce") != manual_nonce:
-        logging.info(
-            f"yd_sermon_edit: nonce изменён конкурентно для {task_id}"
-        )
+        logging.info(f"yd_sermon_edit: nonce изменён конкурентно")
         return
 
     old_timeout = pending.get("prompt_timeout_task")
@@ -3174,10 +3756,11 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
 
 
 # ==========================================
-# ПУБЛИЧНЫЕ ОБЁРТКИ ДЛЯ handlers.py И bot.py
+# ПУБЛИЧНЫЕ ОБЁРТКИ
 # ==========================================
 
 render_sermon_prompt = _yd_render_sermon_prompt
+render_category_prompt = _yd_render_category_prompt
 convert_and_upload = _yd_convert_and_upload
 cleanup_task = _yd_cleanup_task
 is_sermon_slide = _is_sermon_slide
