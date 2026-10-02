@@ -59,14 +59,40 @@ class UserManager:
         """Возвращает настройки генерации для конкретного пользователя."""
         if user_id not in self.user_settings:
             # Создаем стандартные дефолты для нового ID
-            self.user_settings[user_id] = {"quality": "2k", "keep_pdf": False}
+            self.user_settings[user_id] = self._default_config()
             self._save_settings()
+        else:
+            # ✅ Миграция: добавляем недостающие ключи в существующие записи
+            defaults = self._default_config()
+            changed = False
+            for k, v in defaults.items():
+                if k not in self.user_settings[user_id]:
+                    self.user_settings[user_id][k] = v
+                    changed = True
+            if changed:
+                self._save_settings()
         return self.user_settings[user_id]
+
+    def _default_config(self) -> dict:
+        """
+        Дефолтная конфигурация нового пользователя.
+
+        Категории по умолчанию: проповедь + начало собрания.
+        «Остальные» выключены — пользователь включает их вручную,
+        если нужен архив со всеми неразмеченными слайдами.
+        """
+        return {
+            "quality": "2k",
+            "keep_pdf": False,
+            "process_sermon": True,      # 🎯
+            "process_opening": True,     # 🎬
+            "process_other": False,      # 📄
+        }
 
     def update_user_config(self, user_id: int, key: str, value):
         """Обновляет параметр пользователя и сразу перезаписывает файл на диске."""
         if user_id not in self.user_settings:
-            self.user_settings[user_id] = {"quality": "2k", "keep_pdf": False}
+            self.user_settings[user_id] = self._default_config()
         
         self.user_settings[user_id][key] = value
         self._save_settings()  # Данные мгновенно защищены от перезапуска manage.sh
