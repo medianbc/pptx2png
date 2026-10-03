@@ -7,16 +7,44 @@ bot through `core`.
 
 ## Install and run
 
+On a new Debian, Ubuntu, or Raspberry Pi OS machine, download and run the
+installer from the repository:
+
+```bash
+curl -fL \
+  https://raw.githubusercontent.com/medianbc/pptx2png/main/install_obs_local.sh \
+  -o install_obs_local.sh
+chmod +x install_obs_local.sh
+./install_obs_local.sh
+```
+
+On macOS, install Homebrew first from [brew.sh](https://brew.sh), then run the
+separate macOS installer:
+
+```bash
+curl -fL \
+  https://raw.githubusercontent.com/medianbc/pptx2png/main/install_obs_local_macos.sh \
+  -o install_obs_local_macos.sh
+chmod +x install_obs_local_macos.sh
+./install_obs_local_macos.sh
+```
+
+The installer installs Git, Python/venv, and LibreOffice Impress, clones the
+project to `~/pptx2png`, creates `.venv`, installs the shared core dependencies,
+and creates a private `config.ini` for the Yandex Disk token. It also creates
+`start_obs_local.sh` for the interactive local OBS mode and
+`prepare_obs_songs.sh` for song preparation. The Linux installer uses apt; the
+macOS installer uses Homebrew and installs LibreOffice as a cask. Both accept a
+different installation directory as the first argument.
+
 From the repository root:
 
 ```bash
-python -m pip install -e ./core
-python -m pip install -r obs_local/requirements.txt
-python -m obs_local
+./start_obs_local.sh
 ```
 
-Alternatively, use the compatibility launcher `python run_obs_local.py` or
-`python -m obs_local.run_obs_local`.
+Alternatively, after activating `.venv`, use the compatibility launcher
+`python run_obs_local.py` or `python -m obs_local.run_obs_local`.
 
 ## Configuration
 
