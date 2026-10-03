@@ -96,6 +96,45 @@ class ExtractSongTitlesTests(unittest.TestCase):
                 )
 
 
+class SongMatchingTests(unittest.TestCase):
+    def test_match_quality_accepts_strong_partial_title_and_yo_variant(self):
+        self.assertEqual(
+            prepare_songs._song_match_quality(
+                "Бог всего творения", "Бог всего творения вечен"
+            ),
+            1,
+        )
+        self.assertEqual(
+            prepare_songs._song_match_quality(
+                "Все прекрасно",
+                "Всё прекрасно",
+            ),
+            2,
+        )
+
+    def test_match_quality_rejects_weak_partial_title(self):
+        self.assertEqual(
+            prepare_songs._song_match_quality(
+                "Бог всего", "Бог всего творения вечен"
+            ),
+            0,
+        )
+
+    def test_exact_local_match_takes_precedence_over_partial_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exact = root / "Бог всего творения.zip"
+            partial = root / "Бог всего творенья - live.zip"
+            exact.touch()
+            partial.touch()
+
+            matches = prepare_songs._find_local_matches(
+                root, "Бог всего творения", ".zip"
+            )
+
+        self.assertEqual(matches, [exact])
+
+
 class ConfigTests(unittest.TestCase):
     def test_shared_project_token_is_used_before_obs_local_config(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -467,7 +506,7 @@ class SongOutputTests(unittest.TestCase):
                 )
 
             first_song = output_dir / "01 - Песня первая"
-            second_song = output_dir / "02 - Песня вторая"
+            second_song = output_dir / "02 - Песня вторая (не найдено)"
             self.assertEqual(results[0].status, "ready")
             self.assertEqual(results[0].png_count, 1)
             self.assertEqual(results[1].status, "not_found")

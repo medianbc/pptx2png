@@ -40,7 +40,10 @@ configured DOCX, searches for matching files, and prepares:
 Local ZIP files are checked first, then local PPTX files. Optional configured
 Yandex Disk folders are searched afterward, ZIP before PPTX. ZIP archives must
 contain PNG slides; PPTX files are rendered with the shared converter. A folder
-is still created when no matching material is found.
+is still created and marked `(не найдено)` when no matching material is found.
+Matching prefers a complete song title in the filename; if none is found, a
+candidate with at least 75% of the title's words in common may be used.
+Ambiguous candidates are not selected automatically.
 
 Configure `[Song preparation]` in `obs_local/settings.ini` and place local files
 in `local_zip_dir` or `local_pptx_dir`. To test with a local DOCX instead of

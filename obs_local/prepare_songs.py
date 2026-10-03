@@ -183,7 +183,26 @@ def _table_rows(table: ElementTree.Element) -> list[list[str]]:
 
 
 def _normalize(value: str) -> str:
-    return re.sub(r"[\W_]+", " ", value.casefold(), flags=re.UNICODE).strip()
+    normalized = value.casefold().replace("ё", "е")
+    return re.sub(r"[\W_]+", " ", normalized, flags=re.UNICODE).strip()
+
+
+def _song_match_quality(filename_stem: str, title: str) -> int:
+    """Return 2 for a full title match, 1 for a strong token overlap, else 0."""
+    normalized_title = _normalize(title)
+    normalized_stem = _normalize(filename_stem)
+    if not normalized_title or not normalized_stem:
+        return 0
+    if f" {normalized_title} " in f" {normalized_stem} ":
+        return 2
+
+    title_tokens = set(normalized_title.split())
+    stem_tokens = set(normalized_stem.split())
+    shared_tokens = title_tokens & stem_tokens
+    required_tokens = max(2, (len(title_tokens) * 3 + 3) // 4)
+    if len(title_tokens) > 1 and len(shared_tokens) >= required_tokens:
+        return 1
+    return 0
 
 
 def _parse_program_date(text: str) -> date | None:
@@ -305,12 +324,11 @@ def _natural_key(value: str) -> list[Any]:
 
 
 def _find_local_matches(root: Path, title: str, suffix: str) -> list[Path]:
-    normalized_title = _normalize(title)
-    if not normalized_title:
+    if not _normalize(title):
         return []
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
-    matches = []
+    matches: list[tuple[int, Path]] = []
     for path in root.rglob("*"):
         if (
             path.is_symlink()
@@ -318,10 +336,16 @@ def _find_local_matches(root: Path, title: str, suffix: str) -> list[Path]:
             or path.suffix.casefold() != suffix
         ):
             continue
-        normalized_stem = _normalize(path.stem)
-        if f" {normalized_title} " in f" {normalized_stem} ":
-            matches.append(path)
-    return sorted(matches, key=lambda path: str(path).casefold())
+        quality = _song_match_quality(path.stem, title)
+        if quality:
+            matches.append((quality, path))
+    if not matches:
+        return []
+    best_quality = max(quality for quality, _ in matches)
+    return sorted(
+        (path for quality, path in matches if quality == best_quality),
+        key=lambda path: str(path).casefold(),
+    )
 
 
 async def _find_yandex_matches(
@@ -330,10 +354,9 @@ async def _find_yandex_matches(
     title: str,
     suffix: str,
 ) -> list[dict[str, Any]]:
-    normalized_title = _normalize(title)
-    if not normalized_title:
+    if not _normalize(title):
         return []
-    matches: list[dict[str, Any]] = []
+    matches: list[tuple[int, dict[str, Any]]] = []
     visited: set[str] = set()
 
     async def visit(path: str, depth: int) -> None:
@@ -351,13 +374,17 @@ async def _find_yandex_matches(
                 item.get("type") == "file"
                 and bool(item_path)
                 and Path(name).suffix.casefold() == suffix
-                and f" {normalized_title} " in f" {_normalize(Path(name).stem)} "
             ):
-                matches.append(item)
+                quality = _song_match_quality(Path(name).stem, title)
+                if quality:
+                    matches.append((quality, item))
 
     for root in roots:
         await visit(root, 0)
-    return matches
+    if not matches:
+        return []
+    best_quality = max(quality for quality, _ in matches)
+    return [item for quality, item in matches if quality == best_quality]
 
 
 def _unique_match(matches: list[Any], title: str, source: str) -> Any | None:
@@ -882,6 +909,12 @@ async def _process_songs(
         result = await _process_song(
             title, song_dir, config, client, temp_root
         )
+        if result.status == "not_found":
+            missing_dir = staging / _song_folder_name(
+                index, f"{title} (не найдено)"
+            )
+            song_dir.rename(missing_dir)
+            result.folder = missing_dir
         results.append(result)
     return results
 
