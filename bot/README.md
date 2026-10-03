@@ -1,26 +1,28 @@
-# Bot module
+# Telegram bot
 
-This folder is reserved for Telegram bot runtime code.
+This package contains the Telegram runtime, handlers, user state, and bot-specific
+utilities. Conversion and Yandex Disk client code are provided by `core`.
 
-## Purpose
-- keep bot entry points isolated
-- avoid mixing bot-only logic with shared conversion logic
-- allow independent deployment and testing
+## Install and run
 
-## Suggested layout
+From the repository root:
 
-```text
-bot/
-├── README.md
-├── bot.py
-├── handlers.py
-├── yandex_flow.py
-├── yandex_state.py
-├── settings.ini
-├── requirements.txt
-└── .github/workflows/
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ./core
+python -m pip install -r bot/requirements.txt
+python -m bot
 ```
 
-## Dependency rule
+`manage.sh` starts the same package entry point and includes the local `core`
+directory on `PYTHONPATH` for existing server environments.
 
-The bot must depend on shared code from the core package, not reimplement conversion logic.
+## Configuration
+
+- `bot/settings.ini` contains non-secret bot settings.
+- Create `bot/config.ini` for secrets; if it is absent, the legacy
+  repository-root `config.ini` is used.
+- `bot/template.yaml` is the Yandex Disk folder template.
+- User allowlists and preferences remain in the repository root to preserve
+  existing deployment state.

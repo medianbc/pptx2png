@@ -5,7 +5,7 @@
 # handlers.py импортирует из этого модуля — работает без изменений.
 # ==========================================
 
-from yandex_flow_core import (
+from .yandex_flow_core import (
     # утилиты
     _safe_answer,
     _safe_edit,
@@ -38,7 +38,7 @@ from yandex_flow_core import (
     drain_deferred_cleanups,
 )
 
-from yandex_flow_handlers import router
+from .yandex_flow_handlers import router
 
 
 # ==========================================
@@ -66,7 +66,7 @@ safe_answer = _safe_answer
 
 def is_sermon_slide(item: dict, slide_idx: int) -> bool:
     """Публичная обёртка. Импортирует из core (совместимость со старым API)."""
-    from yandex_flow_core import _is_sermon_slide
+    from .yandex_flow_core import _is_sermon_slide
     return _is_sermon_slide(item, slide_idx)
 
 

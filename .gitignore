@@ -16,6 +16,7 @@ sys_nohup.log
 venv/
 __pycache__/
 *.pyc
+*.egg-info/
 .DS_Store
 
 # Runtime state

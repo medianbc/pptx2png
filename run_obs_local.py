@@ -1,6 +1,6 @@
-"""Ручной запуск локальной подготовки презентации для OBS."""
+"""Compatibility launcher for the local OBS workflow."""
 
-from obs_local import main
+from obs_local.app import main
 
 
 if __name__ == "__main__":

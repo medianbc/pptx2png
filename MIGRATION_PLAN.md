@@ -1,5 +1,22 @@
 # План миграции: общий core + bot + local OBS
 
+## Состояние миграции
+
+Основное разделение реализовано в этом репозитории:
+
+- общие модули находятся в `core/pptx2png_core/` и устанавливаются как пакет
+  `pptx2png-core`;
+- приложение Telegram находится в `bot/` и запускается командой `python -m bot`;
+- локальное приложение находится в `obs_local/` и запускается командой
+  `python -m obs_local`;
+- настройки бота и локального режима разделены, а чтение старого корневого
+  `config.ini` сохранено как переходная совместимость;
+- `manage.sh` запускает пакет бота и добавляет локальный `core` в `PYTHONPATH`.
+
+Общие зависимости объявлены в `core/pyproject.toml`; зависимость бота находится
+в `bot/requirements.txt`. Извлечение заметок слайдов относится к core,
+Telegram-утилиты — к `bot/utils.py`.
+
 ## Цель
 
 Разделить проект на три уровня ответственности:
@@ -51,6 +68,8 @@ pptx2png/
 ├── bot/
 │   ├── README.md
 │   ├── requirements.txt
+│   ├── __init__.py
+│   ├── __main__.py
 │   ├── bot.py
 │   ├── handlers.py
 │   ├── yandex_flow.py
@@ -58,13 +77,16 @@ pptx2png/
 │   ├── yandex_flow_core.py
 │   ├── yandex_flow_handlers.py
 │   ├── user_manager.py
+│   ├── utils.py
 │   ├── settings.ini
 │   └── template.yaml
 │
 ├── obs_local/
 │   ├── README.md
 │   ├── requirements.txt
-│   ├── obs_local.py
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── app.py
 │   ├── run_obs_local.py
 │   └── settings.ini
 │
@@ -72,7 +94,7 @@ pptx2png/
 │   └── workflows/
 ├── .gitignore
 ├── README.md
-└── pyproject.toml
+└── requirements.txt
 ```
 
 ---
@@ -186,16 +208,12 @@ python -c "from pptx2png_core.converter_engine import convert_all_pngs; print('o
 Проверить:
 
 ```bash
-python bot/bot.py
+python -m bot
+python -m obs_local
 ```
 
-и
-
-```bash
-python obs_local/obs_local.py
-```
-
-или через `python -m` в зависимости от выбранного запуска.
+Запуски требуют конфигурации и внешних сервисов; для проверки импортов
+используйте отдельные команды установки и smoke-check ниже.
 
 ### Этап 7. Удалить дубликаты только после стабилизации
 
@@ -253,11 +271,8 @@ pip install -r obs_local/requirements.txt
 ### 4. Запускать как отдельные процессы
 
 ```bash
-python bot/bot.py
-```
-
-```bash
-python obs_local/obs_local.py
+python -m bot
+python -m obs_local
 ```
 
 ---
@@ -318,17 +333,15 @@ Pillow
 
 ---
 
-## Следующий шаг
+## Проверка после изменений
 
-На этом этапе готовы:
+```bash
+python -m pip install -e ./core
+python -m pip install -r bot/requirements.txt
+python -c "from pptx2png_core.converter_engine import convert_all_pngs"
+python -m bot --help
+python -m obs_local --help
+```
 
-- архитектура разделения
-- список общих модулей
-- подход к GitHub и локальной среде
-- plan миграции по шагам
-
-Дальше можно сразу переходить к:
-
-- реальному перемещению файлов в проекте
-- обновлению импортов
-- добавлению `requirements.txt` и `pyproject.toml` для рабочей структуры
+Для полноценного запуска бота нужны секреты и доступ к Telegram; локальному
+сценарию также нужны LibreOffice и доступ к Яндекс.Диску.

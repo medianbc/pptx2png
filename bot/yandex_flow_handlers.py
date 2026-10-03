@@ -18,8 +18,8 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import yandex_state
-from yandex_state import (
+from . import yandex_state
+from .yandex_state import (
     sessions,
     yd_session_lock,
     yd_active_tasks,
@@ -36,7 +36,7 @@ from pptx2png_core.yandex_disk import (
     find_pptx_in_source,
 )
 
-from yandex_flow_core import (
+from .yandex_flow_core import (
     # утилиты
     _safe_answer,
     _safe_edit,

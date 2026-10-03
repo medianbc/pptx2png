@@ -25,8 +25,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import yandex_state
-from yandex_state import (
+from . import yandex_state
+from .yandex_state import (
     sessions,
     yd_session_lock,
     yd_active_tasks,

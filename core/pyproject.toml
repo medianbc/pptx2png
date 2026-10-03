@@ -7,6 +7,12 @@ name = "pptx2png-core"
 version = "0.1.0"
 description = "Shared conversion and Yandex integration for PPTX pipeline"
 requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "PyMuPDF>=1.23",
+    "python-pptx>=0.6.23",
+    "PyYAML>=6.0",
+]
 
 [tool.setuptools]
 packages = ["pptx2png_core"]

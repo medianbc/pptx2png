@@ -2,7 +2,8 @@
 # 20260903 - улучшенная версия с PID-файлом, проверкой времени старта и состоянием процесса
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE}")" && pwd)"
-BOT_SCRIPT="bot.py"
+BOT_MODULE="bot"
+LEGACY_BOT_SCRIPT="$PROJECT_DIR/bot.py"
 ENV_NAME=$(basename "$PROJECT_DIR")
 
 # Определяем Python
@@ -201,7 +202,9 @@ cmd_start() {
         fi
     fi
 
-    nohup "$PYTHON_EXEC" -u "$PROJECT_DIR/$BOT_SCRIPT" "${EXTRA_ARGS[@]}" > "$NOHUP_LOG" 2>&1 &
+    cd "$PROJECT_DIR" || exit 1
+    PYTHONPATH="$PROJECT_DIR/core${PYTHONPATH:+:$PYTHONPATH}" \
+        nohup "$PYTHON_EXEC" -u -m "$BOT_MODULE" "${EXTRA_ARGS[@]}" > "$NOHUP_LOG" 2>&1 &
     local new_pid=$!
 
     sleep 0.5
@@ -256,7 +259,7 @@ cmd_stop() {
     fi
 
     # 2. Поиск и остановка legacy-процессов (запущенных без PID-файла)
-    local legacy_pids=$(pgrep -f "python.*$PROJECT_DIR/$BOT_SCRIPT" 2>/dev/null)
+    local legacy_pids=$(pgrep -f "python.*$LEGACY_BOT_SCRIPT" 2>/dev/null)
     if [ -n "$legacy_pids" ]; then
         echo "🔍 Найдены legacy-процессы: $legacy_pids"
         for pid in $legacy_pids; do
@@ -270,7 +273,7 @@ cmd_stop() {
 
             # Проверяем, что процесс действительно принадлежит этому проекту
             local cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-            if [[ "$cmdline" == *"$PROJECT_DIR/$BOT_SCRIPT"* ]]; then
+            if [[ "$cmdline" == *"$LEGACY_BOT_SCRIPT"* ]]; then
                 # Останавливаем legacy-процесс с проверкой starttime и состояния
                 stop_legacy_process "$pid" "legacy-процесс $pid"
                 if [ $? -ne 0 ]; then
@@ -323,7 +326,7 @@ cmd_status() {
             return 1
         fi
     else
-        local legacy_pid=$(pgrep -f "python.*$PROJECT_DIR/$BOT_SCRIPT" 2>/dev/null | head -n 1)
+        local legacy_pid=$(pgrep -f "python.*$LEGACY_BOT_SCRIPT" 2>/dev/null | head -n 1)
         if [ -n "$legacy_pid" ]; then
             echo "⚠️ Найден legacy-процесс (PID: $legacy_pid) без PID-файла. Рекомендуется выполнить 'stop'."
             return 1

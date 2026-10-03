@@ -1,5 +1,13 @@
 # Практическая стратегия: вынос локального режима как отдельное направление
 
+## Текущее состояние репозитория
+
+Модель `core + bot + obs_local` уже реализована: core является отдельным
+Python-пакетом, а приложения запускаются из корня репозитория командами
+`python -m bot` и `python -m obs_local`. Настройки локального режима находятся
+в `obs_local/settings.ini`; секреты могут находиться в
+`obs_local/config.ini`. Переходное чтение корневого `config.ini` сохранено.
+
 ## Краткая рекомендация
 
 Не делайте это как `branch` и не превращайте это в "fork" в смысле копию всего проекта.
@@ -47,6 +55,7 @@
 ```text
 pptx2png/
 ├── core/
+│   ├── README.md
 │   ├── pptx2png_core/
 │   │   ├── __init__.py
 │   │   ├── converter_engine.py
@@ -56,14 +65,23 @@ pptx2png/
 │   │   └── ...
 │   └── pyproject.toml
 ├── bot/
+│   ├── __init__.py
+│   ├── __main__.py
 │   ├── bot.py
 │   ├── handlers.py
 │   ├── yandex_flow.py
+│   ├── yandex_flow_core.py
+│   ├── yandex_flow_handlers.py
 │   ├── yandex_state.py
+│   ├── user_manager.py
+│   ├── utils.py
 │   ├── settings.ini
+│   ├── template.yaml
 │   └── requirements.txt
 ├── obs_local/
-│   ├── obs_local.py
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── app.py
 │   ├── run_obs_local.py
 │   ├── settings.ini
 │   └── requirements.txt
@@ -71,7 +89,7 @@ pptx2png/
 │   └── workflows/
 ├── README.md
 ├── .gitignore
-└── pyproject.toml
+└── requirements.txt
 ```
 
 Плюсы:
@@ -220,8 +238,9 @@ pip install -e ./core
 ### Шаг 3. Установить зависимости для бота и локального сценария
 
 ```bash
-pip install -r bot/requirements.txt
-pip install -r obs_local/requirements.txt
+python -m pip install -e ./core
+python -m pip install -r bot/requirements.txt
+python -m pip install -r obs_local/requirements.txt
 ```
 
 или, если это один repo с общим пакетом:
@@ -244,11 +263,8 @@ from converter_engine import convert_all_pngs
 from pptx2png_core.converter_engine import convert_all_pngs
 ```
 
-или при монорепозитории:
-
-```python
-from core.pptx2png_core.converter_engine import convert_all_pngs
-```
+В этом монорепозитории такой импорт работает после установки `core` в
+editable mode; приложению не нужно знать путь `core/` внутри репозитория.
 
 ### Шаг 5. Разделить конфиги
 
@@ -273,16 +289,6 @@ obs_local/settings.ini
 Главное: не мусорить секретные данные в общем ядре.
 
 ### Шаг 6. Запускать отдельными entry points
-
-```bash
-python bot/bot.py
-```
-
-```bash
-python obs_local/obs_local.py
-```
-
-или через CLI:
 
 ```bash
 python -m bot
@@ -401,14 +407,8 @@ from pptx2png_core.converter_engine import convert_all_pngs
 
 ---
 
-## Рекомендуемое следующее действие
+## Следующее направление
 
-Сначала сделать это в текущем репозитории так:
-
-1. создать папку `core/`;
-2. перенести общие модули туда;
-3. оставить `bot/` и `obs_local/` как entry points;
-4. проверить, что бот работает без изменения бизнес-логики;
-5. только потом решать, переносить ли это в отдельный GitHub repo.
-
-Это самый безопасный путь.
+Структурная миграция завершена в рамках одного репозитория. Следующий этап —
+добавить CI-проверки установки core и импорта обоих приложений, а затем решить,
+нужен ли локальному OBS-сценарию отдельный runtime/deployment.

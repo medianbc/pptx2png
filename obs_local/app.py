@@ -26,6 +26,7 @@ from pptx2png_core.yandex_disk import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent
 CATEGORIES = {"sermon": "Проповедь", "opening": "Начало", "prayer": "Молитва"}
 
 
@@ -34,6 +35,8 @@ def load_config() -> dict[str, Any]:
     secrets = configparser.ConfigParser(interpolation=None)
     settings_path = BASE_DIR / "settings.ini"
     secrets_path = BASE_DIR / "config.ini"
+    if not secrets_path.exists():
+        secrets_path = PROJECT_DIR / "config.ini"
 
     if not settings.read(settings_path, encoding="utf-8"):
         raise RuntimeError(f"Не найден файл настроек: {settings_path}")
@@ -63,7 +66,7 @@ def load_config() -> dict[str, Any]:
 
     root_path = Path(root_value).expanduser()
     if not root_path.is_absolute():
-        root_path = BASE_DIR / root_path
+        root_path = PROJECT_DIR / root_path
 
     legacy_keyword = settings.get(
         "YandexDisk", "sermon_keyword", fallback="проповед"
