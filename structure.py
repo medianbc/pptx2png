@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 
 import yaml
 
-from yandex_disk import YandexDiskClient, YandexDiskError
+from pptx2png_core.yandex_disk import YandexDiskClient, YandexDiskError
 
 
 # ==========================================

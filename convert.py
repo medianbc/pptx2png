@@ -19,7 +19,7 @@ if missing:
 
 import argparse
 from pathlib import Path
-from converter_engine import (
+from pptx2png_core.converter_engine import (
     make_dark_mode,
     pptx_to_pdf_crossplatform,
     pdf_to_png_fast,

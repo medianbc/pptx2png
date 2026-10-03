@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pptx2png-core"
+version = "0.1.0"
+description = "Shared conversion and Yandex integration for PPTX pipeline"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["pptx2png_core"]
+
+[tool.setuptools.package-dir]
+pptx2png_core = "pptx2png_core"

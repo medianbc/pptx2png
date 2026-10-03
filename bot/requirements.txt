@@ -1,0 +1,8 @@
+# Example bot runtime dependencies.
+# Confirm exact versions after validating the live environment.
+
+python-telegram-bot>=20.0
+aiohttp
+python-dotenv
+Pillow
+python-pptx

@@ -28,7 +28,7 @@ from yandex_state import (
     yd_is_active,
 )
 
-from yandex_disk import (
+from pptx2png_core.yandex_disk import (
     YandexDiskError,
     get_nearest_sunday,
     month_folder_name,

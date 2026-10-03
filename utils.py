@@ -8,8 +8,8 @@ from aiogram import Bot, types
 from pptx import Presentation
 from urllib.parse import urlencode
 
-# Импортируем ваш существующий движок рендеринга
-import converter_engine
+# Импортируем общий движок рендеринга
+import pptx2png_core.converter_engine as converter_engine
 
 # ==========================================
 # 1. ПРОВЕРКА ОРФОГРАФИИ (С РАЗДЕЛЕНИЕМ СТАТУСОВ)

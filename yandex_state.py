@@ -6,7 +6,7 @@ import asyncio
 import secrets
 from typing import Optional, Dict, Set
 
-from yandex_disk import YandexDiskClient
+from pptx2png_core.yandex_disk import YandexDiskClient
 
 
 # ==========================================

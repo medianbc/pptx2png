@@ -23,7 +23,7 @@ from handlers import router, task_lock_manager
 
 # ✅ Yandex-подсистема: конфиг и состояние
 import yandex_state
-from yandex_disk import YandexDiskClient
+from pptx2png_core.yandex_disk import YandexDiskClient
 from yandex_state import yd_active_tasks, yd_session_lock
 
 

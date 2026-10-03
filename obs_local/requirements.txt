@@ -1,0 +1,6 @@
+# Example local OBS runtime dependencies.
+# Confirm exact versions after validating the live environment.
+
+aiohttp
+python-pptx
+Pillow
