@@ -22,3 +22,7 @@ __pycache__/
 # Runtime state
 .run_state/
 *.pid
+
+# Локальные материалы и результаты OBS
+song_assets/
+obs_png/
