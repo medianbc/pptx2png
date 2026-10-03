@@ -136,6 +136,34 @@ class SongMatchingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_png_zip_paths_url_and_cache_flag_are_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            obs_dir = project_dir / "obs_local"
+            obs_dir.mkdir()
+            (obs_dir / "settings.ini").write_text(
+                "[OBS Local paths]\n"
+                "root_path = ./obs_png\n"
+                "[Song preparation]\n"
+                "yandex_zip_png_paths = /remote/png\n"
+                "yandex_zip_png_url = https://disk.yandex.ru/d/example\n"
+                "cache_missing_yandex_song_zips = true\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(prepare_songs, "BASE_DIR", obs_dir),
+                patch.object(prepare_songs, "PROJECT_DIR", project_dir),
+            ):
+                config = prepare_songs.load_config()
+
+        self.assertEqual(config["yandex_zip_png_paths"], ["/remote/png"])
+        self.assertEqual(
+            config["yandex_zip_png_url"],
+            "https://disk.yandex.ru/d/example",
+        )
+        self.assertTrue(config["cache_missing_yandex_song_zips"])
+
     def test_shared_project_token_is_used_before_obs_local_config(self):
         with tempfile.TemporaryDirectory() as directory:
             project_dir = Path(directory)
@@ -475,6 +503,78 @@ class SongOutputTests(unittest.TestCase):
                 ["slide_001.png", "slide_002.png"],
             )
 
+    def test_remote_zip_and_pptx_materials_are_cached_as_local_png_zips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zip_dir = root / "local_zip"
+            zip_dir.mkdir()
+            remote_zip = root / "remote.zip"
+            with zipfile.ZipFile(remote_zip, "w") as archive:
+                archive.writestr("slides/original.png", PNG)
+            remote_pptx = root / "remote.pptx"
+            remote_pptx.write_bytes(b"pptx")
+
+            class FakeClient:
+                def __init__(self):
+                    self.downloads = []
+
+                async def list_folder(self, path):
+                    if path == "/remote/zip":
+                        return [
+                            {
+                                "type": "file",
+                                "name": "Song from ZIP.zip",
+                                "path": "/remote/zip/Song from ZIP.zip",
+                            }
+                        ]
+                    if path == "/remote/pptx":
+                        return [
+                            {
+                                "type": "file",
+                                "name": "Song from PPTX.pptx",
+                                "path": "/remote/pptx/Song from PPTX.pptx",
+                            }
+                        ]
+                    return []
+
+                async def download_file(self, remote_path, destination):
+                    self.downloads.append(remote_path)
+                    source = remote_zip if remote_path.endswith(".zip") else remote_pptx
+                    destination.write_bytes(source.read_bytes())
+                    return True
+
+            async def fake_convert(_source, render_dir, _quality):
+                png = render_dir / "slide.png"
+                png.write_bytes(PNG)
+                return [png], None
+
+            client = FakeClient()
+            config = {
+                "zip_dir": zip_dir,
+                "yandex_zip_png_paths": ["/remote/zip"],
+                "yandex_pptx_paths": ["/remote/pptx"],
+                "quality": "standard",
+            }
+            with patch.object(
+                prepare_songs, "convert_all_pngs", side_effect=fake_convert
+            ):
+                cached, failed = asyncio.run(
+                    prepare_songs._cache_remote_song_zips(client, config, root)
+                )
+                repeated_cached, repeated_failed = asyncio.run(
+                    prepare_songs._cache_remote_song_zips(client, config, root)
+                )
+
+            self.assertEqual((cached, failed), (2, 0))
+            self.assertEqual((repeated_cached, repeated_failed), (0, 0))
+            self.assertEqual(len(client.downloads), 2)
+            self.assertTrue(
+                prepare_songs._zip_has_valid_pngs(zip_dir / "Song from ZIP.zip")
+            )
+            self.assertTrue(
+                prepare_songs._zip_has_valid_pngs(zip_dir / "Song from PPTX.zip")
+            )
+
     def test_run_publishes_song_folders_and_preserves_previous_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -493,8 +593,9 @@ class SongOutputTests(unittest.TestCase):
                 "program_url": "",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
-                "yandex_zip_paths": [],
+                "yandex_zip_png_paths": [],
                 "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
                 "output_dir": output_dir,
                 "quality": "standard",
                 "yandex_token": "",
@@ -538,8 +639,9 @@ class SongOutputTests(unittest.TestCase):
                 "program_url": "",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
-                "yandex_zip_paths": [],
+                "yandex_zip_png_paths": [],
                 "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
                 "output_dir": output_dir,
                 "quality": "standard",
                 "yandex_token": "",
@@ -565,6 +667,7 @@ class SongOutputTests(unittest.TestCase):
             self.assertTrue(
                 (output_dir / "01 - Песня первая" / "slide_001.png").is_file()
             )
+            self.assertTrue(prepare_songs._zip_has_valid_pngs(zip_dir / "Песня первая.zip"))
 
 
 if __name__ == "__main__":

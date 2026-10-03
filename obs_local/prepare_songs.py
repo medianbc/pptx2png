@@ -15,7 +15,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree
@@ -95,11 +95,22 @@ def load_config() -> dict[str, Any]:
         "program_url": song_settings.get("program_url", "").strip(),
         "zip_dir": local_path("local_zip_dir", "./song_assets/zip"),
         "pptx_dir": local_path("local_pptx_dir", "./song_assets/pptx"),
-        "yandex_zip_paths": _parse_remote_paths(
-            song_settings.get("yandex_zip_paths", "")
+        "yandex_zip_png_paths": _parse_remote_paths(
+            song_settings.get(
+                "yandex_zip_png_paths",
+                song_settings.get("yandex_zip_paths", ""),
+            )
         ),
+        "yandex_zip_png_url": song_settings.get(
+            "yandex_zip_png_url", song_settings.get("yandex_zip_url", "")
+        ).strip(),
         "yandex_pptx_paths": _parse_remote_paths(
             song_settings.get("yandex_pptx_paths", "")
+        ),
+        "cache_missing_yandex_song_zips": settings.getboolean(
+            "Song preparation",
+            "cache_missing_yandex_song_zips",
+            fallback=False,
         ),
         "output_dir": root_path / "Трансляция" / "Песни",
         "quality": quality,
@@ -312,6 +323,15 @@ def _safe_name(value: str) -> str:
     return cleaned[:100] or "Без названия"
 
 
+def _local_song_zip_path(config: dict[str, Any], source_stem: str) -> Path:
+    return config["zip_dir"] / f"{_safe_name(source_stem)}.zip"
+
+
+def _cache_pngs_if_missing(png_paths: list[Path], destination: Path) -> None:
+    if not _zip_has_valid_pngs(destination):
+        _create_png_zip(png_paths, destination)
+
+
 def _song_folder_name(index: int, title: str) -> str:
     return f"{index:02d} - {_safe_name(title)}"
 
@@ -387,6 +407,153 @@ async def _find_yandex_matches(
     return [item for quality, item in matches if quality == best_quality]
 
 
+async def _list_yandex_files(
+    client: YandexDiskClient,
+    roots: list[str],
+    suffix: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    files: list[tuple[str, dict[str, Any]]] = []
+    visited: set[str] = set()
+    seen_files: set[str] = set()
+
+    async def visit(root: str, path: str, depth: int) -> None:
+        if path in visited:
+            return
+        visited.add(path)
+        for item in await client.list_folder(path):
+            name = str(item.get("name", ""))
+            item_path = str(item.get("path", ""))
+            if item.get("type") == "dir" and depth < MAX_YANDEX_SEARCH_DEPTH:
+                if item_path:
+                    await visit(root, item_path, depth + 1)
+            elif (
+                item.get("type") == "file"
+                and item_path
+                and Path(name).suffix.casefold() == suffix
+                and item_path not in seen_files
+            ):
+                seen_files.add(item_path)
+                files.append((root, item))
+
+    for root in roots:
+        await visit(root, root, 0)
+    return files
+
+
+def _remote_cache_path(
+    local_zip_dir: Path, root: str, item_path: str, item_name: str
+) -> Path:
+    remote_root = PurePosixPath(root.removeprefix("disk:"))
+    remote_file = PurePosixPath(item_path.removeprefix("disk:"))
+    try:
+        relative = remote_file.relative_to(remote_root)
+    except ValueError:
+        relative = PurePosixPath(item_name)
+    safe_parts = [_safe_name(part) for part in relative.parts[:-1]]
+    parent = local_zip_dir.joinpath(*safe_parts)
+    return parent / f"{_safe_name(Path(item_name).stem)}.zip"
+
+
+def _remote_item_cache_path(
+    config: dict[str, Any], item: dict[str, Any]
+) -> Path:
+    item_path = str(item.get("path", ""))
+    roots = [
+        *config.get("yandex_zip_png_paths", []),
+        *config.get("yandex_pptx_paths", []),
+    ]
+    matching_roots = [
+        root
+        for root in roots
+        if item_path.removeprefix("disk:").startswith(
+            root.removeprefix("disk:").rstrip("/") + "/"
+        )
+    ]
+    if matching_roots:
+        root = max(matching_roots, key=len)
+        return _remote_cache_path(
+            config["zip_dir"], root, item_path, str(item.get("name", ""))
+        )
+    return _local_song_zip_path(config, Path(str(item.get("name", ""))).stem)
+
+
+async def _cache_remote_song_zips(
+    client: YandexDiskClient,
+    config: dict[str, Any],
+    temp_root: Path,
+) -> tuple[int, int]:
+    cached = 0
+    failed = 0
+    sources = [
+        (config.get("yandex_zip_png_paths", []), ".zip"),
+        (config.get("yandex_pptx_paths", []), ".pptx"),
+    ]
+    for roots, suffix in sources:
+        remote_files = await _list_yandex_files(client, roots, suffix)
+        for root, item in remote_files:
+            item_name = str(item["name"])
+            item_path = str(item["path"])
+            destination = _remote_cache_path(config["zip_dir"], root, item_path, item_name)
+            if _zip_has_valid_pngs(destination):
+                LOGGER.debug("Локальный ZIP с PNG уже есть: %s", destination)
+                continue
+
+            with tempfile.TemporaryDirectory(
+                prefix="song_cache_", dir=temp_root
+            ) as temp_name:
+                working = Path(temp_name)
+                source = working / _safe_name(item_name)
+                if not await client.download_file(item_path, source):
+                    failed += 1
+                    LOGGER.error("Не удалось скачать материал для кэша: %s", item_name)
+                    continue
+
+                if suffix == ".zip":
+                    png_dir = working / "png"
+                    png_dir.mkdir()
+                    try:
+                        _copy_zip_pngs(source, png_dir)
+                    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+                        failed += 1
+                        LOGGER.error(
+                            "Не удалось подготовить PNG из удалённого ZIP %s: %s",
+                            item_name,
+                            error,
+                        )
+                        continue
+                    png_paths = sorted(
+                        png_dir.glob("*.png"),
+                        key=lambda path: _natural_key(path.name),
+                    )
+                else:
+                    render_dir = working / "render"
+                    render_dir.mkdir()
+                    try:
+                        png_paths, _ = await convert_all_pngs(
+                            source, render_dir, config["quality"]
+                        )
+                    except Exception:
+                        failed += 1
+                        LOGGER.exception(
+                            "Не удалось конвертировать удалённый PPTX %s",
+                            item_name,
+                        )
+                        continue
+
+                if not png_paths:
+                    failed += 1
+                    LOGGER.error("Для материала %s не получены PNG", item_name)
+                    continue
+                _create_png_zip(png_paths, destination)
+                cached += 1
+                LOGGER.info(
+                    "Создан локальный ZIP с PNG: %s (источник: %s)",
+                    destination,
+                    item_path,
+                )
+    return cached, failed
+
+
 def _unique_match(matches: list[Any], title: str, source: str) -> Any | None:
     if len(matches) > 1:
         names = ", ".join(
@@ -431,6 +598,36 @@ def _copy_zip_pngs(zip_path: Path, output_dir: Path) -> int:
         for staged_png in sorted(staged.glob("*.png")):
             shutil.move(str(staged_png), output_dir / staged_png.name)
     return written
+
+
+def _create_png_zip(png_paths: list[Path], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.stem}-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for index, png_path in enumerate(png_paths, 1):
+                archive.write(png_path, f"slide_{index:03d}.png")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _zip_has_valid_pngs(zip_path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            for entry in archive.infolist():
+                if entry.is_dir() or Path(entry.filename).suffix.casefold() != ".png":
+                    continue
+                with archive.open(entry) as stream:
+                    if stream.read(len(PNG_SIGNATURE)) == PNG_SIGNATURE:
+                        return True
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return False
 
 
 def _normalize_program_public_key(url: str) -> str:
@@ -683,6 +880,9 @@ async def _process_song(
                         shutil.copy2(
                             png_path, song_dir / f"slide_{png_index:03d}.png"
                         )
+                    _cache_pngs_if_missing(
+                        png_paths, _local_song_zip_path(config, match.stem)
+                    )
                     result.png_count = len(png_paths)
             except Exception as error:
                 for child in song_dir.iterdir():
@@ -698,7 +898,7 @@ async def _process_song(
         return result
 
     remote_steps = [
-        ("Yandex Disk ZIP", config["yandex_zip_paths"], ".zip"),
+        ("Yandex Disk ZIP", config.get("yandex_zip_png_paths", []), ".zip"),
         ("Yandex Disk PPTX", config["yandex_pptx_paths"], ".pptx"),
     ]
     for label, roots, suffix in remote_steps:
@@ -742,6 +942,10 @@ async def _process_song(
             if suffix == ".zip":
                 try:
                     result.png_count = _copy_zip_pngs(source_path, song_dir)
+                    _cache_pngs_if_missing(
+                        sorted(song_dir.glob("*.png"), key=lambda path: _natural_key(path.name)),
+                        _remote_item_cache_path(config, match),
+                    )
                 except (zipfile.BadZipFile, RuntimeError) as error:
                     logging.warning(
                         "Не удалось использовать %s: %s", match["name"], error
@@ -761,6 +965,10 @@ async def _process_song(
                             shutil.copy2(
                                 png_path, song_dir / f"slide_{png_index:03d}.png"
                             )
+                        _cache_pngs_if_missing(
+                            png_paths,
+                            _remote_item_cache_path(config, match),
+                        )
                         result.png_count = len(png_paths)
                 except Exception as error:
                     for child in song_dir.iterdir():
@@ -806,11 +1014,11 @@ async def run(
     LOGGER.info("Запуск подготовки песен OBS на %s", target_date.isoformat())
     LOGGER.debug(
         "Конфигурация: local_zip=%s, local_pptx=%s, output=%s, "
-        "yandex_zip_roots=%d, yandex_pptx_roots=%d",
+        "yandex_zip_png_roots=%d, yandex_pptx_roots=%d",
         config["zip_dir"],
         config["pptx_dir"],
         config["output_dir"],
-        len(config["yandex_zip_paths"]),
+        len(config.get("yandex_zip_png_paths", [])),
         len(config["yandex_pptx_paths"]),
     )
     if program_file is None and not url:
@@ -849,7 +1057,10 @@ async def run(
                 print(f"  {index:02d}. {title}")
 
             client = None
-            if config["yandex_zip_paths"] or config["yandex_pptx_paths"]:
+            if (
+                config.get("yandex_zip_png_paths")
+                or config["yandex_pptx_paths"]
+            ):
                 if not config["yandex_token"]:
                     raise RuntimeError(
                         "Для поиска песен на Яндекс.Диске задайте "
@@ -861,6 +1072,19 @@ async def run(
                     results = await _process_songs(
                         songs, staging, config, client, work_dir
                     )
+                    if config.get("cache_missing_yandex_song_zips", False):
+                        cached, failed = await _cache_remote_song_zips(
+                            client, config, work_dir
+                        )
+                        LOGGER.info(
+                            "Пополнение ZIP-кэша завершено: создано=%d, ошибок=%d",
+                            cached,
+                            failed,
+                        )
+                        print(
+                            "Пополнение локальной ZIP-библиотеки: "
+                            f"создано={cached}, ошибок={failed}"
+                        )
             else:
                 results = await _process_songs(
                     songs, staging, config, None, work_dir

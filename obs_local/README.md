@@ -62,11 +62,19 @@ python -m obs_local.prepare_songs
 ```
 
 Optional remote search folders are configured as pipe-separated Yandex Disk
-paths in `yandex_zip_paths` and `yandex_pptx_paths`. Remote search requires a
+paths in `yandex_zip_png_paths` and `yandex_pptx_paths`. Remote search requires a
 `[YandexDisk] token` in the repository-root `config.ini`, shared with the bot.
 An `obs_local/config.ini` token is used only as a fallback.
 When publishing a new result, the previous `Трансляция/Песни` directory is
 retained as a timestamped backup; backups are not automatically deleted.
+
+When a matching local PPTX or remote ZIP/PPTX is used, its PNG slides are also
+saved as a ZIP in `local_zip_dir` (remote files retain their relative folder
+structure). To scan all configured remote ZIP and PPTX folders after processing
+the current program and cache files that do not yet have a valid local PNG ZIP,
+set `cache_missing_yandex_song_zips = true` in `[Song preparation]`.
+The `yandex_zip_png_url` setting is the share URL corresponding to
+`yandex_zip_png_paths`; the API search uses the configured paths.
 
 ## Logs and troubleshooting
 
