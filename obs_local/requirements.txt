@@ -1,0 +1,1 @@
+# Shared dependencies are installed with the editable core package.

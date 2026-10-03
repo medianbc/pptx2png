@@ -17,7 +17,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from utils import (
+from .utils import (
     extract_text_from_pptx,
     check_spelling,
     download_file_by_url,
@@ -26,10 +26,10 @@ from utils import (
 )
 
 # ✅ Yandex-подсистема
-import yandex_state
-from yandex_state import sessions, yd_session_lock, yd_active_tasks
-from yandex_disk import YandexDiskError
-from yandex_flow import (
+from . import yandex_state
+from .yandex_state import sessions, yd_session_lock, yd_active_tasks
+from pptx2png_core.yandex_disk import YandexDiskError
+from .yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
     cleanup_task as yd_cleanup_task,
@@ -37,8 +37,8 @@ from yandex_flow import (
     prompt_timeout_watchdog,
 )
 
-import converter_engine
-from converter_engine import convert_all_pngs, create_zip_stream
+import pptx2png_core.converter_engine as converter_engine
+from pptx2png_core.converter_engine import convert_all_pngs, create_zip_stream
 
 
 # ==========================================
@@ -472,7 +472,7 @@ async def cmd_start(message: types.Message, check_access, get_settings_keyboard)
         ok, err = await yandex_state.config.client.check_access()
         if ok:
             yd_status = "✅ Доступен"
-            from yandex_disk import (
+            from pptx2png_core.yandex_disk import (
                 get_nearest_sunday,
                 resolve_sunday_paths,
                 find_pptx_in_source,
@@ -750,7 +750,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
                 # Все файлы решены — запускаем конвертацию (или cleanup, если всё skip).
                 # ✅ Отправляем бот-сообщение, которое можно редактировать:
                 # пользователь увидит и шапку режима, и спиннер, и кнопку отмены.
-                from yandex_flow import convert_and_upload
+                from .yandex_flow import convert_and_upload
                 status_msg = await message.reply(
                     "⚙️ Запускаю конвертацию оставшихся файлов..."
                 )

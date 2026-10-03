@@ -1,5 +1,2 @@
-aiogram>=3.0
-aiohttp
-python-pptx
-pyyaml
-PyMuPDF
+-e ./core
+-r bot/requirements.txt

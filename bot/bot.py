@@ -18,13 +18,13 @@ from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiohttp
 
-from user_manager import UserManager
-from handlers import router, task_lock_manager
+from .user_manager import UserManager
+from .handlers import router, task_lock_manager
 
 # ✅ Yandex-подсистема: конфиг и состояние
-import yandex_state
-from yandex_disk import YandexDiskClient
-from yandex_state import yd_active_tasks, yd_session_lock
+from . import yandex_state
+from pptx2png_core.yandex_disk import YandexDiskClient
+from .yandex_state import yd_active_tasks, yd_session_lock
 
 
 # ==========================================
@@ -32,7 +32,8 @@ from yandex_state import yd_active_tasks, yd_session_lock
 # ==========================================
 
 def setup_environment():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    app_dir = Path(__file__).resolve().parent
+    script_dir = str(app_dir.parent)
     env_name = os.path.basename(script_dir)
 
     parser = argparse.ArgumentParser(description="PPTX2PNG Telegram Bot")
@@ -40,8 +41,10 @@ def setup_environment():
     parser.add_argument("--shm-dir", type=str, help="Путь к временной папке в RAM-диске")
     args, unknown = parser.parse_known_args()
 
-    config_path = Path(script_dir) / "config.ini"
-    settings_path = Path(script_dir) / "settings.ini"
+    config_path = app_dir / "config.ini"
+    if not config_path.exists():
+        config_path = Path(script_dir) / "config.ini"
+    settings_path = app_dir / "settings.ini"
 
     config = configparser.ConfigParser()
     settings_config = configparser.ConfigParser()
@@ -465,7 +468,7 @@ async def main():
         # папки задач на /dev/shm были удалены, а не брошены.
         # Делаем это ДО закрытия session.
         try:
-            from yandex_flow import drain_deferred_cleanups_async
+            from .yandex_flow import drain_deferred_cleanups_async
             await drain_deferred_cleanups_async(timeout=30.0)
         except Exception as e:
             logging.warning(f"Ошибка drain отложенных cleanup: {e}")

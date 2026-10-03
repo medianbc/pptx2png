@@ -25,19 +25,19 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import yandex_state
-from yandex_state import (
+from . import yandex_state
+from .yandex_state import (
     sessions,
     yd_session_lock,
     yd_active_tasks,
     yd_release,
 )
 
-from yandex_disk import YandexDiskError
-from structure import safe_folder_name
-from sermon_detector import find_sermon_range
-from utils import extract_speaker_notes
-from converter_engine import (
+from pptx2png_core.yandex_disk import YandexDiskError
+from pptx2png_core.structure import safe_folder_name
+from pptx2png_core.sermon_detector import find_sermon_range
+from pptx2png_core.utils import extract_speaker_notes
+from pptx2png_core.converter_engine import (
     convert_all_pngs,
     create_zip_stream,
     ppt_to_pptx_crossplatform,
