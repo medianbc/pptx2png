@@ -32,6 +32,8 @@ from pptx2png_core.yandex_disk import YandexDiskError
 from .yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
+    render_category_prompt,
+    _cat_meta,
     cleanup_task as yd_cleanup_task,
     is_sermon_slide,
     prompt_timeout_watchdog,
@@ -710,8 +712,37 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         text_clean = message.text.strip().lower()
 
-        if text_clean in ("отмена", "cancel", "0"):
+        if (
+            text_clean in ("отмена", "cancel")
+            and pending.get("awaiting_range_category") is not None
+        ):
             pending.pop("awaiting_range_for_idx", None)
+            pending["awaiting_range_category"] = None
+            timeout_task = pending.get("prompt_timeout_task")
+            if timeout_task is not None and not timeout_task.done():
+                timeout_task.cancel()
+            pending["prompt_timeout_task"] = None
+            pending["prompt_watchdog_nonce"] = None
+            pending["prompt_nonce"] = None
+            pending["prompt_idx"] = None
+            pending["prompt_message_id"] = None
+            await message.reply(
+                "↩️ Изменение отменено; текущий диапазон не изменён."
+            )
+            await render_category_prompt(
+                task_id=tid,
+                item=current,
+                status_msg=None,
+                reply_fn=message.reply,
+            )
+            return
+
+        if (
+            text_clean in ("отмена", "cancel", "0")
+            and pending.get("awaiting_range_category") is None
+        ):
+            pending.pop("awaiting_range_for_idx", None)
+            pending["awaiting_range_category"] = None
 
             timeout_task = pending.get("prompt_timeout_task")
             if timeout_task is not None and not timeout_task.done():
@@ -805,6 +836,74 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
 
         warning = ("\n⚠️ " + "; ".join(warning_parts)) if warning_parts else ""
 
+        category = pending.get("awaiting_range_category")
+        if category is not None:
+            category_data = current.setdefault("categories", {}).setdefault(
+                category, {}
+            )
+            all_matches = sorted({
+                slide
+                for start, end in normalized
+                for slide in range(start, end + 1)
+            })
+            category_data.update({
+                "ranges": normalized,
+                "matches": all_matches,
+                "found": bool(normalized),
+                "manual": True,
+            })
+            selected_categories = set(
+                current.get("selected_categories") or set()
+            )
+            if normalized:
+                selected_categories.add(category)
+            else:
+                selected_categories.discard(category)
+            current["selected_categories"] = selected_categories
+
+            if category == "sermon":
+                current["ranges"] = normalized
+                current["start"] = normalized[0][0] if normalized else None
+                current["end"] = normalized[-1][1] if normalized else None
+                current["matches"] = all_matches
+                current["manual_range"] = True
+
+            pending.pop("awaiting_range_for_idx", None)
+            pending["awaiting_range_category"] = None
+            timeout_task = pending.get("prompt_timeout_task")
+            if timeout_task is not None and not timeout_task.done():
+                timeout_task.cancel()
+            pending["prompt_timeout_task"] = None
+            pending["prompt_watchdog_nonce"] = None
+            pending["prompt_nonce"] = None
+            pending["prompt_idx"] = None
+            pending["prompt_message_id"] = None
+
+            category_name = _cat_meta().get(category, {}).get("name", category)
+            if normalized:
+                ranges_text = ", ".join(
+                    f"{start}–{end}" if start != end else str(start)
+                    for start, end in normalized
+                )
+                await message.reply(
+                    f"✅ Диапазон «{html_module.escape(category_name)}» "
+                    f"установлен: <b>{ranges_text}</b>{warning}",
+                    parse_mode="HTML",
+                )
+            else:
+                await message.reply(
+                    f"⚠️ Диапазон «{html_module.escape(category_name)}» "
+                    f"не установлен.{warning}",
+                    parse_mode="HTML",
+                )
+            await render_category_prompt(
+                task_id=tid,
+                item=current,
+                status_msg=None,
+                reply_fn=message.reply,
+            )
+            return
+
         # Сохраняем диапазон в prepared
         current["ranges"] = normalized
         current["start"] = normalized[0][0] if normalized else None
@@ -830,6 +929,7 @@ async def handle_text_input(message: types.Message, check_access, get_settings_k
         current["manual_range"] = True
         current["confirmed"] = False
         pending.pop("awaiting_range_for_idx", None)
+        pending["awaiting_range_category"] = None
 
         # Отменяем watchdog
         timeout_task = pending.get("prompt_timeout_task")
