@@ -1099,6 +1099,7 @@ async def _yd_prepare_files_impl(
                         "prompt_watchdog_nonce": None,
                         "status_message_id": status_message_id,
                         "awaiting_range_for_idx": None,
+                        "awaiting_range_category": None,
                     }
 
         if cleanup_needed:
@@ -1253,6 +1254,7 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     pending["prompt_idx"] = None
     pending["prompt_message_id"] = None
     pending["awaiting_range_for_idx"] = None
+    pending["awaiting_range_category"] = None
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1314,7 +1316,7 @@ def _render_category_toggle_keyboard(
         ))
 
     kb.row(InlineKeyboardButton(
-        text="✏️ Изменить диапазон категории",
+        text="✏️ Изменить диапазон",
         callback_data=f"yd_cat_edit:{task_id}:{idx}:{nonce}",
     ))
 
@@ -1390,6 +1392,10 @@ def _render_category_prompt_text(item: dict, selected: set) -> str:
         lines.append("")
 
     lines.append("🎯 <b>Отметьте категории для конвертации:</b>")
+    lines.append(
+        "<i>Диапазон любой категории можно изменить вручную "
+        "кнопкой «Изменить диапазон».</i>"
+    )
 
     if not selected:
         lines.append("")
@@ -1910,6 +1916,7 @@ async def _yd_cleanup_task(
                     pending["prompt_timeout_task"] = None
                     pending["prompt_watchdog_nonce"] = None
                     pending["awaiting_range_for_idx"] = None
+                    pending["awaiting_range_category"] = None
                     pending["prompt_nonce"] = None
                     pending["prompt_idx"] = None
         except Exception as e:

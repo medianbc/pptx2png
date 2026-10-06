@@ -1,12 +1,14 @@
 import aiohttp
+import ipaddress
 import logging
 import shutil
 import asyncio  # ✅ Добавлен импорт asyncio
+import socket
 from pathlib import Path
 from typing import Tuple, List, Optional
 from aiogram import Bot, types
 from pptx import Presentation
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import pptx2png_core.converter_engine as converter_engine
 
@@ -168,18 +170,79 @@ async def download_yandex_disk(url: str, destination: Path) -> bool:
         logging.error(f"Исключение при скачивании с Яндекс.Диска: {e}", exc_info=True)
         return False
 
-async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
-    """ Скачивает презентацию по HTTP-ссылке напрямую в RAM-диск (SHM). """
+
+class _PublicOnlyResolver(aiohttp.abc.AbstractResolver):
+    """Разрешает только публичные IP, исключая SSRF в локальную сеть."""
+
+    def __init__(self):
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_UNSPEC):
+        records = await self._resolver.resolve(host, port, family)
+        if not records or any(
+            not ipaddress.ip_address(record["host"]).is_global
+            for record in records
+        ):
+            raise OSError(f"Host resolves to a non-public IP: {host}")
+        return records
+
+    async def close(self):
+        await self._resolver.close()
+
+
+def _validate_public_http_url(url: str) -> str:
+    """Проверяет схему и блокирует URL с локальным IP или userinfo."""
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise ValueError("Only absolute HTTP(S) URLs are allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are not allowed")
+    _ = parsed.port
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as response:
-                if response.status != 200:
-                    logging.error(f"Ошибка скачивания по ссылке. Статус: {response.status}")
-                    return False
-                
-                with open(destination, "wb") as f:
-                    f.write(await response.read())
-                return True
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return url
+    if not address.is_global:
+        raise ValueError("Non-public IP addresses are not allowed")
+    return url
+
+
+async def download_file_by_url(url: str, destination: Path, status_message: types.Message) -> bool:
+    """Скачивает презентацию с публичного HTTP(S)-адреса в RAM-диск."""
+    try:
+        connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
+        async with aiohttp.ClientSession(connector=connector) as session:
+            current_url = _validate_public_http_url(url)
+            for redirect_count in range(6):
+                async with session.get(
+                    current_url,
+                    timeout=30,
+                    allow_redirects=False,
+                ) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location or redirect_count == 5:
+                            logging.error("Превышен лимит или отсутствует адрес редиректа.")
+                            return False
+                        current_url = _validate_public_http_url(
+                            urljoin(str(response.url), location)
+                        )
+                        continue
+                    if response.status != 200:
+                        logging.error(
+                            f"Ошибка скачивания по ссылке. Статус: {response.status}"
+                        )
+                        return False
+
+                    with open(destination, "wb") as file:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            file.write(chunk)
+                    return True
+            return False
+    except ValueError as e:
+        logging.warning(f"Отклонена небезопасная ссылка для скачивания: {e}")
+        return False
     except asyncio.TimeoutError:
         logging.error(f"Таймаут при скачивании по ссылке: {url}")
         return False
