@@ -25,19 +25,19 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import yandex_state
-from yandex_state import (
+from . import yandex_state
+from .yandex_state import (
     sessions,
     yd_session_lock,
     yd_active_tasks,
     yd_release,
 )
 
-from yandex_disk import YandexDiskError
-from structure import safe_folder_name
-from sermon_detector import find_sermon_range
-from utils import extract_speaker_notes
-from converter_engine import (
+from pptx2png_core.yandex_disk import YandexDiskError
+from pptx2png_core.structure import safe_folder_name
+from pptx2png_core.sermon_detector import find_sermon_range
+from pptx2png_core.utils import extract_speaker_notes
+from pptx2png_core.converter_engine import (
     convert_all_pngs,
     create_zip_stream,
     ppt_to_pptx_crossplatform,
@@ -1099,6 +1099,7 @@ async def _yd_prepare_files_impl(
                         "prompt_watchdog_nonce": None,
                         "status_message_id": status_message_id,
                         "awaiting_range_for_idx": None,
+                        "awaiting_range_category": None,
                     }
 
         if cleanup_needed:
@@ -1253,6 +1254,7 @@ async def _yd_claim_prompt(callback: types.CallbackQuery) -> Optional[dict]:
     pending["prompt_idx"] = None
     pending["prompt_message_id"] = None
     pending["awaiting_range_for_idx"] = None
+    pending["awaiting_range_category"] = None
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1314,7 +1316,7 @@ def _render_category_toggle_keyboard(
         ))
 
     kb.row(InlineKeyboardButton(
-        text="✏️ Изменить диапазон категории",
+        text="✏️ Изменить диапазон",
         callback_data=f"yd_cat_edit:{task_id}:{idx}:{nonce}",
     ))
 
@@ -1390,6 +1392,10 @@ def _render_category_prompt_text(item: dict, selected: set) -> str:
         lines.append("")
 
     lines.append("🎯 <b>Отметьте категории для конвертации:</b>")
+    lines.append(
+        "<i>Диапазон любой категории можно изменить вручную "
+        "кнопкой «Изменить диапазон».</i>"
+    )
 
     if not selected:
         lines.append("")
@@ -1910,6 +1916,7 @@ async def _yd_cleanup_task(
                     pending["prompt_timeout_task"] = None
                     pending["prompt_watchdog_nonce"] = None
                     pending["awaiting_range_for_idx"] = None
+                    pending["awaiting_range_category"] = None
                     pending["prompt_nonce"] = None
                     pending["prompt_idx"] = None
         except Exception as e:

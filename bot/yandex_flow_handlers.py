@@ -18,8 +18,8 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import yandex_state
-from yandex_state import (
+from . import yandex_state
+from .yandex_state import (
     sessions,
     yd_session_lock,
     yd_active_tasks,
@@ -28,7 +28,7 @@ from yandex_state import (
     yd_is_active,
 )
 
-from yandex_disk import (
+from pptx2png_core.yandex_disk import (
     YandexDiskError,
     get_nearest_sunday,
     month_folder_name,
@@ -36,7 +36,7 @@ from yandex_disk import (
     find_pptx_in_source,
 )
 
-from yandex_flow_core import (
+from .yandex_flow_core import (
     # утилиты
     _safe_answer,
     _safe_edit,
@@ -760,18 +760,250 @@ async def yd_cat_convert(callback: types.CallbackQuery, bot: Bot):
 
 
 # ==========================================
-# v4.0: yd_cat_edit (заглушка)
+# Ручное редактирование диапазона категории
 # ==========================================
 
 @router.callback_query(F.data.startswith("yd_cat_edit:"))
 async def yd_cat_edit(callback: types.CallbackQuery, bot: Bot):
-    """v4.0: заглушка. Ручное редактирование — v4.1."""
-    await _safe_answer(
-        callback,
-        "✏️ Ручное редактирование диапазона по категориям — в следующем "
-        "обновлении. Пока используйте автоматические диапазоны.",
-        show_alert=True,
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+
+    task_id = parts[1]
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+
+    pending = session["pending"]
+    if not isinstance(pending, dict):
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+    if (
+        pending.get("prompt_nonce") != parts[3]
+        or pending.get("prompt_idx") != idx
+        or callback.from_user.id != pending.get("owner_user_id")
+    ):
+        await _safe_answer(callback, "⏳ Промпт уже обработан.", show_alert=True)
+        return
+    if idx < 0 or idx >= len(pending.get("prepared", [])):
+        await _safe_answer(callback, "❌ Файл не найден.", show_alert=True)
+        return
+
+    pending = await _yd_claim_prompt(callback)
+    if pending is None:
+        return
+
+    item = pending["prepared"][idx]
+    file_name = html_module.escape(item.get("file_name", ""))
+    total_slides = item.get("total_slides", 0)
+    picker_nonce = secrets.token_hex(4)
+    pending["prompt_nonce"] = picker_nonce
+    pending["prompt_idx"] = idx
+
+    category_keyboard = InlineKeyboardBuilder()
+    categories = item.get("categories", {})
+    for category in _cat_order():
+        category_meta = _cat_meta().get(category, {})
+        name = category_meta.get("name", category)
+        category_data = categories.get(category) or {}
+        ranges_text = _format_ranges_text(category_data.get("ranges") or [])
+        status = ranges_text if category_data.get("ranges") else "не задан"
+        category_keyboard.row(InlineKeyboardButton(
+            text=f"{category_meta.get('emoji', '❓')} {name} ({status})",
+            callback_data=(
+                f"yd_cat_choose:{task_id}:{idx}:{picker_nonce}:{category}"
+            ),
+        ))
+    category_keyboard.row(InlineKeyboardButton(
+        text="↩️ Назад",
+        callback_data=f"yd_cat_edit_back:{task_id}:{idx}:{picker_nonce}",
+    ))
+    category_keyboard.row(InlineKeyboardButton(
+        text="❌ Отменить задачу",
+        callback_data=f"yd_task_cancel:{task_id}",
+    ))
+
+    try:
+        await callback.message.edit_text(
+            "✏️ <b>Выберите категорию для изменения диапазона</b>\n\n"
+            f"📄 Файл: <code>{file_name}</code>\n"
+            f"📊 Всего слайдов: <b>{total_slides}</b>",
+            parse_mode="HTML",
+            reply_markup=category_keyboard.as_markup(),
+        )
+    except Exception as error:
+        logging.error(
+            "Не удалось показать выбор категории для изменения диапазона: %s",
+            error,
+            exc_info=True,
+        )
+        await _yd_render_category_prompt(
+            task_id=task_id,
+            item=item,
+            status_msg=callback.message,
+        )
+        await _safe_answer(callback, "❌ Не удалось открыть редактирование.")
+        return
+
+    pending["prompt_message_id"] = callback.message.message_id
+    await _restart_prompt_watchdog(task_id, pending, picker_nonce)
+    await _safe_answer(callback)
+
+
+@router.callback_query(F.data.startswith("yd_cat_choose:"))
+async def yd_cat_choose(callback: types.CallbackQuery, bot: Bot):
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+
+    task_id = parts[1]
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+    category = parts[4]
+    if category not in _cat_order():
+        await _safe_answer(callback, "❌ Неизвестная категория.", show_alert=True)
+        return
+
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+    pending = session["pending"]
+    if (
+        not isinstance(pending, dict)
+        or pending.get("prompt_nonce") != parts[3]
+        or pending.get("prompt_idx") != idx
+        or callback.from_user.id != pending.get("owner_user_id")
+    ):
+        await _safe_answer(callback, "⏳ Промпт уже обработан.", show_alert=True)
+        return
+    if idx < 0 or idx >= len(pending.get("prepared", [])):
+        await _safe_answer(callback, "❌ Файл не найден.", show_alert=True)
+        return
+
+    pending = await _yd_claim_prompt(callback)
+    if pending is None:
+        return
+
+    item = pending["prepared"][idx]
+    category_data = item.setdefault("categories", {}).setdefault(category, {})
+    ranges_text = _format_ranges_text(category_data.get("ranges") or [])
+    if not category_data.get("ranges"):
+        ranges_text = "не задан"
+    category_meta = _cat_meta().get(category, {})
+    category_name = html_module.escape(category_meta.get("name", category))
+    file_name = html_module.escape(item.get("file_name", ""))
+    total_slides = item.get("total_slides", 0)
+    manual_nonce = secrets.token_hex(4)
+
+    try:
+        await callback.message.edit_text(
+            f"✏️ <b>Укажите диапазон: {category_name}</b>\n\n"
+            f"📄 Файл: <code>{file_name}</code>\n"
+            f"📊 Всего слайдов: <b>{total_slides}</b>\n"
+            f"Текущий диапазон: <code>{ranges_text}</code>\n\n"
+            f"<b>Формат:</b> <code>5-30</code> или "
+            f"<code>5,7,10-15</code>\n"
+            "Отправьте диапазон сообщением в чат. Можно указать несколько "
+            "диапазонов через запятую.\n"
+            "<i>Для возврата без изменений отправьте «отмена».</i>",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception as error:
+        logging.error(
+            "Не удалось показать редактирование категории %s: %s",
+            category,
+            error,
+            exc_info=True,
+        )
+        await _yd_render_category_prompt(
+            task_id=task_id,
+            item=item,
+            status_msg=callback.message,
+        )
+        await _safe_answer(callback, "❌ Не удалось открыть редактирование.")
+        return
+
+    pending["awaiting_range_for_idx"] = idx
+    pending["awaiting_range_category"] = category
+    pending["prompt_nonce"] = manual_nonce
+    pending["prompt_idx"] = idx
+    pending["prompt_message_id"] = callback.message.message_id
+    await _restart_prompt_watchdog(task_id, pending, manual_nonce)
+    await _safe_answer(callback)
+
+
+async def _restart_prompt_watchdog(
+    task_id: str, pending: dict, expected_nonce: str
+) -> None:
+    old_timeout = pending.get("prompt_timeout_task")
+    if old_timeout is not None and not old_timeout.done():
+        old_timeout.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(old_timeout), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception:
+            logging.exception("Не удалось дождаться старого prompt watchdog")
+
+    pending["prompt_timeout_task"] = asyncio.create_task(
+        _yd_prompt_timeout_watchdog(
+            task_id, yandex_state.config.prompt_timeout_sec, expected_nonce
+        )
     )
+    pending["prompt_watchdog_nonce"] = expected_nonce
+
+
+@router.callback_query(F.data.startswith("yd_cat_edit_back:"))
+async def yd_cat_edit_back(callback: types.CallbackQuery, bot: Bot):
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+    task_id = parts[1]
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await _safe_answer(callback, "❌ Некорректный запрос.", show_alert=True)
+        return
+    session = sessions.get(task_id)
+    if not session or "pending" not in session:
+        await _safe_answer(callback, "❌ Сессия неактивна.", show_alert=True)
+        return
+    pending = session["pending"]
+    if (
+        not isinstance(pending, dict)
+        or pending.get("prompt_nonce") != parts[3]
+        or pending.get("prompt_idx") != idx
+        or callback.from_user.id != pending.get("owner_user_id")
+    ):
+        await _safe_answer(callback, "⏳ Промпт уже обработан.", show_alert=True)
+        return
+    pending = await _yd_claim_prompt(callback)
+    if pending is None:
+        return
+    if idx < 0 or idx >= len(pending.get("prepared", [])):
+        await _safe_answer(callback, "❌ Файл не найден.", show_alert=True)
+        return
+    await _yd_render_category_prompt(
+        task_id=task_id,
+        item=pending["prepared"][idx],
+        status_msg=callback.message,
+    )
+    await _safe_answer(callback)
 
 
 # ==========================================
@@ -986,6 +1218,7 @@ async def yd_task_cancel_callback(callback: types.CallbackQuery):
     pending["prompt_timeout_task"] = None
     pending["prompt_watchdog_nonce"] = None
     pending["awaiting_range_for_idx"] = None
+    pending["awaiting_range_category"] = None
 
     prompt_active = pending.get("prompt_nonce") is not None
 
@@ -1107,8 +1340,8 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
             f"{context_block}\n\n"
             f"<b>Формат:</b> <code>5-30</code> или <code>5,7,10-15</code>\n"
             f"Отправьте текстом в чат (ответом на это сообщение).\n"
-            f"<i>Отправьте <code>отмена</code> или <code>0</code>, "
-            f"чтобы пропустить файл.</i>",
+            f"<i>Отправьте <code>отмена</code>, чтобы вернуться "
+            f"без изменения диапазона.</i>",
             parse_mode="HTML",
             reply_markup=cancel_kb.as_markup(),
         )
@@ -1132,6 +1365,7 @@ async def yd_sermon_edit(callback: types.CallbackQuery, bot: Bot):
         return
 
     pending["awaiting_range_for_idx"] = idx
+    pending["awaiting_range_category"] = "sermon"
     pending["prompt_nonce"] = manual_nonce
     pending["prompt_idx"] = idx
     if sent_msg is not None and hasattr(sent_msg, "message_id"):
