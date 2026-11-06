@@ -301,12 +301,6 @@ def ensure_program_url(
             print(f"Некорректная ссылка: {error}")
             continue
 
-        update_ini_file(
-            BASE_DIR / "settings.ini",
-            {"Song preparation": {"program_url": url}},
-        )
-        config["program_url"] = url
-        print("Ссылка сохранена в obs_local/settings.ini.")
         return url
 
 
@@ -1125,8 +1119,10 @@ async def run(
 ) -> list[SongResult]:
     config = config or load_config()
     url = (program_url or config["program_url"]).strip()
+    prompted_program_url = False
     if program_file is None and not url and interactive:
         url = ensure_program_url(config, input_fn)
+        prompted_program_url = True
     LOGGER.info("Запуск подготовки песен OBS на %s", target_date.isoformat())
     LOGGER.debug(
         "Конфигурация: local_zip=%s, local_pptx=%s, output=%s, "
@@ -1160,7 +1156,25 @@ async def run(
             if program_file is None:
                 async with aiohttp.ClientSession() as session:
                     program_file = work_dir / "program.docx"
-                    await download_program_docx(session, url, program_file)
+                    while True:
+                        try:
+                            await download_program_docx(
+                                session, url, program_file
+                            )
+                        except RuntimeError as error:
+                            if not prompted_program_url:
+                                raise
+                            print(f"Не удалось проверить DOCX: {error}")
+                            url = ensure_program_url(config, input_fn)
+                            continue
+                        break
+                if prompted_program_url:
+                    update_ini_file(
+                        BASE_DIR / "settings.ini",
+                        {"Song preparation": {"program_url": url}},
+                    )
+                    config["program_url"] = url
+                    print("Ссылка сохранена в obs_local/settings.ini.")
 
             LOGGER.info("Разбор программы: %s", program_file.name)
             songs = extract_song_titles(program_file, target_date)
@@ -1281,6 +1295,14 @@ async def _process_songs(
         result = await _process_song(
             search_title, song_dir, config, client, temp_root
         )
+        if (
+            result.status == "not_found"
+            and _normalize(search_title) != _normalize(title)
+        ):
+            result.folder.rmdir()
+            result = await _process_song(
+                title, song_dir, config, client, temp_root
+            )
         result.title = title
         if result.status == "not_found":
             missing_dir = staging / _song_folder_name(
@@ -1416,7 +1438,7 @@ def main() -> None:
                 args.program_file,
                 args.program_url,
                 config=config,
-                interactive=not args.program_file and sys.stdin.isatty(),
+                interactive=sys.stdin.isatty(),
             )
         )
     except Exception as error:
