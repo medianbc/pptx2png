@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import configparser
 import getpass
-import os
 import re
 import shutil
 import tempfile
@@ -38,9 +37,6 @@ DEFAULT_ROOT_PATH = "./obs_png"
 
 class OperationCancelled(Exception):
     """Raised when the operator cancels an interactive OBS preparation."""
-
-
-
 
 
 def _read_yandex_token() -> str:
