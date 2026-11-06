@@ -8,8 +8,8 @@ import getpass
 import os
 import re
 import shutil
-import stat
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,8 @@ from pptx2png_core.yandex_disk import (
     resolve_sunday_paths,
 )
 
+from .config_utils import update_ini_file as _update_ini_file
+
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -38,85 +40,7 @@ class OperationCancelled(Exception):
     """Raised when the operator cancels an interactive OBS preparation."""
 
 
-def _update_ini_file(
-    path: Path,
-    updates: dict[str, dict[str, str]],
-    file_mode: int | None = None,
-) -> None:
-    newline = "\r\n" if path.exists() and "\r\n" in path.read_text(
-        encoding="utf-8"
-    ) else "\n"
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    output: list[str] = []
-    written = {section: set() for section in updates}
-    section_name = None
 
-    def append_missing(section: str) -> None:
-        for key, value in updates[section].items():
-            if key.lower() not in written[section]:
-                output.append(f"{key} = {value}")
-                written[section].add(key.lower())
-
-    for line in lines:
-        section_match = configparser.ConfigParser.SECTCRE.match(line)
-        if section_match:
-            if section_name in updates:
-                append_missing(section_name)
-            section_name = section_match.group("header").strip()
-            output.append(line)
-            continue
-
-        if section_name in updates:
-            option_match = re.match(r"^(\s*)([^#;\s][^=:]*?)\s*[=:]", line)
-            if option_match:
-                key = option_match.group(2).strip()
-                replacement = next(
-                    (
-                        value
-                        for option, value in updates[section_name].items()
-                        if option.lower() == key.lower()
-                    ),
-                    None,
-                )
-                if replacement is not None:
-                    output.append(f"{option_match.group(1)}{key} = {replacement}")
-                    written[section_name].add(key.lower())
-                    continue
-        output.append(line)
-
-    if section_name in updates:
-        append_missing(section_name)
-    for section, options in updates.items():
-        if any(key.lower() not in written[section] for key in options):
-            if output and output[-1].strip():
-                output.append("")
-            output.append(f"[{section}]")
-            append_missing(section)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if file_mode is None and path.exists():
-        file_mode = stat.S_IMODE(path.stat().st_mode)
-    temporary_path = None
-    try:
-        updated_text = newline.join(output) + newline
-        validation = configparser.ConfigParser(interpolation=None)
-        validation.read_string(updated_text, source=str(path))
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(updated_text)
-        if file_mode is not None:
-            os.chmod(temporary_path, file_mode)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
 
 
 def _read_yandex_token() -> str:
@@ -241,28 +165,73 @@ def load_config(
 
 
 async def download_presentation(
-    config: dict[str, Any], sunday: datetime, temp_dir: Path
+    config: dict[str, Any],
+    sunday: datetime,
+    temp_dir: Path,
+    input_fn: Callable[[str], str] | None = None,
 ) -> Path:
+    if input_fn is None:
+        input_fn = input
+
     async with aiohttp.ClientSession() as http_session:
         client = YandexDiskClient(config["token"], http_session)
         accessible, error = await client.check_access()
         if not accessible:
             raise RuntimeError(f"Нет доступа к Яндекс.Диску: {error}")
 
-        paths = await resolve_sunday_paths(
-            client,
-            config["base_path"],
-            sunday,
-            source_folder=config["source_folder"],
-        )
-        if not paths:
-            raise RuntimeError(f"Не найдена папка служения за {sunday:%d.%m.%Y}")
-
-        files = await find_pptx_in_source(client, paths["source"], sunday)
-        if not files:
-            raise RuntimeError(
-                f"В {paths['source']} не найдены PPT/PPTX за {sunday:%d.%m.%Y}"
+        while True:
+            paths = await resolve_sunday_paths(
+                client,
+                config["base_path"],
+                sunday,
+                source_folder=config["source_folder"],
             )
+            files = (
+                await find_pptx_in_source(client, paths["source"], sunday)
+                if paths
+                else []
+            )
+            if files:
+                break
+
+            if paths:
+                problem = (
+                    f"В папке служения не найдены PPT/PPTX "
+                    f"за {sunday:%d.%m.%Y}."
+                )
+            else:
+                problem = f"Папка служения за {sunday:%d.%m.%Y} не найдена."
+            print(f"\n{problem}")
+            print("Можно продолжить подготовку одним из способов:")
+            print("  Enter       — повторить поиск на Яндекс.Диске")
+            print("  путь к PPTX — открыть локальный файл (.pptx или .ppt)")
+            print("  esc / exit  — введите для возврата в меню")
+            try:
+                answer = input_fn("Ваш выбор: ").strip()
+            except EOFError as error:
+                raise OperationCancelled from error
+
+            if answer.lower() in {
+                "\x1b",
+                "esc",
+                "exit",
+                "quit",
+                "q",
+                "выход",
+                "отмена",
+            }:
+                raise OperationCancelled
+            if not answer:
+                continue
+
+            local_path = Path(answer.strip("\"'")).expanduser()
+            if local_path.suffix.lower() not in {".ppt", ".pptx"}:
+                print("Укажите путь к файлу .ppt или .pptx.")
+                continue
+            if not local_path.is_file():
+                print(f"Файл не найден: {local_path}")
+                continue
+            return local_path
 
         print(f"\nПрезентации на {sunday:%d.%m.%Y}:")
         for index, item in enumerate(files, start=1):
@@ -270,7 +239,7 @@ async def download_presentation(
 
         while True:
             try:
-                answer = input("Номер презентации [0 — отмена]: ").strip()
+                answer = input_fn("Номер презентации [0 — отмена]: ").strip()
                 if answer.lower() in {"0", "q", "cancel", "отмена"}:
                     raise OperationCancelled
                 choice = int(answer) - 1

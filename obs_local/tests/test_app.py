@@ -1,9 +1,11 @@
+import asyncio
 import configparser
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from obs_local import app
 
@@ -54,6 +56,117 @@ class SlideRangeTests(unittest.TestCase):
                 "custom", [(1, 2)], 12, input_fn=lambda _: "e"
             )
         )
+
+
+class PresentationSourceRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_context = tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        )
+        self.addCleanup(self.temp_context.cleanup)
+        self.temp_dir = Path(self.temp_context.name)
+        self.config = {
+            "token": "test-token",
+            "base_path": "/presentations",
+            "source_folder": "Служение",
+        }
+        self.session = object()
+        self.session_context = MagicMock()
+        self.session_context.__aenter__ = AsyncMock(return_value=self.session)
+        self.session_context.__aexit__ = AsyncMock(return_value=False)
+        self.client = MagicMock()
+        self.client.check_access = AsyncMock(return_value=(True, ""))
+        self.client.download_file = AsyncMock(return_value=True)
+
+    def test_missing_remote_folder_accepts_a_local_presentation(self):
+        local_presentation = self.temp_dir / "local-deck.pptx"
+        local_presentation.write_bytes(b"synthetic pptx placeholder")
+        with (
+            patch.object(
+                app.aiohttp, "ClientSession", return_value=self.session_context
+            ),
+            patch.object(app, "YandexDiskClient", return_value=self.client),
+            patch.object(
+                app,
+                "resolve_sunday_paths",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = asyncio.run(
+                app.download_presentation(
+                    self.config,
+                    datetime(2026, 11, 8),
+                    self.temp_dir,
+                    input_fn=lambda _: str(local_presentation),
+                )
+            )
+
+        self.assertEqual(result, local_presentation)
+        self.client.download_file.assert_not_awaited()
+
+    def test_enter_retries_yandex_search(self):
+        paths = {"source": "/presentations/source"}
+        presentation = {
+            "name": "remote-deck.pptx",
+            "path": "/presentations/source/remote-deck.pptx",
+        }
+        with (
+            patch.object(
+                app.aiohttp, "ClientSession", return_value=self.session_context
+            ),
+            patch.object(app, "YandexDiskClient", return_value=self.client),
+            patch.object(
+                app,
+                "resolve_sunday_paths",
+                new_callable=AsyncMock,
+                side_effect=[None, paths],
+            ) as resolve_paths,
+            patch.object(
+                app,
+                "find_pptx_in_source",
+                new_callable=AsyncMock,
+                return_value=[presentation],
+            ),
+        ):
+            answers = iter(["", "1"])
+            result = asyncio.run(
+                app.download_presentation(
+                    self.config,
+                    datetime(2026, 11, 8),
+                    self.temp_dir,
+                    input_fn=lambda _: next(answers),
+                )
+            )
+
+        self.assertEqual(resolve_paths.await_count, 2)
+        self.client.download_file.assert_awaited_once_with(
+            presentation["path"], self.temp_dir / presentation["name"]
+        )
+        self.assertEqual(result, self.temp_dir / presentation["name"])
+
+    def test_exit_choice_cancels_without_ending_the_process(self):
+        with (
+            patch.object(
+                app.aiohttp, "ClientSession", return_value=self.session_context
+            ),
+            patch.object(app, "YandexDiskClient", return_value=self.client),
+            patch.object(
+                app,
+                "resolve_sunday_paths",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with self.assertRaises(app.OperationCancelled):
+                asyncio.run(
+                    app.download_presentation(
+                        self.config,
+                        datetime(2026, 11, 8),
+                        self.temp_dir,
+                        input_fn=lambda _: "exit",
+                    )
+                )
 
 
 class InteractiveConfigTests(unittest.TestCase):

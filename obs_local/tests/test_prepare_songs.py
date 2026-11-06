@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 from obs_local import prepare_songs
@@ -136,6 +136,54 @@ class SongMatchingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_program_url_is_prompted_validated_and_saved(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            obs_dir = Path(directory) / "obs_local"
+            obs_dir.mkdir()
+            settings_path = obs_dir / "settings.ini"
+            settings_path.write_text(
+                "# Preserve this comment.\n"
+                "[Song preparation]\n"
+                "local_zip_dir = ./song_assets/zip\n",
+                encoding="utf-8",
+            )
+            config = {"program_url": ""}
+            answers = iter(
+                [
+                    "https://docs.yandex.ru/view/d/not-a-public-key",
+                    "https://disk.yandex.ru/d/public-program",
+                ]
+            )
+
+            with patch.object(prepare_songs, "BASE_DIR", obs_dir):
+                result = prepare_songs.ensure_program_url(
+                    config, input_fn=lambda _: next(answers)
+                )
+
+            saved = settings_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result, "https://disk.yandex.ru/d/public-program")
+        self.assertEqual(config["program_url"], result)
+        self.assertIn("# Preserve this comment.", saved)
+        self.assertIn(f"program_url = {result}", saved)
+
+    def test_song_title_aliases_are_saved_and_loaded(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            aliases_path = Path(directory) / "song_title_aliases.json"
+            aliases = {"песня вторая": "Другое название"}
+            prepare_songs.save_song_title_aliases(aliases, aliases_path)
+
+            self.assertEqual(
+                prepare_songs.load_song_title_aliases(aliases_path), aliases
+            )
+            self.assertFalse(
+                list(Path(directory).glob(".song_title_aliases.json.*"))
+            )
+
     def test_macos_uses_user_log_directory_instead_of_linux_shm_default(self):
         with tempfile.TemporaryDirectory() as directory:
             project_dir = Path(directory)
@@ -617,6 +665,7 @@ class SongOutputTests(unittest.TestCase):
             (output_dir / "old-result.txt").write_text("preserve", encoding="utf-8")
             config = {
                 "program_url": "",
+                "song_title_aliases_path": root / "song_title_aliases.json",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
                 "yandex_zip_png_paths": [],
@@ -663,6 +712,7 @@ class SongOutputTests(unittest.TestCase):
             output_dir = root / "Трансляция" / "Песни"
             config = {
                 "program_url": "",
+                "song_title_aliases_path": root / "song_title_aliases.json",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
                 "yandex_zip_png_paths": [],
@@ -694,6 +744,74 @@ class SongOutputTests(unittest.TestCase):
                 (output_dir / "01 - Песня первая" / "slide_001.png").is_file()
             )
             self.assertTrue(prepare_songs._zip_has_valid_pngs(zip_dir / "Песня первая.zip"))
+
+    def test_missing_song_can_be_found_and_remembered_by_alternative_title(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            program_path = root / "program.docx"
+            _create_docx(program_path)
+            zip_dir = root / "zip"
+            pptx_dir = root / "pptx"
+            zip_dir.mkdir()
+            pptx_dir.mkdir()
+            with zipfile.ZipFile(zip_dir / "Песня первая.zip", "w") as archive:
+                archive.writestr("slide_1.png", PNG)
+            with zipfile.ZipFile(zip_dir / "Alt title.zip", "w") as archive:
+                archive.writestr("slide_1.png", PNG)
+            aliases_path = root / "song_title_aliases.json"
+            output_dir = root / "Трансляция" / "Песни"
+            config = {
+                "program_url": "",
+                "song_title_aliases_path": aliases_path,
+                "zip_dir": zip_dir,
+                "pptx_dir": pptx_dir,
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": output_dir,
+                "quality": "standard",
+                "yandex_token": "",
+            }
+
+            first_answers = iter(["Alt title"])
+            first_results = asyncio.run(
+                prepare_songs.run(
+                    date(2026, 10, 4),
+                    program_path,
+                    config=config,
+                    interactive=True,
+                    input_fn=lambda _: next(first_answers),
+                )
+            )
+            first_song_dir = output_dir / "02 - Песня вторая"
+            self.assertTrue(
+                (first_song_dir / "slide_001.png").is_file(),
+                f"Output contents: {list(output_dir.iterdir())}",
+            )
+            self.assertTrue(aliases_path.is_file())
+
+            second_results = asyncio.run(
+                prepare_songs.run(
+                    date(2026, 10, 4),
+                    program_path,
+                    config=config,
+                    interactive=True,
+                    input_fn=Mock(
+                        side_effect=AssertionError("unexpected alias prompt")
+                    ),
+                )
+            )
+            saved_aliases = prepare_songs.load_song_title_aliases(aliases_path)
+
+        self.assertEqual(first_results[1].status, "ready")
+        self.assertEqual(first_results[1].title, "Песня вторая")
+        self.assertEqual(
+            saved_aliases, {"песня вторая": "Alt title"}
+        )
+        self.assertEqual(second_results[1].status, "ready")
+        self.assertEqual(second_results[1].title, "Песня вторая")
 
 
 if __name__ == "__main__":

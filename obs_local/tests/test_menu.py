@@ -20,6 +20,20 @@ class MainMenuTests(unittest.TestCase):
     def test_eof_exits_cleanly(self):
         menu.run_menu(input_fn=Mock(side_effect=EOFError))
 
+    def test_cancelling_presentation_returns_to_menu_for_song_preparation(self):
+        answers = iter(["1", "2", "0"])
+        with (
+            patch.object(
+                menu.app,
+                "run",
+                side_effect=menu.app.OperationCancelled,
+            ),
+            patch.object(menu, "_prepare_songs") as prepare_songs,
+        ):
+            menu.run_menu(input_fn=lambda _: next(answers))
+
+        prepare_songs.assert_called_once_with()
+
     def test_date_argument_keeps_direct_presentation_launch(self):
         with (
             patch("sys.argv", ["obs_local", "--date", "2026-11-08"]),
