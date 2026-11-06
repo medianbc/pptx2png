@@ -24,6 +24,11 @@ directory on `PYTHONPATH` for existing server environments.
 - Create `bot/config.ini` for secrets; if it is absent, the legacy
   repository-root `config.ini` is used.
 - `bot/template.yaml` is the Yandex Disk folder template.
+- `[FolderSetup]` in `bot/settings.ini` controls automatic folder creation.
+  When enabled, the bot checks the configured tree at startup (to catch up on a
+  missed run) and at Monday midnight in the server's local time for the
+  upcoming Sunday. Failed attempts are retried at `retry_interval_sec`; the
+  configured Yandex Disk base folder must already exist.
 - User allowlists and preferences remain in the repository root to preserve
   existing deployment state.
 

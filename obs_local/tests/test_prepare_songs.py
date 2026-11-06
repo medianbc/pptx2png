@@ -939,6 +939,5 @@ class SongOutputTests(unittest.TestCase):
 
         self.assertTrue(run.await_args.kwargs["interactive"])
 
-
 if __name__ == "__main__":
     unittest.main()

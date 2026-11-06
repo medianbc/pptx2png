@@ -1291,7 +1291,7 @@ async def _process_songs(
     aliases = aliases or {}
     for index, title in enumerate(songs, 1):
         song_dir = staging / _song_folder_name(index, title)
-        search_title = aliases.get(_normalize(title), title)
+        search_title = aliases.get(_normalize(title), title        )
         result = await _process_song(
             search_title, song_dir, config, client, temp_root
         )
