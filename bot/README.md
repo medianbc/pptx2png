@@ -26,3 +26,8 @@ directory on `PYTHONPATH` for existing server environments.
 - `bot/template.yaml` is the Yandex Disk folder template.
 - User allowlists and preferences remain in the repository root to preserve
   existing deployment state.
+
+## User guide
+
+See [BOT_USER_FLOWS.md](../BOT_USER_FLOWS.md) for the Russian user guide,
+commands, menus, slide-range selection, `/sunday` and common errors.
