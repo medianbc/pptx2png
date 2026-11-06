@@ -31,6 +31,7 @@ def _prepare_songs() -> None:
             prepare_songs.run(
                 prepare_songs.get_nearest_sunday().date(),
                 config=config,
+                interactive=True,
             )
         )
     except Exception as error:
