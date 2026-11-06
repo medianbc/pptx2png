@@ -174,8 +174,10 @@ cannot be found, the workflow reports the status of every song and lets the
 operator enter an alternative title to retry the search. Successful
 alternatives are stored locally in the ignored
 `obs_local/song_title_aliases.json` file and reused on later runs. Enter an
-empty response to skip an alternative. Non-interactive runs can still use
-`--program-file` or `--program-url`.
+empty response to skip an alternative. If a saved alias no longer finds a
+match, the original program title is tried as a fallback. A prompted program
+link is saved only after Yandex Disk returns a valid DOCX. Non-interactive runs
+can still use `--program-file` or `--program-url`.
 
 ## Test song preparation for OBS
 
