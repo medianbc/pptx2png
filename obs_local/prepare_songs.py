@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 import tempfile
 import uuid
 import zipfile
@@ -37,6 +38,7 @@ MAX_ZIP_PNG_BYTES = 512 * 1024 * 1024
 MAX_ZIP_PNG_FILES = 1000
 MAX_PROGRAM_DOCX_BYTES = 50 * 1024 * 1024
 MAX_YANDEX_SEARCH_DEPTH = 3
+DEFAULT_RAM_LOG_DIR = "/dev/shm/pptx2png_tasks/obs_local/logs"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -91,6 +93,26 @@ def load_config() -> dict[str, Any]:
         value = song_settings.get(option, default).strip()
         return _resolve_path(value)
 
+    configured_log_dir = settings.get(
+        "Logging", "log_dir", fallback=""
+    ).strip()
+    if sys.platform == "darwin" and configured_log_dir in {
+        "",
+        DEFAULT_RAM_LOG_DIR,
+    }:
+        log_dir = Path.home() / "Library" / "Logs" / "pptx2png" / "obs_local"
+        if configured_log_dir:
+            logging.warning(
+                "Настройка log_dir=%s предназначена для Linux; "
+                "на macOS используется %s",
+                configured_log_dir,
+                log_dir,
+            )
+    elif configured_log_dir:
+        log_dir = _resolve_path(configured_log_dir)
+    else:
+        log_dir = Path(DEFAULT_RAM_LOG_DIR)
+
     return {
         "program_url": song_settings.get("program_url", "").strip(),
         "zip_dir": local_path("local_zip_dir", "./song_assets/zip"),
@@ -115,13 +137,7 @@ def load_config() -> dict[str, Any]:
         "output_dir": root_path / "Трансляция" / "Песни",
         "quality": quality,
         "yandex_token": _load_yandex_token(),
-        "log_dir": _resolve_path(
-            settings.get(
-                "Logging",
-                "log_dir",
-                fallback="/dev/shm/pptx2png_tasks/obs_local/logs",
-            ).strip()
-        ),
+        "log_dir": log_dir,
     }
 
 

@@ -1,5 +1,8 @@
 # Local OBS workflow
 
+> Russian version: [README.RU.md](README.RU.md). Keep both files aligned whenever
+> the local OBS workflow documentation changes.
+
 This package downloads a presentation from Yandex Disk, lets the operator
 select a category and slide range, and writes PNG files to the configured
 local OBS directory. Conversion and Yandex Disk operations are shared with the
@@ -7,35 +10,91 @@ bot through `core`.
 
 ## Install and run
 
-On a new Debian, Ubuntu, or Raspberry Pi OS machine, download and run the
-installer from the repository:
+On a new machine, clone the current local-workflow branch and run its installer:
 
 ```bash
-curl -fL \
-  https://raw.githubusercontent.com/medianbc/pptx2png/main/install_obs_local.sh \
-  -o install_obs_local.sh
-chmod +x install_obs_local.sh
+git clone --branch dev --single-branch \
+  https://github.com/medianbc/pptx2png.git "$HOME/pptx2png"
+cd "$HOME/pptx2png"
 ./install_obs_local.sh
 ```
 
-On macOS, install Homebrew first from [brew.sh](https://brew.sh), then run the
-separate macOS installer:
+For a different installation directory, pass it to the installer:
 
 ```bash
-curl -fL \
-  https://raw.githubusercontent.com/medianbc/pptx2png/main/install_obs_local_macos.sh \
-  -o install_obs_local_macos.sh
-chmod +x install_obs_local_macos.sh
-./install_obs_local_macos.sh
+git clone --branch dev --single-branch \
+  https://github.com/medianbc/pptx2png.git "$HOME/my-pptx2png"
+cd "$HOME/my-pptx2png"
+./install_obs_local.sh "$HOME/my-pptx2png"
 ```
 
-The installer installs Git, Python/venv, and LibreOffice Impress, clones the
-project to `~/pptx2png`, creates `.venv`, installs the shared core dependencies,
-and creates a private `config.ini` for the Yandex Disk token. It also creates
-`start_obs_local.sh` for the interactive local OBS mode and
-`prepare_obs_songs.sh` for song preparation. The Linux installer uses apt; the
-macOS installer uses Homebrew and installs LibreOffice as a cask. Both accept a
-different installation directory as the first argument.
+The Linux installer uses `apt-get` to install Git, Python/venv and LibreOffice
+Impress. It creates `.venv`, installs dependencies, creates a private
+`config.ini` for the Yandex Disk token, and generates launchers for presentation
+and song preparation. Existing configuration is preserved. The installer does
+not update source files in an existing checkout.
+
+### macOS installation
+
+#### Requirements
+
+- macOS with Homebrew installed and available in Terminal.
+- Internet access to GitHub and Homebrew/PyPI package repositories.
+- Python 3.10 or later. The installer installs Python through Homebrew; the
+  shared package declares `requires-python >= 3.10`.
+- LibreOffice for PPT/PPTX-to-PDF/PNG conversion. The installer installs the
+  application using the Homebrew cask.
+
+The repository does not specify a minimum macOS version or run dedicated macOS
+CI. The installer has no Intel/Apple Silicon-specific branches, so verify the
+installation and conversion locally on the target machine.
+
+#### Installation steps
+
+1. Install Homebrew using [brew.sh](https://brew.sh) and verify that it is
+   available in Terminal:
+
+   ```bash
+   brew --version
+   ```
+
+2. Clone the current `dev` branch and run the macOS installer:
+
+   ```bash
+   git clone --branch dev --single-branch \
+     https://github.com/medianbc/pptx2png.git "$HOME/pptx2png"
+   cd "$HOME/pptx2png"
+   ./install_obs_local_macos.sh
+   ```
+
+   For a custom directory, pass it explicitly:
+   `./install_obs_local_macos.sh "$HOME/my-pptx2png"`. The installer uses
+   Homebrew to install Git, Python and LibreOffice, creates `.venv`, installs
+   `core` and local application dependencies, and creates
+   `start_obs_local.sh` and `prepare_obs_songs.sh`. It does not update source
+   files in an existing checkout.
+
+3. Check Python and LibreOffice:
+
+   ```bash
+   ./.venv/bin/python --version
+   test -x /Applications/LibreOffice.app/Contents/MacOS/soffice
+   ```
+
+   If LibreOffice is installed elsewhere, ensure `soffice` is available on
+   `PATH`.
+
+4. Configure `obs_local/settings.ini` and `config.ini` as described below.
+   Interactive presentation preparation requires a Yandex Disk OAuth token
+   and `[YandexDisk] base_path`. The installer can prompt for the token and
+   saves the secret file with owner-only permissions.
+
+5. Run the desired workflow:
+
+   ```bash
+   ./start_obs_local.sh
+   ./prepare_obs_songs.sh --debug
+   ```
 
 From the repository root:
 
@@ -48,13 +107,49 @@ Alternatively, after activating `.venv`, use the compatibility launcher
 
 ## Configuration
 
-- `obs_local/settings.ini` contains local-mode options and its own
-  `root_path`. The `[Song preparation]` section configures the meeting document
-  URL, local song ZIP/PPTX folders, and optional Yandex Disk search folders.
-- The shared repository-root `config.ini` supplies the `[YandexDisk] token`
-  used by the bot and OBS local mode. `obs_local/config.ini` is supported as a
-  fallback when the shared file does not contain a token.
-- Relative output paths are resolved from the repository root.
+- `obs_local/settings.ini` contains non-secret options. `[YandexDisk]` defines
+  `base_path` and `source_folder` used to fetch the upcoming Sunday's
+  presentation.
+- `[OBS Local paths]` defines `root_path` and quality (`standard`, `2k`, or
+  `4k`). Relative `root_path` values resolve from the repository root.
+- `[SlideCategories]` contains keywords used to detect slide categories in
+  speaker notes.
+- `[Song preparation]` defines `program_url`, `local_zip_dir`,
+  `local_pptx_dir`, optional Yandex Disk search paths, and
+  `cache_missing_yandex_song_zips`.
+- The Yandex Disk token belongs in the root `config.ini` under `[YandexDisk]`;
+  song preparation also supports `obs_local/config.ini` as a fallback. Do not
+  put tokens in `settings.ini` or commit secret files.
+
+Example secret file (replace the placeholder locally):
+
+```ini
+[YandexDisk]
+token = YOUR_OAUTH_TOKEN
+```
+
+### Current implementation
+
+`python -m obs_local` (or `start_obs_local.sh`) lists presentations for the
+upcoming Sunday from Yandex Disk and asks the operator to select one. It reads
+speaker notes, detects the `sermon`, `opening`, and `prayer` categories, lets
+the operator choose a category and one contiguous slide range, and converts
+the presentation to PNG. Output is written to
+`root_path/YYYY-MM-DD/presentation/run-id/category`. The interactive workflow
+does not currently prompt for missing configuration values or save them.
+
+`python -m obs_local.prepare_songs` separately reads song titles from the DOCX
+tables for the selected Sunday, searches local PNG ZIPs and PPTX files, and
+then searches Yandex Disk ZIP/PPTX files when remote paths and a token are
+configured. PPTX files are rendered to PNG and placed in separate numbered
+folders under `root_path/Трансляция/Песни`; missing songs are marked. Results
+are published from a staging directory, and the previous output is retained as
+a backup.
+
+Yandex API search uses `yandex_zip_png_paths` and `yandex_pptx_paths` together
+with an OAuth token. Configured shared-folder URLs do not replace these paths
+and do not enable search by themselves. `program_url` selects the DOCX program;
+if it is empty, the script errors and asks for a setting or `--program-file`.
 
 ## Test song preparation for OBS
 
@@ -101,8 +196,14 @@ saved as a ZIP in `local_zip_dir` (remote files retain their relative folder
 structure). To scan all configured remote ZIP and PPTX folders after processing
 the current program and cache files that do not yet have a valid local PNG ZIP,
 set `cache_missing_yandex_song_zips = true` in `[Song preparation]`.
-The `yandex_zip_png_url` setting is the share URL corresponding to
-`yandex_zip_png_paths`; the API search uses the configured paths.
+`yandex_zip_png_url` is currently retained as configuration metadata; it does
+not drive API search. Search uses the configured folder paths and OAuth token.
+
+On macOS, song-preparation logs are written to
+`~/Library/Logs/pptx2png/obs_local/` when the settings file contains the
+repository's Linux `/dev/shm` default. On Linux, the default remains
+`/dev/shm/pptx2png_tasks/obs_local/logs/`. A custom directory can be passed
+with `--log-dir PATH`.
 
 ## Logs and troubleshooting
 

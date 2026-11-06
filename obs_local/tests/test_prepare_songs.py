@@ -136,6 +136,32 @@ class SongMatchingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_macos_uses_user_log_directory_instead_of_linux_shm_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            obs_dir = project_dir / "obs_local"
+            obs_dir.mkdir()
+            (obs_dir / "settings.ini").write_text(
+                "[OBS Local paths]\n"
+                "root_path = ./obs_png\n"
+                "[Logging]\n"
+                "log_dir = /dev/shm/pptx2png_tasks/obs_local/logs\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(prepare_songs, "BASE_DIR", obs_dir),
+                patch.object(prepare_songs, "PROJECT_DIR", project_dir),
+                patch.object(prepare_songs.sys, "platform", "darwin"),
+                patch.object(Path, "home", return_value=project_dir),
+            ):
+                config = prepare_songs.load_config()
+
+        self.assertEqual(
+            config["log_dir"],
+            project_dir / "Library" / "Logs" / "pptx2png" / "obs_local",
+        )
+
     def test_png_zip_paths_url_and_cache_flag_are_loaded(self):
         with tempfile.TemporaryDirectory() as directory:
             project_dir = Path(directory)

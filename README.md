@@ -1,5 +1,8 @@
 # pptx2png
 
+> Russian version: [README.RU.md](README.RU.md). Keep both READMEs aligned when
+> the project documentation changes.
+
 The repository is organized as a shared core plus two runtimes:
 
 - `core/` — reusable PPTX conversion, notes parsing, and Yandex Disk code.
@@ -41,3 +44,11 @@ Non-secret options live in `bot/settings.ini` and `obs_local/settings.ini`.
 Create `bot/config.ini` and/or `obs_local/config.ini` for credentials. Both
 applications also accept the legacy root-level `config.ini` during the
 configuration transition. Do not commit credentials.
+
+## Documentation
+
+- [Project architecture](ARCHITECTURE.md)
+- [Telegram bot user guide and interaction flows](BOT_USER_FLOWS.md) (Russian)
+- [Local OBS workflow](obs_local/README.md)
+- [Local OBS workflow in Russian](obs_local/README.RU.md)
+- [Development roadmap](promt.md) (Russian)
