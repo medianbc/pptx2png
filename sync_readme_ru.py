@@ -21,8 +21,23 @@ def collect_headings(path: Path) -> dict[int, int]:
         raise FileNotFoundError(f"Missing file: {path}")
 
     counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    fence_marker: str | None = None
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
+        if fence_marker is not None:
+            marker_length = len(stripped) - len(
+                stripped.lstrip(fence_marker[0])
+            )
+            if marker_length >= len(fence_marker) and not stripped[
+                marker_length:
+            ].strip():
+                fence_marker = None
+            continue
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[0]
+            marker_length = len(stripped) - len(stripped.lstrip(marker))
+            fence_marker = marker * marker_length
+            continue
         if not stripped.startswith("#"):
             continue
         level = len(stripped) - len(stripped.lstrip("#"))
