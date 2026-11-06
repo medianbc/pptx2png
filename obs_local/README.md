@@ -163,7 +163,16 @@ a backup.
 Yandex API search uses `yandex_zip_png_paths` and `yandex_pptx_paths` together
 with an OAuth token. Configured shared-folder URLs do not replace these paths
 and do not enable search by themselves. `program_url` selects the DOCX program;
-if it is empty, the script errors and asks for a setting or `--program-file`.
+if it is empty, the interactive workflow asks for a public Yandex Disk file
+link and saves it to `obs_local/settings.ini`. When a song from the program
+cannot be found, the workflow reports the status of every song and lets the
+operator enter an alternative title to retry the search. Successful
+alternatives are stored locally in the ignored
+`obs_local/song_title_aliases.json` file and reused on later runs. Enter an
+empty response to skip an alternative. If a saved alias no longer finds a
+match, the original program title is tried as a fallback. A prompted program
+link is saved only after Yandex Disk returns a valid DOCX. Non-interactive runs
+can still use `--program-file` or `--program-url`.
 
 ## Test song preparation for OBS
 

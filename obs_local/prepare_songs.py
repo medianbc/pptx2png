@@ -7,6 +7,7 @@ import asyncio
 import configparser
 import json
 import logging
+import os
 import re
 import shutil
 import sys
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree
 
@@ -26,9 +27,12 @@ import aiohttp
 from pptx2png_core.converter_engine import convert_all_pngs
 from pptx2png_core.yandex_disk import YandexDiskClient, get_nearest_sunday
 
+from .config_utils import update_ini_file
+
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
+SONG_TITLE_ALIASES_PATH = BASE_DIR / "song_title_aliases.json"
 PUBLIC_DOWNLOAD_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
 DOCX_NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -115,6 +119,7 @@ def load_config() -> dict[str, Any]:
 
     return {
         "program_url": song_settings.get("program_url", "").strip(),
+        "song_title_aliases_path": SONG_TITLE_ALIASES_PATH,
         "zip_dir": local_path("local_zip_dir", "./song_assets/zip"),
         "pptx_dir": local_path("local_pptx_dir", "./song_assets/pptx"),
         "yandex_zip_png_paths": _parse_remote_paths(
@@ -212,6 +217,91 @@ def _table_rows(table: ElementTree.Element) -> list[list[str]]:
 def _normalize(value: str) -> str:
     normalized = value.casefold().replace("ё", "е")
     return re.sub(r"[\W_]+", " ", normalized, flags=re.UNICODE).strip()
+
+
+def load_song_title_aliases(path: Path | None = None) -> dict[str, str]:
+    path = Path(path or SONG_TITLE_ALIASES_PATH)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "Не удалось прочитать альтернативные названия песен: "
+            f"{path}"
+        ) from error
+    if not isinstance(payload, dict) or any(
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or not key.strip()
+        or not value.strip()
+        for key, value in payload.items()
+    ):
+        raise RuntimeError(
+            "Некорректный формат файла альтернативных названий: "
+            f"{path}"
+        )
+    return payload
+
+
+def save_song_title_aliases(
+    aliases: dict[str, str], path: Path | None = None
+) -> None:
+    path = Path(path or SONG_TITLE_ALIASES_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(aliases, temporary, ensure_ascii=False, indent=2)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def ensure_program_url(
+    config: dict[str, Any],
+    input_fn: Callable[[str], str] | None = None,
+) -> str:
+    url = config.get("program_url", "").strip()
+    if url:
+        return url
+
+    input_fn = input_fn or input
+    print("Ссылка на DOCX-программу собрания ещё не настроена.")
+    print(
+        "Введите публичную ссылку на файл Яндекс.Диска "
+        "(например, https://disk.yandex.ru/d/<public-key>)."
+    )
+    while True:
+        try:
+            url = input_fn("Ссылка на DOCX-программу: ").strip()
+        except EOFError as error:
+            raise RuntimeError(
+                "Ссылка на программу не введена. Запустите подготовку "
+                "в интерактивном терминале или задайте program_url "
+                "в settings.ini."
+            ) from error
+        if not url:
+            print("Ссылка не может быть пустой.")
+            continue
+        try:
+            _normalize_program_public_key(url)
+        except RuntimeError as error:
+            print(f"Некорректная ссылка: {error}")
+            continue
+
+        return url
 
 
 def _song_match_quality(filename_stem: str, title: str) -> int:
@@ -1024,9 +1114,15 @@ async def run(
     program_file: Path | None = None,
     program_url: str | None = None,
     config: dict[str, Any] | None = None,
+    interactive: bool = False,
+    input_fn: Callable[[str], str] | None = None,
 ) -> list[SongResult]:
     config = config or load_config()
     url = (program_url or config["program_url"]).strip()
+    prompted_program_url = False
+    if program_file is None and not url and interactive:
+        url = ensure_program_url(config, input_fn)
+        prompted_program_url = True
     LOGGER.info("Запуск подготовки песен OBS на %s", target_date.isoformat())
     LOGGER.debug(
         "Конфигурация: local_zip=%s, local_pptx=%s, output=%s, "
@@ -1039,7 +1135,8 @@ async def run(
     )
     if program_file is None and not url:
         raise RuntimeError(
-            "Укажите --program-file или задайте [Song preparation] program_url"
+            "Укажите --program-file или задайте [Song preparation] program_url. "
+            "Для интерактивного запроса запустите программу из терминала."
         )
     if program_file is not None and not program_file.is_file():
         raise RuntimeError(f"Файл программы не найден: {program_file}")
@@ -1059,7 +1156,25 @@ async def run(
             if program_file is None:
                 async with aiohttp.ClientSession() as session:
                     program_file = work_dir / "program.docx"
-                    await download_program_docx(session, url, program_file)
+                    while True:
+                        try:
+                            await download_program_docx(
+                                session, url, program_file
+                            )
+                        except RuntimeError as error:
+                            if not prompted_program_url:
+                                raise
+                            print(f"Не удалось проверить DOCX: {error}")
+                            url = ensure_program_url(config, input_fn)
+                            continue
+                        break
+                if prompted_program_url:
+                    update_ini_file(
+                        BASE_DIR / "settings.ini",
+                        {"Song preparation": {"program_url": url}},
+                    )
+                    config["program_url"] = url
+                    print("Ссылка сохранена в obs_local/settings.ini.")
 
             LOGGER.info("Разбор программы: %s", program_file.name)
             songs = extract_song_titles(program_file, target_date)
@@ -1072,6 +1187,10 @@ async def run(
             for index, title in enumerate(songs, 1):
                 print(f"  {index:02d}. {title}")
 
+            aliases_path = Path(
+                config.get("song_title_aliases_path", SONG_TITLE_ALIASES_PATH)
+            )
+            aliases = load_song_title_aliases(aliases_path)
             client = None
             if (
                 config.get("yandex_zip_png_paths")
@@ -1086,8 +1205,20 @@ async def run(
                 async with aiohttp.ClientSession() as session:
                     client = YandexDiskClient(config["yandex_token"], session)
                     results = await _process_songs(
-                        songs, staging, config, client, work_dir
+                        songs, staging, config, client, work_dir, aliases
                     )
+                    if interactive:
+                        results = await _retry_missing_songs_with_aliases(
+                            results,
+                            songs,
+                            staging,
+                            config,
+                            client,
+                            work_dir,
+                            aliases,
+                            aliases_path,
+                            input_fn,
+                        )
                     if config.get("cache_missing_yandex_song_zips", False):
                         cached, failed = await _cache_remote_song_zips(
                             client, config, work_dir
@@ -1103,8 +1234,20 @@ async def run(
                         )
             else:
                 results = await _process_songs(
-                    songs, staging, config, None, work_dir
+                    songs, staging, config, None, work_dir, aliases
                 )
+                if interactive:
+                    results = await _retry_missing_songs_with_aliases(
+                        results,
+                        songs,
+                        staging,
+                        config,
+                        None,
+                        work_dir,
+                        aliases,
+                        aliases_path,
+                        input_fn,
+                    )
 
         backup = _publish_output(staging, target)
 
@@ -1142,13 +1285,25 @@ async def _process_songs(
     config: dict[str, Any],
     client: YandexDiskClient | None,
     temp_root: Path,
+    aliases: dict[str, str] | None = None,
 ) -> list[SongResult]:
     results = []
+    aliases = aliases or {}
     for index, title in enumerate(songs, 1):
         song_dir = staging / _song_folder_name(index, title)
+        search_title = aliases.get(_normalize(title), title)
         result = await _process_song(
-            title, song_dir, config, client, temp_root
+            search_title, song_dir, config, client, temp_root
         )
+        if (
+            result.status == "not_found"
+            and _normalize(search_title) != _normalize(title)
+        ):
+            result.folder.rmdir()
+            result = await _process_song(
+                title, song_dir, config, client, temp_root
+            )
+        result.title = title
         if result.status == "not_found":
             missing_dir = staging / _song_folder_name(
                 index, f"{title} (не найдено)"
@@ -1157,6 +1312,80 @@ async def _process_songs(
             result.folder = missing_dir
         results.append(result)
     return results
+
+
+async def _retry_missing_songs_with_aliases(
+    results: list[SongResult],
+    songs: list[str],
+    staging: Path,
+    config: dict[str, Any],
+    client: YandexDiskClient | None,
+    temp_root: Path,
+    aliases: dict[str, str],
+    aliases_path: Path,
+    input_fn: Callable[[str], str] | None,
+) -> list[SongResult]:
+    input_fn = input_fn or input
+    print("\nРезультаты поиска песен:")
+    for index, result in enumerate(results, 1):
+        print(f"  {index:02d}. {result.title} — {_song_result_label(result)}")
+
+    for index, result in enumerate(results, 1):
+        if result.status != "not_found":
+            continue
+        try:
+            alternative = input_fn(
+                f"Песня «{result.title}» не найдена. "
+                "Введите альтернативное название "
+                "(Enter — пропустить): "
+            ).strip()
+        except EOFError:
+            print("Ввод завершён; остальные ненайденные песни пропускаются.")
+            break
+        if not alternative:
+            continue
+
+        result.folder.rmdir()
+        song_dir = staging / _song_folder_name(index, songs[index - 1])
+        retried = await _process_song(
+            alternative, song_dir, config, client, temp_root
+        )
+        retried.title = songs[index - 1]
+        if retried.status == "not_found":
+            missing_dir = staging / _song_folder_name(
+                index, f"{songs[index - 1]} (не найдено)"
+            )
+            song_dir.rename(missing_dir)
+            retried.folder = missing_dir
+            print(f"  Повторный поиск: «{alternative}» — не найдено.")
+        elif retried.status == "ready":
+            aliases[_normalize(songs[index - 1])] = alternative
+            save_song_title_aliases(aliases, aliases_path)
+            print(
+                f"  Найдено по названию «{alternative}»; "
+                "альтернатива сохранена для следующих запусков."
+            )
+        else:
+            print(
+                f"  Повторный поиск «{alternative}»: "
+                f"{retried.error or retried.status}."
+            )
+        results[index - 1] = retried
+
+    print("\nИтог по программе:")
+    for index, result in enumerate(results, 1):
+        print(f"  {index:02d}. {result.title} — {_song_result_label(result)}")
+    return results
+
+
+def _song_result_label(result: SongResult) -> str:
+    if result.status == "ready":
+        if result.source:
+            return f"найдено ({Path(result.source).name})"
+        return "найдено"
+    if result.status == "not_found":
+        return "не найдено"
+    return result.status
 
 
 def main() -> None:
@@ -1209,6 +1438,7 @@ def main() -> None:
                 args.program_file,
                 args.program_url,
                 config=config,
+                interactive=sys.stdin.isatty(),
             )
         )
     except Exception as error:
