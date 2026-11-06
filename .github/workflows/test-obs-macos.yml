@@ -1,0 +1,80 @@
+name: OBS macOS installation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "core/**"
+      - "obs_local/**"
+      - "install_obs_local_macos.sh"
+      - ".github/workflows/test-obs-macos.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-smoke-test:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install the local OBS package from a source archive without Git
+        env:
+          CI: "true"
+          PPTX2PNG_ARCHIVE_URL: https://codeload.github.com/${{ github.repository }}/tar.gz/${{ github.sha }}
+          PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
+        run: ./install_obs_local_macos.sh "$PPTX2PNG_INSTALL_DIR"
+
+      - name: Verify launchers and LibreOffice
+        env:
+          PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
+        run: |
+          cd "$PPTX2PNG_INSTALL_DIR"
+          test -x start_obs_local.sh
+          test -x prepare_obs_songs.sh
+          ./.venv/bin/python --version
+          /Applications/LibreOffice.app/Contents/MacOS/soffice --headless --version
+          printf '0\n' | ./start_obs_local.sh
+          ./prepare_obs_songs.sh --help
+
+      - name: Run isolated local tests
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pptx2png-pycache
+          PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
+        run: |
+          cd "$PPTX2PNG_INSTALL_DIR"
+          ./.venv/bin/python -m unittest discover -s obs_local/tests -v
+
+      - name: Smoke-test PPTX to PNG conversion
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
+        run: |
+          cd "$PPTX2PNG_INSTALL_DIR"
+          ./.venv/bin/python - <<'PY'
+          import asyncio
+          import tempfile
+          from pathlib import Path
+
+          from pptx import Presentation
+          from pptx2png_core.converter_engine import convert_all_pngs
+
+          with tempfile.TemporaryDirectory(prefix="pptx2png-macos-") as directory:
+              root = Path(directory)
+              presentation = Presentation()
+              presentation.slides.add_slide(presentation.slide_layouts[6])
+              source = root / "smoke-test.pptx"
+              presentation.save(source)
+              output = root / "png"
+              output.mkdir()
+
+              png_paths, _ = asyncio.run(
+                  convert_all_pngs(source, output, "standard")
+              )
+              if len(png_paths) != 1 or not png_paths[0].is_file():
+                  raise SystemExit("Expected one rendered PNG slide")
+          PY
