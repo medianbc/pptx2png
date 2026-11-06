@@ -19,7 +19,8 @@ class CollectHeadingsTests(unittest.TestCase):
             "~~~\n"
         )
 
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        temp_dir = "/dev/shm" if Path("/dev/shm").is_dir() else None
+        with tempfile.TemporaryDirectory(dir=temp_dir) as directory:
             readme = Path(directory) / "README.md"
             readme.write_text(content, encoding="utf-8")
 

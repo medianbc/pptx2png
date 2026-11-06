@@ -12,6 +12,8 @@ from bot.folder_setup import (
     should_check_folder_tree,
 )
 
+TEMP_DIR = "/dev/shm" if Path("/dev/shm").is_dir() else None
+
 
 class FakeYandexDiskClient:
     def __init__(self, folders=None):
@@ -65,7 +67,7 @@ class FolderTreeCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{sunday_path}/Трансляция/pptx2png", client.folders)
 
     async def test_supports_disk_root_as_base_path(self):
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as directory:
             template = Path(directory) / "template.yaml"
             template.write_text("structure:\n  Служение: {}\n", encoding="utf-8")
             client = FakeYandexDiskClient({"/"})
@@ -86,7 +88,7 @@ class FolderTreeCreationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reuses_existing_date_folder_variant(self):
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as directory:
             template = Path(directory) / "template.yaml"
             template.write_text("structure:\n  Служение: {}\n", encoding="utf-8")
             month_path = "/presentations/11 ноябрь 2026"
@@ -107,7 +109,7 @@ class FolderTreeCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{existing_date}/Служение", client.folders)
 
     async def test_does_not_create_base_path_when_it_is_missing(self):
-        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as directory:
             template = Path(directory) / "template.yaml"
             template.write_text("structure:\n  Служение: {}\n", encoding="utf-8")
             client = FakeYandexDiskClient()
