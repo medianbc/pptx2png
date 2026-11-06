@@ -28,7 +28,9 @@ async def ensure_sunday_folder_tree(
     if structure is None or not structure:
         raise RuntimeError(f"Некорректный шаблон дерева папок: {template_path}")
 
-    base_path = strip_disk_prefix(base_path).rstrip("/")
+    base_path = strip_disk_prefix(base_path).strip()
+    if base_path != "/":
+        base_path = base_path.rstrip("/")
     if not base_path or not await client.folder_exists(base_path):
         raise RuntimeError(
             f"Базовая папка Яндекс.Диска не найдена или недоступна: {base_path!r}"
@@ -43,7 +45,7 @@ async def ensure_sunday_folder_tree(
     month_path = (
         strip_disk_prefix(month["path"])
         if month
-        else f"{base_path}/{month_name}"
+        else f"{base_path.rstrip('/')}/{month_name}"
     )
     if not month and not await client.ensure_folder(month_path):
         raise RuntimeError(f"Не удалось создать папку месяца: {month_path}")
