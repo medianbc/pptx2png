@@ -8,6 +8,7 @@ import getpass
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -160,28 +161,73 @@ def load_config(
 
 
 async def download_presentation(
-    config: dict[str, Any], sunday: datetime, temp_dir: Path
+    config: dict[str, Any],
+    sunday: datetime,
+    temp_dir: Path,
+    input_fn: Callable[[str], str] | None = None,
 ) -> Path:
+    if input_fn is None:
+        input_fn = input
+
     async with aiohttp.ClientSession() as http_session:
         client = YandexDiskClient(config["token"], http_session)
         accessible, error = await client.check_access()
         if not accessible:
             raise RuntimeError(f"Нет доступа к Яндекс.Диску: {error}")
 
-        paths = await resolve_sunday_paths(
-            client,
-            config["base_path"],
-            sunday,
-            source_folder=config["source_folder"],
-        )
-        if not paths:
-            raise RuntimeError(f"Не найдена папка служения за {sunday:%d.%m.%Y}")
-
-        files = await find_pptx_in_source(client, paths["source"], sunday)
-        if not files:
-            raise RuntimeError(
-                f"В {paths['source']} не найдены PPT/PPTX за {sunday:%d.%m.%Y}"
+        while True:
+            paths = await resolve_sunday_paths(
+                client,
+                config["base_path"],
+                sunday,
+                source_folder=config["source_folder"],
             )
+            files = (
+                await find_pptx_in_source(client, paths["source"], sunday)
+                if paths
+                else []
+            )
+            if files:
+                break
+
+            if paths:
+                problem = (
+                    f"В папке служения не найдены PPT/PPTX "
+                    f"за {sunday:%d.%m.%Y}."
+                )
+            else:
+                problem = f"Папка служения за {sunday:%d.%m.%Y} не найдена."
+            print(f"\n{problem}")
+            print("Можно продолжить подготовку одним из способов:")
+            print("  Enter       — повторить поиск на Яндекс.Диске")
+            print("  путь к PPTX — открыть локальный файл (.pptx или .ppt)")
+            print("  esc / exit  — введите для возврата в меню")
+            try:
+                answer = input_fn("Ваш выбор: ").strip()
+            except EOFError as error:
+                raise OperationCancelled from error
+
+            if answer.lower() in {
+                "\x1b",
+                "esc",
+                "exit",
+                "quit",
+                "q",
+                "выход",
+                "отмена",
+            }:
+                raise OperationCancelled
+            if not answer:
+                continue
+
+            local_path = Path(answer.strip("\"'")).expanduser()
+            if local_path.suffix.lower() not in {".ppt", ".pptx"}:
+                print("Укажите путь к файлу .ppt или .pptx.")
+                continue
+            if not local_path.is_file():
+                print(f"Файл не найден: {local_path}")
+                continue
+            return local_path
 
         print(f"\nПрезентации на {sunday:%d.%m.%Y}:")
         for index, item in enumerate(files, start=1):
@@ -189,7 +235,7 @@ async def download_presentation(
 
         while True:
             try:
-                answer = input("Номер презентации [0 — отмена]: ").strip()
+                answer = input_fn("Номер презентации [0 — отмена]: ").strip()
                 if answer.lower() in {"0", "q", "cancel", "отмена"}:
                     raise OperationCancelled
                 choice = int(answer) - 1

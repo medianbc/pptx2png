@@ -152,6 +152,11 @@ prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to `settings.ini` and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
 
+If the upcoming Sunday's service folder or presentation is missing on Yandex
+Disk, the workflow reports it and offers to retry the search (press Enter), use
+a local `.ppt`/`.pptx` file (enter its path), or cancel (enter `esc` or `exit`).
+Cancelling returns to the main menu, so song preparation can still be selected.
+
 The song-preparation menu option reads song titles from the DOCX tables for the
 selected Sunday, searches local PNG ZIPs and PPTX files, and
 then searches Yandex Disk ZIP/PPTX files when remote paths and a token are
