@@ -72,5 +72,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Интерактивное меню подготовки материалов для OBS."
     )
-    parser.parse_args()
+    parser.add_argument(
+        "--date",
+        help="Запустить подготовку презентации на дату YYYY-MM-DD без меню.",
+    )
+    args = parser.parse_args()
+    if args.date is not None:
+        app.main()
+        return
     run_menu()
