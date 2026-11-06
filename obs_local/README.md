@@ -10,10 +10,10 @@ bot through `core`.
 
 ## Install and run
 
-On a new machine, clone the current local-workflow branch and run its installer:
+On a new machine, clone the stable `main` branch and run its installer:
 
 ```bash
-git clone --branch dev --single-branch \
+git clone --branch main --single-branch \
   https://github.com/medianbc/pptx2png.git "$HOME/pptx2png"
 cd "$HOME/pptx2png"
 ./install_obs_local.sh
@@ -22,7 +22,7 @@ cd "$HOME/pptx2png"
 For a different installation directory, pass it to the installer:
 
 ```bash
-git clone --branch dev --single-branch \
+git clone --branch main --single-branch \
   https://github.com/medianbc/pptx2png.git "$HOME/my-pptx2png"
 cd "$HOME/my-pptx2png"
 ./install_obs_local.sh "$HOME/my-pptx2png"
@@ -45,9 +45,11 @@ not update source files in an existing checkout.
 - LibreOffice for PPT/PPTX-to-PDF/PNG conversion. The installer installs the
   application using the Homebrew cask.
 
-The repository does not specify a minimum macOS version or run dedicated macOS
-CI. The installer has no Intel/Apple Silicon-specific branches, so verify the
-installation and conversion locally on the target machine.
+The repository does not specify a minimum macOS version. The
+`OBS macOS installation` GitHub Actions workflow installs the package on a
+clean macOS runner and smoke-tests conversion. The installer has no
+Intel/Apple Silicon-specific branches; verify the installation and conversion
+on the target machine as well.
 
 #### Installation steps
 
@@ -58,21 +60,26 @@ installation and conversion locally on the target machine.
    brew --version
    ```
 
-2. Clone the current `dev` branch and run the macOS installer:
+2. Download and run the installer. Git is not required:
 
    ```bash
-   git clone --branch dev --single-branch \
-     https://github.com/medianbc/pptx2png.git "$HOME/pptx2png"
+   curl -fL \
+     https://raw.githubusercontent.com/medianbc/pptx2png/main/install_obs_local_macos.sh \
+     -o "$HOME/install_obs_local_macos.sh"
+   less "$HOME/install_obs_local_macos.sh"
+   bash "$HOME/install_obs_local_macos.sh" "$HOME/pptx2png"
    cd "$HOME/pptx2png"
-   ./install_obs_local_macos.sh
    ```
 
-   For a custom directory, pass it explicitly:
-   `./install_obs_local_macos.sh "$HOME/my-pptx2png"`. The installer uses
-   Homebrew to install Git, Python and LibreOffice, creates `.venv`, installs
-   `core` and local application dependencies, and creates
-   `start_obs_local.sh` and `prepare_obs_songs.sh`. It does not update source
-   files in an existing checkout.
+   The command downloads the `main` source archive and extracts it into
+   `$HOME/pptx2png`. Replace that path to choose a different installation
+   directory. The installer uses Homebrew to install Python and LibreOffice,
+   creates `.venv`, installs `core` and local application dependencies, and
+   creates `start_obs_local.sh` and `prepare_obs_songs.sh`. Git is not required
+   for a fresh installation. If you run the installer
+   from an existing Git checkout, Git is only needed to validate its origin.
+   Rerunning the installer in an archive installation directory reuses the
+   extracted source and does not automatically update it.
 
 3. Check Python and LibreOffice:
 
@@ -131,12 +138,16 @@ token = YOUR_OAUTH_TOKEN
 ### Current implementation
 
 `python -m obs_local` (or `start_obs_local.sh`) lists presentations for the
-upcoming Sunday from Yandex Disk and asks the operator to select one. It reads
-speaker notes, detects the `sermon`, `opening`, and `prayer` categories, lets
-the operator choose a category and one contiguous slide range, and converts
-the presentation to PNG. Output is written to
+upcoming Sunday from Yandex Disk and asks the operator to select one (`0`, `q`,
+or `cancel` cancels the selection). It reads speaker notes and lets the
+operator prepare all slides, select a detected category, or enter one or more
+custom slide ranges (for example `1-4, 7, 9-11`). The chosen slides and output
+category are shown for confirmation before rendering; the operator can return
+to selection or cancel. Output is written to
 `root_path/YYYY-MM-DD/presentation/run-id/category`. The interactive workflow
-does not currently prompt for missing configuration values or save them.
+prompts for missing paths, quality and Yandex Disk token on first run, saves
+ordinary settings to `settings.ini` and the token to a private `config.ini`.
+The token is not stored in `settings.ini`.
 
 `python -m obs_local.prepare_songs` separately reads song titles from the DOCX
 tables for the selected Sunday, searches local PNG ZIPs and PPTX files, and
