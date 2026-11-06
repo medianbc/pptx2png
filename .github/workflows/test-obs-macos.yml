@@ -37,7 +37,7 @@ jobs:
           test -x prepare_obs_songs.sh
           ./.venv/bin/python --version
           /Applications/LibreOffice.app/Contents/MacOS/soffice --headless --version
-          ./start_obs_local.sh --help
+          printf '0\n' | ./start_obs_local.sh
           ./prepare_obs_songs.sh --help
 
       - name: Run isolated local tests

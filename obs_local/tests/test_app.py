@@ -1,3 +1,4 @@
+import configparser
 import os
 import tempfile
 import unittest
@@ -64,7 +65,8 @@ class InteractiveConfigTests(unittest.TestCase):
             settings_path = obs_dir / "settings.ini"
             settings_path.write_text(
                 "# Keep user comments.\n"
-                "[YandexDisk]\n"
+                "[YandexDisk] # Keep section comment.\n"
+                "base_path: \n"
                 "source_folder = Meeting\n",
                 encoding="utf-8",
             )
@@ -83,7 +85,9 @@ class InteractiveConfigTests(unittest.TestCase):
             saved_settings = settings_path.read_text(encoding="utf-8")
             secret_path = obs_dir / "config.ini"
             self.assertIn("# Keep user comments.", saved_settings)
+            self.assertIn("# Keep section comment.", saved_settings)
             self.assertIn("base_path = /disk/presentations", saved_settings)
+            self.assertEqual(saved_settings.count("[YandexDisk]"), 1)
             self.assertIn("root_path = ./obs_png", saved_settings)
             self.assertIn("quality = 2k", saved_settings)
             self.assertNotIn("quality = invalid", saved_settings)
@@ -93,6 +97,24 @@ class InteractiveConfigTests(unittest.TestCase):
             self.assertIn("token = test-token", secret_path.read_text(encoding="utf-8"))
             if os.name == "posix":
                 self.assertEqual(secret_path.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_updated_settings_are_not_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.ini"
+            original = (
+                "[YandexDisk]\n"
+                "base_path = /first\n"
+                "base_path: /second\n"
+            )
+            settings_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaises(configparser.DuplicateOptionError):
+                app._update_ini_file(
+                    settings_path,
+                    {"YandexDisk": {"base_path": "/updated"}},
+                )
+
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
 
     def test_non_interactive_config_does_not_prompt(self):
         with tempfile.TemporaryDirectory() as directory:

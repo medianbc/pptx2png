@@ -100,17 +100,19 @@ on the target machine as well.
 
    ```bash
    ./start_obs_local.sh
-   ./prepare_obs_songs.sh --debug
    ```
 
-From the repository root:
+The menu offers presentation preparation (`1`), song preparation (`2`), and
+exit (`0`). To run song preparation directly with debug logging (for example,
+when diagnosing an issue), use:
 
 ```bash
-./start_obs_local.sh
+./prepare_obs_songs.sh --debug
 ```
 
-Alternatively, after activating `.venv`, use the compatibility launcher
-`python run_obs_local.py` or `python -m obs_local.run_obs_local`.
+From the repository root, run the menu with `python -m obs_local`. Direct
+workflow entry points remain available through `python -m
+obs_local.run_obs_local` and `python -m obs_local.prepare_songs`.
 
 ## Configuration
 
@@ -137,9 +139,10 @@ token = YOUR_OAUTH_TOKEN
 
 ### Current implementation
 
-`python -m obs_local` (or `start_obs_local.sh`) lists presentations for the
-upcoming Sunday from Yandex Disk and asks the operator to select one (`0`, `q`,
-or `cancel` cancels the selection). It reads speaker notes and lets the
+`python -m obs_local` (or `start_obs_local.sh`) opens a menu to choose
+presentation or song preparation. The presentation workflow lists
+presentations for the upcoming Sunday from Yandex Disk and asks the operator to
+select one (`0`, `q`, or `cancel` cancels the selection). It reads speaker notes and lets the
 operator prepare all slides, select a detected category, or enter one or more
 custom slide ranges (for example `1-4, 7, 9-11`). The chosen slides and output
 category are shown for confirmation before rendering; the operator can return
@@ -149,8 +152,8 @@ prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to `settings.ini` and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
 
-`python -m obs_local.prepare_songs` separately reads song titles from the DOCX
-tables for the selected Sunday, searches local PNG ZIPs and PPTX files, and
+The song-preparation menu option reads song titles from the DOCX tables for the
+selected Sunday, searches local PNG ZIPs and PPTX files, and
 then searches Yandex Disk ZIP/PPTX files when remote paths and a token are
 configured. PPTX files are rendered to PNG and placed in separate numbered
 folders under `root_path/Трансляция/Песни`; missing songs are marked. Results

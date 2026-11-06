@@ -58,16 +58,16 @@ def _update_ini_file(
                 written[section].add(key.lower())
 
     for line in lines:
-        section_match = re.fullmatch(r"\s*\[([^\]]+)\]\s*", line)
+        section_match = configparser.ConfigParser.SECTCRE.match(line)
         if section_match:
             if section_name in updates:
                 append_missing(section_name)
-            section_name = section_match.group(1)
+            section_name = section_match.group("header").strip()
             output.append(line)
             continue
 
         if section_name in updates:
-            option_match = re.match(r"^(\s*)([^#;\s][^=]*?)\s*=", line)
+            option_match = re.match(r"^(\s*)([^#;\s][^=:]*?)\s*[=:]", line)
             if option_match:
                 key = option_match.group(2).strip()
                 replacement = next(
@@ -98,6 +98,9 @@ def _update_ini_file(
         file_mode = stat.S_IMODE(path.stat().st_mode)
     temporary_path = None
     try:
+        updated_text = newline.join(output) + newline
+        validation = configparser.ConfigParser(interpolation=None)
+        validation.read_string(updated_text, source=str(path))
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -107,7 +110,7 @@ def _update_ini_file(
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-            temporary.write(newline.join(output) + newline)
+            temporary.write(updated_text)
         if file_mode is not None:
             os.chmod(temporary_path, file_mode)
         os.replace(temporary_path, path)
