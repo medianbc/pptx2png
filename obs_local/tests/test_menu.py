@@ -256,16 +256,52 @@ class MainMenuTests(unittest.TestCase):
                 menu.get_settings_path(root).read_text(encoding="utf-8"),
             )
 
-    def test_missing_settings_returns_without_repeated_prompts(self):
-        with tempfile.TemporaryDirectory() as directory:
+    def test_unavailable_settings_keep_updates_reachable(self):
+        for failure in ("missing", "malformed", "encoding", "unreadable", "migration"):
+            for installed in (False, True):
+                with (
+                    self.subTest(failure=failure, installed=installed),
+                    tempfile.TemporaryDirectory() as directory,
+                    contextlib.ExitStack() as stack,
+                ):
+                    path = Path(directory) / "settings.ini"
+                    if failure == "malformed":
+                        path.write_text("[OBS Local paths]\nquality = standard\n[broken\n", encoding="utf-8")
+                    elif failure == "encoding":
+                        path.write_bytes(b"\xff")
+                    elif failure == "unreadable":
+                        stack.enter_context(patch.object(Path, "open", side_effect=PermissionError("denied")))
+                    stack.enter_context(patch.object(
+                        menu, "get_settings_path", return_value=path,
+                        side_effect=PermissionError("migration denied") if failure == "migration" else None,
+                    ))
+                    check = stack.enter_context(patch.object(menu, "_check_updates", return_value=installed))
+                    save = stack.enter_context(patch.object(menu, "update_ini_file"))
+                    output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    input_fn = Mock(side_effect=["2"] if installed else ["2", "0"])
+
+                    self.assertEqual(menu._settings_menu(input_fn), installed)
+
+                    check.assert_called_once_with(input_fn)
+                    save.assert_not_called()
+                    self.assertEqual(input_fn.call_count, 1 if installed else 2)
+                    self.assertIn("Не удалось прочитать настройки", output.getvalue())
+                    self.assertIn("2. Проверить обновления", output.getvalue())
+                    self.assertNotIn("quality = standard", output.getvalue())
+
+    def test_missing_settings_allow_back_invalid_choice_and_eof(self):
+        for answers in (["0"], ["invalid", "0"], [EOFError]):
             with (
+                self.subTest(answers=answers),
+                tempfile.TemporaryDirectory() as directory,
                 patch.object(menu.app, "BASE_DIR", Path(directory)),
-                patch("builtins.print") as output,
+                patch.object(menu, "_check_updates") as check,
+                contextlib.redirect_stdout(io.StringIO()),
             ):
-                input_fn = Mock(side_effect=AssertionError("unexpected prompt"))
-                menu._settings_menu(input_fn)
-            input_fn.assert_not_called()
-            self.assertIn("Не найден файл настроек", output.call_args.args[0])
+                input_fn = Mock(side_effect=answers)
+                self.assertFalse(menu._settings_menu(input_fn))
+                self.assertEqual(input_fn.call_count, len(answers))
+                check.assert_not_called()
 
     def test_token_is_hidden_saved_privately_and_updates_local_override(self):
         with tempfile.TemporaryDirectory() as directory:

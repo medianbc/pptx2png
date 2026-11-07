@@ -123,6 +123,8 @@ parameters from the current OS settings file and saves edits while preserving co
 A separate numbered action accepts a hidden Yandex token and saves it in
 private `config.ini` files. Another numbered action in Settings checks updates;
 its number follows the token action. Empty input keeps the current parameter value.
+If settings are missing, unreadable, or malformed, the menu reports the error
+and still offers token entry (`1`), update checking (`2`), and back (`0`).
 Update checking contacts GitHub only
 after you select it. If a newer revision exists, the menu asks before changing
 files. Git checkouts are updated with a fast-forward only; uncommitted changes
