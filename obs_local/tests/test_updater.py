@@ -60,6 +60,21 @@ class UpdateCheckTests(unittest.TestCase):
 
 
 class ArchiveUpdateTests(unittest.TestCase):
+    def test_manifest_cannot_claim_preserved_secret_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            secret_path = project_dir / "config.ini"
+            secret_path.write_text("token = keep\n", encoding="utf-8")
+            (project_dir / updater.MANIFEST_FILE).write_text(
+                json.dumps(["config.ini"]), encoding="utf-8"
+            )
+
+            with patch.object(updater, "PROJECT_DIR", project_dir):
+                with self.assertRaises(updater.UpdateError):
+                    updater._read_installed_manifest()
+
+            self.assertEqual(secret_path.read_text(encoding="utf-8"), "token = keep\n")
+
     def test_archive_extraction_accepts_github_root_directory(self):
         archive_buffer = io.BytesIO()
         with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
