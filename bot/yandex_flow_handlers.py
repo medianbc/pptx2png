@@ -8,7 +8,9 @@
 import asyncio
 import html as html_module
 import logging
+import re
 import secrets
+import shutil
 import time
 from pathlib import Path
 
@@ -207,17 +209,55 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
         logging.info(f"[YD] Найдено pptx: {len(pptx_files)}")
 
         if not pptx_files:
-            src_esc = html_module.escape(yandex_state.config.source_folder)
+            async with yd_session_lock:
+                current = sessions.get(session_key)
+                race_detected = (
+                    current is None
+                    or not current.get("_draft")
+                    or current.get("_draft_id") != draft_id
+                )
+                if not race_detected:
+                    sessions[session_key] = {
+                        "user_id": message.from_user.id,
+                        "chat_id": message.chat.id,
+                        "sunday": sunday,
+                        "sunday_str": sunday_str,
+                        "paths": paths,
+                        "files": [],
+                        "nonce": nonce,
+                        "created_at": time.time(),
+                        "task_ids": [],
+                        "cancelled": False,
+                        "processing": False,
+                        "awaiting_upload": True,
+                    }
+
+            if race_detected:
+                await status_msg.edit_text(
+                    "⚠️ <b>Другая команда /sunday уже активна.</b>\n\n"
+                    "Дождитесь её завершения или отмените /cancel_yd.",
+                    parse_mode="HTML",
+                )
+                return
+
+            kb = InlineKeyboardBuilder()
+            kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"yd_cancel:{message.from_user.id}:{nonce}",
+            ))
             await status_msg.edit_text(
                 f"📅 Ближайшее воскресенье: "
                 f"<b>{html_module.escape(sunday_str)}</b>\n"
                 f"📍 Папка: "
                 f"<code>{html_module.escape(paths['source'])}</code>\n\n"
                 f"❌ <b>pptx-файлы не найдены.</b>\n\n"
-                f"Положите pptx с датой <code>{sunday:%d.%m.%y}</code> "
-                f"в папку <code>{src_esc}</code> и попробуйте снова.",
+                f"Отправьте сюда файл <b>.ppt</b> или <b>.pptx</b>, "
+                f"и я обработаю его так же, как презентацию с Яндекс.Диска.",
                 parse_mode="HTML",
+                reply_markup=kb.as_markup(),
             )
+            session_created = True
+            await yd_release(message.from_user.id, message.chat.id, nonce)
             return
 
         MAX_LEN = 3500
@@ -358,6 +398,10 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                 sessions.pop(session_key, None)
 
         if nonce is not None and not session_created:
+            async with yd_session_lock:
+                current = sessions.get(session_key)
+                if current is not None and current.get("nonce") == nonce:
+                    sessions.pop(session_key, None)
             released = await yd_release(
                 message.from_user.id, message.chat.id, nonce
             )
@@ -365,6 +409,139 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                 logging.info(
                     f"[YD] 🔓 Сессия {message.from_user.id}:{message.chat.id} "
                     f"освобождена (неудачный запуск)"
+                )
+
+
+def _is_awaiting_sunday_upload(message: types.Message) -> bool:
+    if message.from_user is None:
+        return False
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    session = sessions.get(session_key)
+    return bool(
+        session
+        and session.get("user_id") == message.from_user.id
+        and session.get("chat_id") == message.chat.id
+        and session.get("awaiting_upload")
+        and not session.get("cancelled")
+    )
+
+
+@router.message(F.document, _is_awaiting_sunday_upload)
+async def handle_sunday_upload(
+    message: types.Message,
+    bot: Bot,
+    SHM_DIR: str,
+    user_mgr,
+    check_access,
+):
+    if not await check_access(message):
+        return
+
+    document = message.document
+    original_name = document.file_name or ""
+    name = Path(original_name.replace("\\", "/")).name
+    suffix = Path(name).suffix.lower()
+    if suffix not in {".ppt", ".pptx"}:
+        await message.reply(
+            "❌ Для /sunday отправьте файл .ppt или .pptx. "
+            "Сессия остаётся активной."
+        )
+        return
+
+    safe_name = re.sub(r"[^\w .()\-]", "_", name, flags=re.UNICODE).strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = f"presentation{suffix}"
+    if len(safe_name) > 100:
+        safe_name = f"{safe_name[:100 - len(suffix)]}{suffix}"
+
+    session_key = f"yd_{message.from_user.id}_{message.chat.id}"
+    async with yd_session_lock:
+        picker = sessions.get(session_key)
+        if (
+            picker is None
+            or picker.get("user_id") != message.from_user.id
+            or picker.get("nonce") is None
+            or not picker.get("awaiting_upload")
+            or picker.get("cancelled")
+        ):
+            await message.reply(
+                "❌ Сессия /sunday больше не ожидает файл. "
+                "Запустите команду /sunday заново."
+            )
+            return
+        picker["awaiting_upload"] = False
+        picker["processing"] = True
+        sunday = picker["sunday"]
+        paths = picker["paths"]
+        nonce = picker["nonce"]
+
+    upload_dir = Path(SHM_DIR) / f"yd_upload_{secrets.token_hex(8)}"
+    upload_path = upload_dir / safe_name
+    status_msg = None
+    started = False
+
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        status_msg = await message.reply(
+            "⏳ Загружаю презентацию для /sunday..."
+        )
+        file_info = await bot.get_file(document.file_id)
+        await bot.download_file(file_info.file_path, destination=upload_path)
+        if not upload_path.is_file() or upload_path.stat().st_size == 0:
+            raise ValueError("Telegram вернул пустой файл")
+
+        await status_msg.edit_text(
+            "✅ Файл принят. Запускаю обычную обработку /sunday..."
+        )
+        await _yd_prepare_files(
+            callback=None,
+            bot=bot,
+            SHM_DIR=SHM_DIR,
+            user_mgr=user_mgr,
+            files_to_process=[{
+                "name": safe_name,
+                "size": upload_path.stat().st_size,
+                "local_path": str(upload_path),
+            }],
+            sunday=sunday,
+            paths=paths,
+            session_key=session_key,
+            nonce=nonce,
+            status_msg=status_msg,
+            owner_user_id=message.from_user.id,
+            chat_id=message.chat.id,
+        )
+        started = True
+    except Exception as e:
+        logging.error(
+            f"[YD-UPLOAD] Не удалось принять файл для {session_key}: {e}",
+            exc_info=True,
+        )
+        async with yd_session_lock:
+            picker = sessions.get(session_key)
+            if picker is not None and picker.get("nonce") == nonce:
+                picker["awaiting_upload"] = True
+                picker["processing"] = False
+        try:
+            error_text = (
+                "❌ Не удалось загрузить файл. Проверьте формат и повторите "
+                "отправку; сессия /sunday остаётся активной."
+            )
+            if status_msg is not None:
+                await status_msg.edit_text(error_text)
+            else:
+                await message.reply(error_text)
+        except Exception:
+            logging.exception("[YD-UPLOAD] Не удалось показать ошибку загрузки")
+    finally:
+        if not started:
+            try:
+                shutil.rmtree(upload_dir)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.exception(
+                    "[YD-UPLOAD] Не удалось удалить временный каталог загрузки"
                 )
 
 
