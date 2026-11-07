@@ -1236,36 +1236,50 @@ async def run(
                                 "esc/exit для отмены."
                             )
                             input_fn = input_fn or input
-                            try:
-                                answer = input_fn(
-                                    "Путь к DOCX или Enter для повтора: "
-                                ).strip()
-                            except EOFError as input_error:
-                                raise RuntimeError(
-                                    "Подготовка песен отменена."
-                                ) from input_error
-                            if answer.casefold() in {"esc", "exit", "q"}:
-                                raise RuntimeError("Подготовка песен отменена.")
-                            if answer:
+                            retry_requested = False
+                            while True:
+                                try:
+                                    answer = input_fn(
+                                        "Путь к DOCX или Enter для повтора: "
+                                    ).strip()
+                                except EOFError as input_error:
+                                    raise RuntimeError(
+                                        "Подготовка песен отменена."
+                                    ) from input_error
+                                if answer.casefold() in {"esc", "exit", "q"}:
+                                    raise RuntimeError(
+                                        "Подготовка песен отменена."
+                                    )
+                                if not answer:
+                                    retry_requested = True
+                                    break
+
                                 local_program = Path(
                                     answer.strip("\"' ")
                                 ).expanduser()
                                 if not local_program.is_file():
                                     print(
                                         f"Файл не найден: {local_program}. "
-                                        "Попробуйте ещё раз."
+                                        "Введите путь ещё раз или Enter для "
+                                        "повтора запроса."
                                     )
                                     continue
                                 try:
                                     _validate_program_docx(local_program)
                                 except RuntimeError as file_error:
-                                    print(f"Некорректный DOCX: {file_error}")
+                                    print(
+                                        f"Некорректный DOCX: {file_error}. "
+                                        "Укажите другой файл или нажмите "
+                                        "Enter для повтора запроса."
+                                    )
                                     continue
                                 program_file = local_program
                                 print(
                                     f"Используется локальная программа: "
                                     f"{program_file}"
                                 )
+                                break
+                            if not retry_requested:
                                 break
                             print(
                                 "Повторяю запрос. Если ограничение сохраняется, "

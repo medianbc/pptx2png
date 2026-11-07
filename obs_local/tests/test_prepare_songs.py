@@ -477,13 +477,16 @@ class SongOutputTests(unittest.TestCase):
 
         asyncio.run(execute())
 
-    def test_interactive_rate_limit_falls_back_to_local_program_docx(self):
+    def test_rate_limit_retries_only_on_enter_and_accepts_local_docx(self):
         with tempfile.TemporaryDirectory(
             dir="/dev/shm" if Path("/dev/shm").is_dir() else None
         ) as directory:
             root = Path(directory)
             local_program = root / "program.docx"
             _create_docx(local_program)
+            invalid_program = root / "invalid.docx"
+            invalid_program.write_text("not a DOCX", encoding="utf-8")
+            missing_program = root / "missing.docx"
             config = {
                 "program_url": "https://disk.yandex.ru/i/example_program",
                 "song_title_aliases_path": root / "aliases.json",
@@ -514,6 +517,9 @@ class SongOutputTests(unittest.TestCase):
                     )
 
             class FakeSession:
+                def __init__(self):
+                    self.get_calls = 0
+
                 async def __aenter__(self):
                     return self
 
@@ -521,11 +527,24 @@ class SongOutputTests(unittest.TestCase):
                     return None
 
                 def get(self, *_args, **_kwargs):
+                    self.get_calls += 1
                     return FakeResponse()
 
-            inputs = iter([str(local_program), "", ""])
+            session = FakeSession()
+            inputs = iter(
+                [
+                    "",
+                    str(missing_program),
+                    str(invalid_program),
+                    str(local_program),
+                    "",
+                    "",
+                ]
+            )
             with patch.object(
-                prepare_songs.aiohttp, "ClientSession", return_value=FakeSession()
+                prepare_songs.aiohttp,
+                "ClientSession",
+                return_value=session,
             ):
                 results = asyncio.run(
                     prepare_songs.run(
@@ -537,6 +556,7 @@ class SongOutputTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(results), 2)
+        self.assertEqual(session.get_calls, 2)
 
     def test_download_rejects_docs_view_link_before_api_call(self):
         docs_url = (
