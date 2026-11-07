@@ -4,10 +4,15 @@ from pathlib import Path
 
 try:
     import pymupdf
-except ImportError:
-    print("Ошибка: библиотека PyMuPDF не установлена.")
-    print("Выполните в терминале команду: python3 -m pip install pymupdf")
-    exit()
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    try:
+        import fitz as pymupdf
+    except ImportError:
+        print("Ошибка: библиотека PyMuPDF не установлена.")
+        print("Выполните в терминале команду: python3 -m pip install pymupdf")
+        exit()
 
 def convert_all_pdfs_to_4k():
     # Находим текущую папку, где запущен скрипт

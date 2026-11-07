@@ -19,7 +19,12 @@ from typing import List, Tuple, Optional
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-import pymupdf
+try:
+    import pymupdf
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    import fitz as pymupdf
 
 
 # ==========================================
