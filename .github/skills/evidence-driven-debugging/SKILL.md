@@ -18,6 +18,11 @@ Fix the root cause, not the symptom. Every claim must be backed by observed beha
 1. Reproduce the problem exactly.
    - Capture the user-visible symptom, command, stack trace, input, or failing condition.
    - Note the environment: OS, Python version, relevant config, and external dependencies.
+   - For a new chat/computer, establish checkout branch/SHA, worktree state,
+     Python executable and dependency availability first. Previous chat paths,
+     test counts and CI results are historical evidence, not the current state.
+   - Use synthetic fixtures and mock external APIs by default. Do not print
+     secrets or read private materials/logs merely to initialize context.
 
 2. Narrow to the failing layer.
    - Read only the specific file and function involved.
@@ -42,6 +47,12 @@ Fix the root cause, not the symptom. Every claim must be backed by observed beha
    - Run the focused repro or relevant test.
    - Confirm the bug is actually resolved, not merely hidden.
    - Record the evidence: command, output, and result.
+   - Use the checkout's environment rather than a copied absolute venv path.
+     A missing module is an environment failure, not evidence of a code bug.
+     Restore only required dependencies after a missing-dependency failure.
+   - In the Linux RAM-disk environment set `TMPDIR=/dev/shm`; on other systems
+     use a valid platform temporary directory. Keep real materials and
+     persistent state separate from disposable test output.
 
 7. Check for regressions.
    - Review adjacent code paths that could be affected.
@@ -53,6 +64,13 @@ Fix the root cause, not the symptom. Every claim must be backed by observed beha
 - If the code path is not yet localized, read narrower slices of the stack or logs rather than broad files.
 - If multiple hypotheses remain, test one hypothesis at a time and keep the evidence trail clear.
 - If the problem is external to the repo, document the environment mismatch or dependency issue instead of changing code blindly.
+- Distinguish HTTP success from valid content: a Yandex download page returning
+  HTTP 200 with HTML/CAPTCHA is not a valid DOCX/PPTX. Treat HTTP 429 as service
+  throttling; verify recovery/cancellation with mocks instead of repeated live
+  requests or CAPTCHA bypass.
+- For OBS, consult the [local skill](../pptx2png-obs-local/SKILL.md) for independent
+  OS settings, token precedence, logging, alias normalization and publication
+  safety. For bot changes, consult the [bot skill](../pptx2png-bot/SKILL.md).
 
 ## Completion Checklist
 - The exact symptom is reproduced or clearly described.
