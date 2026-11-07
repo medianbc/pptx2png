@@ -38,7 +38,11 @@ from .yandex_flow_core import (
     drain_deferred_cleanups,
 )
 
-from .yandex_flow_handlers import router
+from .yandex_flow_handlers import (
+    router,
+    _is_awaiting_sunday_upload,
+    handle_sunday_upload,
+)
 
 
 # ==========================================
@@ -85,4 +89,6 @@ __all__ = [
     "drain_deferred_cleanups_async",
     "safe_answer",
     "is_sermon_slide",
+    "_is_awaiting_sunday_upload",
+    "handle_sunday_upload",
 ]

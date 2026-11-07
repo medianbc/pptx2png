@@ -2,12 +2,15 @@ import asyncio
 import shutil
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot import yandex_flow_handlers as flow_handlers
+from aiogram import Bot
+from aiogram.types import Chat, Document, Message, Update, User
+
+from bot import handlers, yandex_flow_handlers as flow_handlers
 from bot import yandex_flow_core
 from bot import yandex_state
 from pptx import Presentation
@@ -243,6 +246,47 @@ class SundayUploadTests(unittest.IsolatedAsyncioTestCase):
 
         message.from_user.id = self.user_id + 1
         self.assertFalse(flow_handlers._is_awaiting_sunday_upload(message))
+
+    async def test_document_router_routes_waiting_sunday_upload_before_regular_handler(self):
+        message = Message(
+            message_id=15,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=self.chat_id, type="private"),
+            from_user=User(
+                id=self.user_id,
+                is_bot=False,
+                first_name="Test",
+            ),
+            document=Document(
+                file_id="telegram-file-id",
+                file_unique_id="unique-file-id",
+                file_name="presentation.pptx",
+            ),
+        )
+        update = Update(update_id=1, message=message)
+        bot = Bot(token="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+        try:
+            with patch.object(
+                handlers, "handle_sunday_upload", new_callable=AsyncMock
+            ) as sunday_handler:
+                await handlers.router.propagate_event(
+                    "message",
+                    message,
+                    bot=bot,
+                    check_access=AsyncMock(return_value=True),
+                    SHM_DIR="/dev/shm",
+                    user_mgr=SimpleNamespace(),
+                    get_settings_keyboard=lambda _user_id: None,
+                    update=update,
+                )
+
+            sunday_handler.assert_awaited_once()
+            self.assertEqual(
+                sunday_handler.await_args.args[0].document.file_name,
+                "presentation.pptx",
+            )
+        finally:
+            await bot.session.close()
 
 
 if __name__ == "__main__":

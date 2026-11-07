@@ -40,6 +40,8 @@ from .yandex_flow import (
     cleanup_task as yd_cleanup_task,
     is_sermon_slide,
     prompt_timeout_watchdog,
+    _is_awaiting_sunday_upload,
+    handle_sunday_upload,
 )
 
 import pptx2png_core.converter_engine as converter_engine
@@ -1437,7 +1439,18 @@ async def handle_toggle_cat_other(
 # ==========================================
 
 @router.message(F.document.file_name.lower().endswith(('.pptx', '.ppt')))
-async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, check_access):
+async def handle_pptx_document(
+    message: types.Message,
+    bot: Bot,
+    SHM_DIR: str,
+    check_access,
+    user_mgr,
+):
+    if _is_awaiting_sunday_upload(message):
+        await handle_sunday_upload(
+            message, bot, SHM_DIR, user_mgr, check_access
+        )
+        return
     if not await check_access(message):
         return
     document = message.document
@@ -1508,6 +1521,11 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
 @router.message(F.document)
 async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_access,
                       user_mgr, get_settings_keyboard):
+    if _is_awaiting_sunday_upload(message):
+        await handle_sunday_upload(
+            message, bot, SHM_DIR, user_mgr, check_access
+        )
+        return
     if not await check_access(message):
         return
     safe_name = safe_filename(message.document.file_name)

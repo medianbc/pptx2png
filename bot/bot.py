@@ -25,7 +25,7 @@ from .folder_setup import folder_setup_loop
 # ✅ Yandex-подсистема: конфиг и состояние
 from . import yandex_state
 from pptx2png_core.yandex_disk import YandexDiskClient
-from .yandex_state import yd_active_tasks, yd_session_lock
+from .yandex_state import yd_active_tasks, yd_active_uploads, yd_session_lock
 
 
 # ==========================================
@@ -277,13 +277,14 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     current_time = time.time()
     deleted = 0
 
-    # ✅ Снимок активных Yandex-задач под локом
+    # Снимок активных Yandex-задач и загруженных для /sunday файлов.
     async with yd_session_lock:
-        active_yd = set(yd_active_tasks)
+        active_yd = set(yd_active_tasks) | set(yd_active_uploads)
 
     for item in shm_dir.iterdir():
-        # ✅ Обрабатываем и task_*, и yd_task_*
-        if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
+        if not item.is_dir() or not item.name.startswith(
+            ("task_", "yd_task_", "yd_upload_")
+        ):
             continue
         task_id = item.name
 

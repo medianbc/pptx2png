@@ -480,6 +480,9 @@ async def handle_sunday_upload(
     status_msg = None
     started = False
 
+    async with yd_session_lock:
+        yandex_state.yd_active_uploads.add(upload_dir.name)
+
     try:
         upload_dir.mkdir(parents=True, exist_ok=False)
         status_msg = await message.reply(
@@ -543,6 +546,9 @@ async def handle_sunday_upload(
                 logging.exception(
                     "[YD-UPLOAD] Не удалось удалить временный каталог загрузки"
                 )
+            finally:
+                async with yd_session_lock:
+                    yandex_state.yd_active_uploads.discard(upload_dir.name)
 
 
 # ==========================================

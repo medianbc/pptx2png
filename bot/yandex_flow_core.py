@@ -1261,6 +1261,11 @@ async def _yd_prepare_files(
                         f"[YD-PREP] Не удалось удалить временный файл "
                         f"загрузки {source}: {e}"
                     )
+                finally:
+                    async with yd_session_lock:
+                        yandex_state.yd_active_uploads.discard(
+                            source.parent.name
+                        )
 
     return await _run_worker_detached(
         temp_task_id, _factory, name="prepare",
