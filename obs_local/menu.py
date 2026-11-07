@@ -8,6 +8,7 @@ import configparser
 import getpass
 import logging
 import tempfile
+from urllib.parse import urlparse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,29 +20,44 @@ from . import app, prepare_songs, updater
 from .config_utils import get_settings_path, update_ini_file
 
 
-def _settings_menu(input_fn: Callable[[str], str]) -> None:
+def _settings_menu(input_fn: Callable[[str], str]) -> bool:
     while True:
         try:
             path = get_settings_path(app.BASE_DIR)
             settings = configparser.ConfigParser(interpolation=None)
             if not settings.read(path, encoding="utf-8"):
                 print(f"Не найден файл настроек: {path}")
-                return
+                return False
             entries = [
                 (section, key, value)
                 for section in settings.sections()
                 for key, value in settings.items(section)
                 if key.lower() != "token"
             ]
+            legacy_url = settings.get("Song preparation", "program_url", fallback="")
+            default_cloud = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
+            for key, default in (
+                ("priority_cloud_disk", default_cloud),
+                ("program_google_url", ""),
+                ("program_yandex_url", ""),
+            ):
+                if not settings.has_option("Song preparation", key):
+                    entries.append(("Song preparation", key, default))
             print("\nНастройки OBS")
             for index, (section, key, value) in enumerate(entries, 1):
                 print(f"  {index}. [{section}] {key} = {value}")
             token_choice = str(len(entries) + 1)
+            update_choice = str(len(entries) + 2)
             print(f"  {token_choice}. Ввести токен Яндекс.Диска")
+            print(f"  {update_choice}. Проверить обновления")
             print("  0. Назад")
             choice = input_fn("Параметр [0]: ").strip() or "0"
             if choice == "0":
-                return
+                return False
+            if choice == update_choice:
+                if _check_updates(input_fn):
+                    return True
+                continue
             if choice == token_choice:
                 token = getpass.getpass("OAuth-токен (ввод скрыт): ").strip()
                 if not token or "\n" in token or "\r" in token:
@@ -64,10 +80,16 @@ def _settings_menu(input_fn: Callable[[str], str]) -> None:
                 print("Введите номер из списка.")
                 continue
             section, key, old_value = entries[int(choice) - 1]
+            if key == "priority_cloud_disk":
+                print("  1. Google\n  2. Яндекс")
             value = input_fn(f"Новое значение [{old_value}] (Enter — оставить): ")
             if not value.strip():
                 continue
             value = value.strip()
+            if key == "priority_cloud_disk":
+                value = {"1": "google", "2": "yandex"}.get(value.lower(), value.lower())
+                if value not in {"google", "yandex"}:
+                    raise ValueError("Выберите 1 (Google) или 2 (Яндекс).")
             if "\n" in value or "\r" in value:
                 raise ValueError("Значение должно занимать одну строку.")
             if key == "quality" and value not in {"standard", "2k", "4k"}:
@@ -77,16 +99,20 @@ def _settings_menu(input_fn: Callable[[str], str]) -> None:
                     raise ValueError("Укажите true или false.")
             if key == "program_url":
                 prepare_songs._normalize_program_public_key(value)
+            if key in {"program_google_url", "program_yandex_url"}:
+                prepare_songs._validate_program_cloud_url(
+                    value, "google" if key == "program_google_url" else "yandex",
+                )
             update_ini_file(path, {section: {key: value}})
             print("Настройка сохранена.")
         except EOFError:
-            return
+            return False
         except configparser.Error as error:
             print(f"Не удалось прочитать настройки: {error}")
-            return
+            return False
         except OSError as error:
             print(f"Не удалось изменить настройки: {error}")
-            return
+            return False
         except (ValueError, RuntimeError) as error:
             print(f"Не удалось изменить настройки: {error}")
 
@@ -231,8 +257,7 @@ def run_menu(
         print("\nЛокальная подготовка материалов для OBS")
         for key, (label, _) in actions.items():
             print(f"  {key}. {label}")
-        print("  3. Проверить обновления")
-        print("  4. Настройки")
+        print("  3. Настройки")
         print("  0. Выход")
 
         try:
@@ -243,16 +268,13 @@ def run_menu(
 
         if choice == "0" or not choice:
             return
-        if choice == "4":
-            _settings_menu(input_fn)
-            continue
         if choice == "3":
-            if _check_updates(input_fn):
+            if _settings_menu(input_fn):
                 return
             continue
         action = actions.get(choice)
         if action is None:
-            print("Введите 1, 2, 3, 4 или 0.")
+            print("Введите 1, 2, 3 или 0.")
             continue
         if choice == "2":
             _songs_menu(input_fn, debug=debug)

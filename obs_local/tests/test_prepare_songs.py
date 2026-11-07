@@ -162,6 +162,82 @@ class SongMatchingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_priority_selects_only_its_cloud_and_keeps_legacy_configs_working(self):
+        google_url = GoogleProgramDownloadTests.URL
+        yandex_url = "https://disk.yandex.ru/d/synthetic-program"
+        cases = (
+            ("", yandex_url, "", "", yandex_url, "yandex"),
+            ("", google_url, "", "", google_url, "google"),
+            ("google", yandex_url, google_url, yandex_url, google_url, "google"),
+            ("yandex", google_url, google_url, yandex_url, yandex_url, "yandex"),
+            ("google", yandex_url, "", yandex_url, "", "google"),
+            ("yandex", yandex_url, google_url, "", yandex_url, "yandex"),
+        )
+        for priority, legacy, google, yandex, expected, expected_cloud in cases:
+            with self.subTest(priority=priority, legacy=legacy), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "settings.ini"
+                text = (
+                    "[OBS Local paths]\nroot_path = ./png\n"
+                    "[Song preparation]\n"
+                    f"program_url = {legacy}\n"
+                    f"program_google_url = {google}\n"
+                    f"program_yandex_url = {yandex}\n"
+                )
+                if priority:
+                    text += f"priority_cloud_disk = {priority}\n"
+                path.write_text(text, encoding="utf-8")
+                with (
+                    patch.object(prepare_songs, "get_settings_path", return_value=path),
+                    patch.object(prepare_songs, "_load_yandex_token", return_value=""),
+                ):
+                    config = prepare_songs.load_config()
+                self.assertEqual(config["program_url"], expected)
+                self.assertEqual(config["priority_cloud_disk"], expected_cloud)
+                self.assertEqual(path.read_text(encoding="utf-8"), text)
+
+    def test_invalid_priority_and_wrong_cloud_url_are_reported(self):
+        cases = (
+            "priority_cloud_disk = other\n",
+            "priority_cloud_disk =\n",
+            "priority_cloud_disk = google\nprogram_google_url = https://disk.yandex.ru/d/program\n",
+            "priority_cloud_disk = yandex\nprogram_yandex_url = https://docs.google.com/document/d/program/edit\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.ini"
+            for options in cases:
+                with self.subTest(options=options):
+                    path.write_text(
+                        "[OBS Local paths]\nroot_path = ./png\n[Song preparation]\n" + options,
+                        encoding="utf-8",
+                    )
+                    with patch.object(prepare_songs, "get_settings_path", return_value=path):
+                        with self.assertRaises(RuntimeError):
+                            prepare_songs.load_config()
+
+    def test_template_defaults_to_google_priority(self):
+        with (
+            patch.object(prepare_songs, "get_settings_path", return_value=prepare_songs.BASE_DIR / "settings.ini"),
+            patch.object(prepare_songs, "_load_yandex_token", return_value=""),
+        ):
+            config = prepare_songs.load_config()
+        self.assertEqual(config["priority_cloud_disk"], "google")
+        self.assertEqual(config["program_url_option"], "program_google_url")
+        self.assertEqual(config["program_url"], "")
+
+    def test_prompt_rejects_the_other_cloud_when_priority_is_set(self):
+        inputs = Mock(side_effect=[
+            "https://disk.yandex.ru/d/synthetic-program",
+            GoogleProgramDownloadTests.URL,
+        ])
+        self.assertEqual(
+            prepare_songs.ensure_program_url(
+                {"program_url": "", "priority_cloud_disk": "google"}, input_fn=inputs,
+            ),
+            GoogleProgramDownloadTests.URL,
+        )
+        self.assertEqual(inputs.call_count, 2)
+
     def test_missing_program_url_is_prompted_and_validated_before_save(self):
         with tempfile.TemporaryDirectory(
             dir="/dev/shm" if Path("/dev/shm").is_dir() else None
@@ -312,6 +388,228 @@ class ConfigTests(unittest.TestCase):
                 config = prepare_songs.load_config()
 
         self.assertEqual(config["yandex_token"], "local-token")
+
+
+class GoogleProgramDownloadTests(unittest.TestCase):
+    URL = "https://docs.google.com/document/d/synthetic-document/edit?usp=sharing"
+
+    def make_session(self, body=None, status=200, headers=None, error=None):
+        response = MagicMock()
+        response.status = status
+        response.headers = headers or {}
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+
+        async def chunks(_size):
+            yield _minimal_docx_bytes() if body is None else body
+
+        response.content.iter_chunked = chunks
+        response.text = AsyncMock(return_value="Access denied")
+        session = Mock()
+        session.get = Mock(return_value=response, side_effect=error)
+        return session
+
+    def test_google_links_export_docx_without_yandex_api_or_token(self):
+        urls = (
+            self.URL,
+            "https://docs.google.com/document/d/synthetic-document",
+            "https://docs.google.com/document/d/synthetic-document/preview",
+            "https://docs.google.com/document/d/synthetic-document/export?format=pdf",
+        )
+        for url in urls:
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as directory:
+                session = self.make_session()
+                destination = Path(directory) / "program.docx"
+                asyncio.run(prepare_songs.download_program_docx(
+                    session, url, destination,
+                ))
+                session.get.assert_called_once()
+                args, kwargs = session.get.call_args
+                self.assertEqual(
+                    args[0],
+                    "https://docs.google.com/document/d/synthetic-document/export?format=docx",
+                )
+                self.assertNotIn("headers", kwargs)
+                self.assertNotIn("params", kwargs)
+                self.assertEqual(destination.read_bytes(), _minimal_docx_bytes())
+
+    def test_google_url_is_accepted_by_interactive_prompt(self):
+        self.assertEqual(
+            prepare_songs.ensure_program_url(
+                {"program_url": ""}, input_fn=lambda _: self.URL,
+            ),
+            self.URL,
+        )
+
+    def test_invalid_google_addresses_are_rejected_before_network_access(self):
+        urls = (
+            "http://docs.google.com/document/d/example/edit",
+            "https://docs.google.com.evil.test/document/d/example/edit",
+            "https://docs.google.com/document/d//edit",
+            "https://docs.google.com/document/d/example/edit/extra",
+            "https://docs.google.com/document/u/0/d/example/edit",
+            "https://docs.google.com/document/d/example%2Fother/edit",
+            "https://user:password@docs.google.com/document/d/example/edit",
+            "https://docs.google.com:8080/document/d/example/edit",
+            "https://docs.google.com:invalid/document/d/example/edit",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for url in urls:
+                with self.subTest(url=url):
+                    session = self.make_session()
+                    with self.assertRaises(RuntimeError):
+                        asyncio.run(prepare_songs.download_program_docx(
+                            session, url, Path(directory) / "program.docx",
+                        ))
+                    session.get.assert_not_called()
+
+    def test_google_http_errors_explain_sharing_permissions(self):
+        for status in (403, 404, 429):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                session = self.make_session(status=status)
+                with self.assertRaisesRegex(RuntimeError, f"HTTP {status}") as caught:
+                    asyncio.run(prepare_songs.download_program_docx(
+                        session, self.URL, Path(directory) / "program.docx",
+                    ))
+                self.assertIn("Google Docs", str(caught.exception))
+                self.assertNotIn("synthetic-document", str(caught.exception))
+
+    def test_google_login_page_with_http_200_is_not_a_docx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(body=b"<html>Sign in to Google</html>")
+            with self.assertRaisesRegex(RuntimeError, "не является DOCX"):
+                asyncio.run(prepare_songs.download_program_docx(
+                    session, self.URL, Path(directory) / "program.docx",
+                ))
+
+    def test_google_download_enforces_header_and_stream_size_limits(self):
+        for headers in ({}, {"Content-Length": "1000"}):
+            with self.subTest(headers=headers), tempfile.TemporaryDirectory() as directory:
+                session = self.make_session(body=b"x" * 11, headers=headers)
+                with patch.object(prepare_songs, "MAX_PROGRAM_DOCX_BYTES", 10):
+                    with self.assertRaisesRegex(RuntimeError, "превышает лимит"):
+                        asyncio.run(prepare_songs.download_program_docx(
+                            session, self.URL, Path(directory) / "program.docx",
+                        ))
+
+    def test_google_network_error_propagates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(
+                error=prepare_songs.aiohttp.ClientConnectionError("network unavailable"),
+            )
+            with self.assertRaises(prepare_songs.aiohttp.ClientConnectionError):
+                asyncio.run(prepare_songs.download_program_docx(
+                    session, self.URL, Path(directory) / "program.docx",
+                ))
+
+    def test_google_export_is_parsed_and_prompted_url_saved_after_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            program = root / "synthetic.docx"
+            _create_docx(program)
+            config = {
+                "program_url": "",
+                "priority_cloud_disk": "google",
+                "program_url_option": "program_google_url",
+                "song_title_aliases_path": root / "aliases.json",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "output_dir": root / "output",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+            session = self.make_session(body=program.read_bytes())
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=session)
+            context.__aexit__ = AsyncMock(return_value=None)
+            inputs = Mock(side_effect=[self.URL, "", ""])
+            with (
+                patch.object(prepare_songs.aiohttp, "ClientSession", return_value=context),
+                patch.object(prepare_songs, "get_settings_path", return_value=root / "settings.ini"),
+                patch.object(prepare_songs, "update_ini_file") as save,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                results = asyncio.run(prepare_songs.run(
+                    date(2026, 10, 4), config=config, interactive=True, input_fn=inputs,
+                ))
+            self.assertEqual([result.title for result in results], ["Песня первая", "Песня вторая"])
+            self.assertTrue(config["output_dir"].is_dir())
+            save.assert_called_once_with(
+                root / "settings.ini", {"Song preparation": {"program_google_url": self.URL}},
+            )
+            self.assertEqual(config["program_url"], self.URL)
+            session.get.assert_called_once()
+
+    def test_google_timeout_can_be_cancelled_without_replacing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "output"
+            target.mkdir()
+            marker = target / "keep.png"
+            marker.write_bytes(PNG)
+            config = {
+                "program_url": self.URL,
+                "priority_cloud_disk": "google",
+                "program_yandex_url": "https://disk.yandex.ru/d/other-source",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "output_dir": target,
+                "quality": "standard",
+                "yandex_token": "",
+            }
+            session = self.make_session(error=asyncio.TimeoutError())
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=session)
+            context.__aexit__ = AsyncMock(return_value=None)
+            with (
+                patch.object(prepare_songs.aiohttp, "ClientSession", return_value=context),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(prepare_songs.OperationCancelled):
+                    asyncio.run(prepare_songs.run(
+                        date(2026, 10, 4), config=config, interactive=True,
+                        input_fn=lambda _: "",
+                    ))
+            self.assertEqual(marker.read_bytes(), PNG)
+            session.get.assert_called_once()
+
+    def test_google_failure_allows_local_docx_without_saving_failed_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            program = root / "local.docx"
+            _create_docx(program)
+            config = {
+                "program_url": "",
+                "song_title_aliases_path": root / "aliases.json",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "output_dir": root / "output",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+            session = self.make_session(status=403)
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=session)
+            context.__aexit__ = AsyncMock(return_value=None)
+            inputs = Mock(side_effect=[self.URL, "2", str(program), "", ""])
+            with (
+                patch.object(prepare_songs.aiohttp, "ClientSession", return_value=context),
+                patch.object(prepare_songs, "update_ini_file") as save,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                results = asyncio.run(prepare_songs.run(
+                    date(2026, 10, 4), config=config, interactive=True, input_fn=inputs,
+                ))
+            self.assertEqual(len(results), 2)
+            session.get.assert_called_once()
+            save.assert_not_called()
+            self.assertEqual(config["program_url"], "")
 
 
 class SongOutputTests(unittest.TestCase):

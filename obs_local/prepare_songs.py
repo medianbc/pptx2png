@@ -64,15 +64,15 @@ def format_user_error(error: Exception) -> str:
     if isinstance(error, ProgramRateLimitError):
         return str(error)
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
-        return "Истекло время ожидания ответа Яндекс.Диска. Повторите попытку."
+        return "Истекло время ожидания ответа сервиса. Повторите попытку."
     if isinstance(error, aiohttp.ClientResponseError):
         return (
-            f"Яндекс.Диск вернул HTTP {error.status}. "
+            f"Сервис вернул HTTP {error.status}. "
             "Проверьте ссылку и доступ к файлу."
         )
     if isinstance(error, aiohttp.ClientError):
         return (
-            "Не удалось связаться с Яндекс.Диском. Проверьте интернет-"
+            "Не удалось связаться с сервисом. Проверьте интернет-"
             "подключение и повторите попытку."
         )
     if isinstance(error, PermissionError):
@@ -155,9 +155,28 @@ def load_config() -> dict[str, Any]:
     log_dir = (
         _resolve_path(configured_log_dir) if configured_log_dir else default_log_dir()
     )
+    legacy_url = song_settings.get("program_url", "").strip()
+    if "priority_cloud_disk" in song_settings:
+        priority = song_settings["priority_cloud_disk"].strip().lower()
+    else:
+        priority = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
+    if priority not in {"google", "yandex"}:
+        raise RuntimeError("priority_cloud_disk должен быть google или yandex")
+    program_url_option = f"program_{priority}_url"
+    program_url = song_settings.get(program_url_option, "").strip()
+    if program_url:
+        _validate_program_cloud_url(program_url, priority)
+    elif legacy_url:
+        legacy_cloud = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
+        if legacy_cloud == priority:
+            program_url = legacy_url
+            if "priority_cloud_disk" not in song_settings:
+                program_url_option = "program_url"
 
     return {
-        "program_url": song_settings.get("program_url", "").strip(),
+        "program_url": program_url,
+        "program_url_option": program_url_option,
+        "priority_cloud_disk": priority,
         "song_title_aliases_path": SONG_TITLE_ALIASES_PATH,
         "zip_dir": local_path("local_zip_dir", "./song_assets/zip"),
         "pptx_dir": local_path("local_pptx_dir", "./song_assets/pptx"),
@@ -323,9 +342,12 @@ def ensure_program_url(
     input_fn = input_fn or input
     print("Ссылка на DOCX-программу собрания ещё не настроена.")
     print(
-        "Введите публичную ссылку на файл Яндекс.Диска "
-        "(например, https://disk.yandex.ru/d/<public-key>)."
+        "Введите публичную ссылку на файл Яндекс.Диска или Google Docs "
+        "(например, https://docs.google.com/document/d/<id>/edit)."
     )
+    priority = config.get("priority_cloud_disk")
+    if priority:
+        print(f"Приоритетное облако: {priority}. Введите ссылку этого источника.")
     while True:
         try:
             url = input_fn("Ссылка на DOCX-программу: ").strip()
@@ -339,7 +361,10 @@ def ensure_program_url(
             print("Ссылка не может быть пустой.")
             continue
         try:
-            _normalize_program_public_key(url)
+            if priority:
+                _validate_program_cloud_url(url, priority)
+            else:
+                _normalize_program_public_key(url)
         except RuntimeError as error:
             print(f"Некорректная ссылка: {error}")
             continue
@@ -789,6 +814,17 @@ def _normalize_program_public_key(url: str) -> str:
         raise RuntimeError(
             "Ссылка программы должна использовать HTTPS"
         )
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("Ссылка программы содержит некорректный порт") from error
+    if parsed.username or parsed.password or port not in (None, 443):
+        raise RuntimeError("Ссылка программы содержит недопустимые параметры адреса")
+    if parsed.hostname == "docs.google.com" and re.fullmatch(
+        r"/document/d/[A-Za-z0-9_-]+(?:/(?:edit|view|preview|export))?/?",
+        parsed.path,
+    ):
+        return url
     if parsed.hostname == "docs.yandex.ru":
         raise RuntimeError(
             "Ссылка docs.yandex.ru/view/d/... открывает viewer документа, "
@@ -807,8 +843,16 @@ def _normalize_program_public_key(url: str) -> str:
     raise RuntimeError(
         "Ссылка программы должна быть публичной HTTPS-ссылкой вида "
         "disk.yandex.ru/d/<public-key>, disk.yandex.ru/i/<public-key> "
-        "или yadi.sk/d/<public-key>"
+        "или yadi.sk/d/<public-key>, либо Google Docs "
+        "docs.google.com/document/d/<id>/edit"
     )
+
+
+def _validate_program_cloud_url(url: str, cloud: str) -> None:
+    _normalize_program_public_key(url)
+    actual_cloud = "google" if urlparse(url).hostname == "docs.google.com" else "yandex"
+    if actual_cloud != cloud:
+        raise RuntimeError(f"Укажите ссылку программы для облака {cloud}")
 
 
 def _sanitize_diagnostic(value: str, sensitive_url: str = "") -> str:
@@ -845,9 +889,9 @@ def _validate_program_docx(path: Path) -> None:
         ) from error
 
 
-async def download_program_docx(
-    session: aiohttp.ClientSession, url: str, destination: Path
-) -> None:
+async def _get_yandex_program_download_url(
+    session: aiohttp.ClientSession, url: str
+) -> str:
     public_key = _normalize_program_public_key(url)
     LOGGER.info(
         "Запрос ссылки на DOCX программы через публичный API Яндекс.Диска "
@@ -921,6 +965,22 @@ async def download_program_docx(
         "Получена временная ссылка для скачивания программы (host=%s)",
         parsed_download_url.hostname,
     )
+    return download_url
+
+
+async def download_program_docx(
+    session: aiohttp.ClientSession, url: str, destination: Path
+) -> None:
+    _normalize_program_public_key(url)
+    parsed = urlparse(url)
+    if parsed.hostname == "docs.google.com":
+        document_id = parsed.path.split("/")[3]
+        download_url = (
+            f"https://docs.google.com/document/d/{document_id}/export?format=docx"
+        )
+        LOGGER.info("Экспорт программы Google Docs в DOCX")
+    else:
+        download_url = await _get_yandex_program_download_url(session, url)
     try:
         async with session.get(
             download_url, timeout=aiohttp.ClientTimeout(total=120)
@@ -933,9 +993,14 @@ async def download_program_docx(
                     response.status,
                     detail,
                 )
+                access_hint = (
+                    " Разрешите просмотр всем, у кого есть ссылка, "
+                    "и скачивание документа в Google Docs."
+                    if parsed.hostname == "docs.google.com" else ""
+                )
                 raise RuntimeError(
                     f"Не удалось скачать программу (HTTP {response.status}): "
-                    f"{detail}"
+                    f"{detail}.{access_hint}"
                 )
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_PROGRAM_DOCX_BYTES:
@@ -961,8 +1026,8 @@ async def download_program_docx(
     except RuntimeError as error:
         raise RuntimeError(
             "Скачанный по публичной ссылке файл не является DOCX. "
-            "Возможно, ссылка ведёт на изображение или Яндекс.Диск вернул "
-            "страницу CAPTCHA вместо файла."
+            "Возможно, сервис вернул страницу входа или CAPTCHA вместо файла. "
+            "Проверьте публичный доступ и разрешение на скачивание документа."
         ) from error
 
 
@@ -974,7 +1039,7 @@ async def _response_error_detail(
         body = (await response.text()).strip()
     except (aiohttp.ClientError, UnicodeDecodeError) as error:
         LOGGER.warning(
-            "Не удалось прочитать тело HTTP-ошибки Яндекс.Диска: %s", error
+            "Не удалось прочитать тело HTTP-ошибки сервиса: %s", error
         )
         LOGGER.debug(
             "Ошибка чтения тела HTTP-ответа; traceback:",
@@ -1202,7 +1267,8 @@ async def run(
     )
     if program_file is None and not url:
         raise RuntimeError(
-            "Укажите --program-file или задайте [Song preparation] program_url. "
+            "Укажите --program-file или задайте [Song preparation] "
+            f"{config.get('program_url_option', 'program_url')}. "
             "Для интерактивного запроса запустите программу из терминала."
         )
     if program_file is not None and not program_file.is_file():
@@ -1300,7 +1366,9 @@ async def run(
                     if prompted_program_url and downloaded_program:
                         update_ini_file(
                             get_settings_path(BASE_DIR),
-                            {"Song preparation": {"program_url": url}},
+                            {"Song preparation": {
+                                config.get("program_url_option", "program_url"): url,
+                            }},
                         )
                         config["program_url"] = url
                         print("Ссылка сохранена в настройках текущей ОС.")
@@ -1540,7 +1608,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--program-url",
-        help="Публичная ссылка на DOCX; если не задана, берётся из настроек текущей ОС.",
+        help="Публичная ссылка Яндекс.Диска или Google Docs; иначе берётся из настроек текущей ОС.",
     )
     parser.add_argument(
         "--log-dir",
