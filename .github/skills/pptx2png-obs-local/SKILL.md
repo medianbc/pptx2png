@@ -54,6 +54,10 @@ feature exists. For a new checkout/chat, use the
 - Song cancellation uses `prepare_songs.OperationCancelled`; both the menu and
   direct CLI handle it normally without an error or traceback. Presentation
   recovery keeps its own `1` retry, `2` local file, `0` cancel numbering.
+- Presentation category ranges are kept only during the current preparation,
+  including back/change-selection paths. Mode `2` converts one category; mode
+  `4` edits/selects multiple categories, renders once and writes separate
+  category folders under one run directory. Do not persist edits to source files.
 - Song search prioritizes local PNG ZIPs, then local PPTX, then configured
   Yandex Disk ZIP/PPTX sources. Matching supports strong partial title matches;
   ambiguous candidates are not selected automatically.
