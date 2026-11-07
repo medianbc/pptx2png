@@ -72,7 +72,7 @@ class MainMenuTests(unittest.TestCase):
         app_main.assert_not_called()
 
     def test_update_check_can_install_and_exits_menu_afterwards(self):
-        answers = iter(["3", "1"])
+        answers = iter(["3", "6", "1"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -81,15 +81,20 @@ class MainMenuTests(unittest.TestCase):
             is_git_checkout=False,
         )
         with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(menu, "get_settings_path", return_value=Path(directory) / "settings.ini"),
             patch.object(menu.updater, "check_for_updates", return_value=update),
             patch.object(menu.updater, "install_update") as install_update,
         ):
+            (Path(directory) / "settings.ini").write_text(
+                "[OBS Local paths]\nquality = standard\n", encoding="utf-8",
+            )
             menu.run_menu(input_fn=lambda _: next(answers))
 
         install_update.assert_called_once_with(update)
 
     def test_update_check_can_be_cancelled(self):
-        answers = iter(["3", "0", "0"])
+        answers = iter(["3", "6", "0", "0", "0"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -98,12 +103,49 @@ class MainMenuTests(unittest.TestCase):
             is_git_checkout=False,
         )
         with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(menu, "get_settings_path", return_value=Path(directory) / "settings.ini"),
             patch.object(menu.updater, "check_for_updates", return_value=update),
             patch.object(menu.updater, "install_update") as install_update,
         ):
+            (Path(directory) / "settings.ini").write_text(
+                "[OBS Local paths]\nquality = standard\n", encoding="utf-8",
+            )
             menu.run_menu(input_fn=lambda _: next(answers))
 
         install_update.assert_not_called()
+
+    def test_settings_returns_after_update_check_failure_or_no_update(self):
+        for error in (None, menu.updater.UpdateError("network unavailable")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.ini"
+                path.write_text("[OBS Local paths]\nquality = standard\n", encoding="utf-8")
+                update = menu.updater.UpdateInfo(
+                    branch="main", local_revision="a" * 40,
+                    remote_revision="a" * 40, available=False,
+                    is_git_checkout=False,
+                )
+                answers = iter(["6", "0"])
+                with (
+                    patch.object(menu, "get_settings_path", return_value=path),
+                    patch.object(menu.updater, "check_for_updates", return_value=update, side_effect=error),
+                    patch.object(menu.updater, "install_update") as install,
+                ):
+                    self.assertFalse(menu._settings_menu(lambda _: next(answers)))
+                install.assert_not_called()
+
+    def test_main_menu_only_enters_settings_and_does_not_check_updates(self):
+        answers = Mock(side_effect=["3", "0"])
+        with (
+            patch.object(menu, "_settings_menu", return_value=False) as settings,
+            patch.object(menu, "_check_updates") as check,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            menu.run_menu(input_fn=answers)
+        settings.assert_called_once_with(answers)
+        check.assert_not_called()
+        self.assertIn("3. Настройки", output.getvalue())
+        self.assertNotIn("Проверить обновления", output.getvalue())
 
     def test_settings_edits_parameter_and_preserves_comments(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -120,6 +162,84 @@ class MainMenuTests(unittest.TestCase):
             self.assertIn("# keep", text)
             self.assertIn("quality = 2k", text)
             self.assertIn("quality = standard", settings_path.read_text(encoding="utf-8"))
+
+    def test_settings_accepts_google_docs_program_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "settings.ini").write_text(
+                "[Song preparation]\nprogram_url = https://disk.yandex.ru/d/old\n",
+                encoding="utf-8",
+            )
+            url = "https://docs.google.com/document/d/synthetic-program/edit?usp=sharing"
+            answers = iter(["1", url, "0"])
+            with patch.object(menu.app, "BASE_DIR", root):
+                menu._settings_menu(lambda _: next(answers))
+            settings = configparser.ConfigParser()
+            settings.read(menu.get_settings_path(root), encoding="utf-8")
+            self.assertEqual(settings.get("Song preparation", "program_url"), url)
+
+    def test_malformed_legacy_url_does_not_trap_settings_or_updates(self):
+        for answers, expected in (
+            (["0"], "https://[broken"),
+            (["1", "https://disk.yandex.ru/d/repaired", "0"], "https://disk.yandex.ru/d/repaired"),
+            (["6", "0"], "https://[broken"),
+        ):
+            with self.subTest(answers=answers), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.ini"
+                path.write_text("[Song preparation]\nprogram_url = https://[broken\n", encoding="utf-8")
+                input_fn = Mock(side_effect=answers)
+                with (
+                    patch.object(menu, "get_settings_path", return_value=path),
+                    patch.object(menu, "_check_updates", return_value=False) as check,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertFalse(menu._settings_menu(input_fn))
+                self.assertEqual(input_fn.call_count, len(answers))
+                self.assertEqual(check.call_count, int(answers[0] == "6"))
+                settings = configparser.ConfigParser()
+                settings.read(path, encoding="utf-8")
+                self.assertEqual(settings.get("Song preparation", "program_url"), expected)
+
+    def test_settings_exposes_priority_and_cloud_links_for_existing_configs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.ini"
+            path.write_text(
+                "# preserve\n[Song preparation]\nprogram_url = https://disk.yandex.ru/d/old\n",
+                encoding="utf-8",
+            )
+            google_url = "https://docs.google.com/document/d/synthetic-program/edit?usp=sharing"
+            answers = iter(["2", "1", "3", google_url, "2", "2", "0"])
+            with (
+                patch.object(menu, "get_settings_path", return_value=path),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                menu._settings_menu(lambda _: next(answers))
+            settings = configparser.ConfigParser()
+            settings.read(path, encoding="utf-8")
+            self.assertEqual(settings.get("Song preparation", "priority_cloud_disk"), "yandex")
+            self.assertEqual(settings.get("Song preparation", "program_google_url"), google_url)
+            self.assertEqual(settings.get("Song preparation", "program_url"), "https://disk.yandex.ru/d/old")
+            self.assertIn("1. Google", output.getvalue())
+            self.assertIn("2. Яндекс", output.getvalue())
+            self.assertIn("# preserve", path.read_text(encoding="utf-8"))
+
+    def test_settings_rejects_invalid_priority_and_mismatched_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.ini"
+            original = (
+                "[Song preparation]\npriority_cloud_disk = google\n"
+                "program_google_url = https://docs.google.com/document/d/program/edit\n"
+            )
+            path.write_text(original, encoding="utf-8")
+            answers = iter(["1", "bad", "2", "https://disk.yandex.ru/d/wrong-cloud", "0"])
+            with (
+                patch.object(menu, "get_settings_path", return_value=path),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                menu._settings_menu(lambda _: next(answers))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(output.getvalue().count("Не удалось изменить настройки"), 2)
 
     def test_settings_rejects_invalid_quality_and_keeps_value(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -158,7 +278,7 @@ class MainMenuTests(unittest.TestCase):
             (local / "config.ini").write_text(
                 "[YandexDisk]\ntoken = old\n", encoding="utf-8"
             )
-            answers = iter(["3", "0"])
+            answers = iter(["6", "0"])
             with (
                 patch.object(menu.app, "BASE_DIR", local),
                 patch.object(menu.app, "PROJECT_DIR", root),
