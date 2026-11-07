@@ -1123,6 +1123,49 @@ class SongOutputTests(unittest.TestCase):
         self.assertEqual(second_results[1].status, "ready")
         self.assertEqual(second_results[1].title, "Песня вторая")
 
+    def test_legacy_alias_for_decomposed_title_still_finds_material(self):
+        for title in ("Долг мои\u0306 уплатил", "Долг мой уплатил"):
+            with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                zip_dir = root / "zip"
+                zip_dir.mkdir()
+                archive_path = zip_dir / "Alt title.zip"
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("slide_1.png", PNG)
+                aliases_path = root / "aliases.json"
+                aliases_path.write_text(
+                    '{"долг мои уплатил": "Alt title"}', encoding="utf-8"
+                )
+                aliases = prepare_songs.load_song_title_aliases(aliases_path)
+                staging = root / "output"
+                staging.mkdir()
+                results = asyncio.run(prepare_songs._process_songs(
+                    [title], staging,
+                    {"zip_dir": zip_dir, "pptx_dir": root / "pptx",
+                     "quality": "standard"},
+                    None, root, aliases,
+                ))
+                self.assertEqual(results[0].status, "ready")
+                self.assertEqual(results[0].source, str(archive_path))
+                self.assertEqual(results[0].title, title)
+
+    def test_nfc_alias_takes_precedence_over_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "output"
+            staging.mkdir()
+            aliases = {"долг мой уплатил": "Current", "долг мои уплатил": "Legacy"}
+            with patch.object(
+                prepare_songs, "_process_song", new_callable=AsyncMock,
+                return_value=prepare_songs.SongResult(
+                    "Current", staging / "song", status="ready"
+                ),
+            ) as process:
+                asyncio.run(prepare_songs._process_songs(
+                    ["Долг мои\u0306 уплатил"], staging, {}, None, root, aliases
+                ))
+            self.assertEqual(process.await_args.args[0], "Current")
+
     def test_saved_alias_falls_back_to_original_title_if_alias_is_missing(self):
         with tempfile.TemporaryDirectory(
             dir="/dev/shm" if Path("/dev/shm").is_dir() else None

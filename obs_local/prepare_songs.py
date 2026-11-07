@@ -249,7 +249,11 @@ def _table_rows(table: ElementTree.Element) -> list[list[str]]:
 
 
 def _normalize(value: str) -> str:
-    normalized = unicodedata.normalize("NFC", value).casefold().replace("ё", "е")
+    return _legacy_normalize(unicodedata.normalize("NFC", value))
+
+
+def _legacy_normalize(value: str) -> str:
+    normalized = value.casefold().replace("ё", "е")
     return re.sub(r"[\W_]+", " ", normalized, flags=re.UNICODE).strip()
 
 
@@ -1413,7 +1417,15 @@ async def _process_songs(
     aliases = aliases or {}
     for index, title in enumerate(songs, 1):
         song_dir = staging / _song_folder_name(index, title)
-        search_title = aliases.get(_normalize(title), title        )
+        search_title = aliases.get(
+            _normalize(title),
+            aliases.get(
+                _legacy_normalize(title),
+                aliases.get(
+                    _legacy_normalize(unicodedata.normalize("NFD", title)), title
+                ),
+            ),
+        )
         result = await _process_song(
             search_title, song_dir, config, client, temp_root
         )
