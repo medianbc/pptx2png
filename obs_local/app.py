@@ -27,7 +27,7 @@ from pptx2png_core.yandex_disk import (
 )
 
 from .config_utils import update_ini_file as _update_ini_file
-from .config_utils import get_settings_path
+from .config_utils import get_settings_path, parse_local_file_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -221,7 +221,7 @@ async def download_presentation(
             except EOFError as error:
                 raise OperationCancelled from error
 
-            local_path = Path(answer.strip("\"'")).expanduser()
+            local_path = parse_local_file_path(answer)
             if local_path.suffix.lower() not in {".ppt", ".pptx"}:
                 print("Укажите путь к файлу .ppt или .pptx.")
                 continue

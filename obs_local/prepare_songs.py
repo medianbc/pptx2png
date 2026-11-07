@@ -28,7 +28,12 @@ import aiohttp
 from pptx2png_core.converter_engine import convert_all_pngs
 from pptx2png_core.yandex_disk import YandexDiskClient, get_nearest_sunday
 
-from .config_utils import default_log_dir, get_settings_path, update_ini_file
+from .config_utils import (
+    default_log_dir,
+    get_settings_path,
+    parse_local_file_path,
+    update_ini_file,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1263,9 +1268,7 @@ async def run(
                                 if not answer:
                                     continue
 
-                                local_program = Path(
-                                    answer.strip("\"' ")
-                                ).expanduser()
+                                local_program = parse_local_file_path(answer)
                                 if not local_program.is_file():
                                     print(
                                         f"Файл не найден: {local_program}. "
