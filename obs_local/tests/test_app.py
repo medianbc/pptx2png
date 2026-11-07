@@ -127,8 +127,11 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
 
     def test_missing_remote_presentation_accepts_a_local_file(self):
         paths = {"source": "/presentations/service"}
-        local_presentation = self.temp_dir / "local-deck.pptx"
+        local_presentation = self.temp_dir / "local deck.pptx"
         local_presentation.write_bytes(b"synthetic pptx placeholder")
+        escaped_path = '"' + str(local_presentation).replace(
+            " ", r"\ " if os.name != "nt" else " "
+        ) + '" '
         with (
             patch.object(
                 app.aiohttp, "ClientSession", return_value=self.session_context
@@ -152,7 +155,7 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
                     self.config,
                     datetime(2026, 11, 8),
                     self.temp_dir,
-                    input_fn=Mock(side_effect=["2", str(local_presentation)]),
+                    input_fn=Mock(side_effect=["2", escaped_path]),
                 )
             )
 

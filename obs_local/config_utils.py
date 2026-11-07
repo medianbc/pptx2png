@@ -11,6 +11,16 @@ import tempfile
 from pathlib import Path
 
 
+def parse_local_file_path(value: str) -> Path:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    path = Path(value).expanduser()
+    if sys.platform != "win32" and not path.is_file():
+        path = Path(value.replace(r"\ ", " ")).expanduser()
+    return path
+
+
 def get_settings_path(base_dir: Path) -> Path:
     """Initialize an independent OS configuration from the legacy settings once."""
     platform = {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
