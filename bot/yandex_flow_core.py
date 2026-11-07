@@ -736,7 +736,7 @@ async def drain_deferred_cleanups(timeout: float = 30.0) -> None:
 # ==========================================
 
 async def _yd_prepare_files_impl(
-    callback: types.CallbackQuery,
+    callback: Optional[types.CallbackQuery],
     bot: Bot,
     SHM_DIR: str,
     user_mgr,
@@ -745,11 +745,17 @@ async def _yd_prepare_files_impl(
     paths: dict,
     session_key: str,
     nonce: str,
+    status_msg=None,
+    owner_user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
 ):
     """Первая фаза: скачивание + извлечение заметок + детект категорий."""
-    status_msg = callback.message
-    owner_user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
+    if callback is not None:
+        status_msg = callback.message
+        owner_user_id = callback.from_user.id
+        chat_id = callback.message.chat.id
+    if status_msg is None or owner_user_id is None or chat_id is None:
+        raise ValueError("Для подготовки файла нужны сообщение, пользователь и чат")
 
     task_id = f"yd_task_{secrets.token_hex(6)}"
     task_dir = Path(SHM_DIR) / task_id
@@ -862,26 +868,52 @@ async def _yd_prepare_files_impl(
             per_file_dir = task_dir / f"src_{f_idx}"
             per_file_dir.mkdir(exist_ok=True)
 
-            base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
+            local_source = pptx_item.get("local_path")
+            if local_source:
+                base_dl_text = (
+                    f"📄 Подготавливаю загруженный файл "
+                    f"<code>{file_name_esc}</code>"
+                )
+            else:
+                base_dl_text = f"📥 Скачиваю <code>{file_name_esc}</code>"
             await _safe_edit(
                 status_msg,
                 base_dl_text,
                 parse_mode="HTML",
                 reply_markup=_get_cancel_keyboard(task_id).as_markup(),
             )
-
             local_pptx = per_file_dir / file_name
-            ok = await _yd_with_spinner(
-                status_msg,
-                task_id,
-                base_dl_text,
-                _yd_async_protected(
+            local_pptx = per_file_dir / file_name
+            if local_source:
+                try:
+                    await _yd_with_spinner(
+                        status_msg,
+                        task_id,
+                        base_dl_text,
+                        _yd_to_thread(
+                            task_id, shutil.copy2, Path(local_source), local_pptx
+                        ),
+                    )
+                    ok = local_pptx.is_file() and local_pptx.stat().st_size > 0
+                except Exception as e:
+                    logging.error(
+                        f"[YD-PREP] {file_name}: копирование загруженного "
+                        f"файла провалилось: {e}",
+                        exc_info=True,
+                    )
+                    ok = False
+            else:
+                ok = await _yd_with_spinner(
+                    status_msg,
                     task_id,
-                    yandex_state.config.client.download_file(
-                        pptx_item["path"], local_pptx
+                    base_dl_text,
+                    _yd_async_protected(
+                        task_id,
+                        yandex_state.config.client.download_file(
+                            pptx_item["path"], local_pptx
+                        ),
                     ),
-                ),
-            )
+                )
             if not ok:
                 logging.error(f"[YD-PREP] {file_name}: скачивание провалилось")
                 prepared.append({
@@ -1174,7 +1206,7 @@ async def _yd_prepare_files_impl(
 
 
 async def _yd_prepare_files(
-    callback: types.CallbackQuery,
+    callback: Optional[types.CallbackQuery],
     bot: Bot,
     SHM_DIR: str,
     user_mgr,
@@ -1183,22 +1215,57 @@ async def _yd_prepare_files(
     paths: dict,
     session_key: str,
     nonce: str,
+    status_msg=None,
+    owner_user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
 ) -> asyncio.Task:
     """Запускает _yd_prepare_files_impl как detached worker."""
     temp_task_id = f"yd_pending_{secrets.token_hex(4)}"
 
     async def _factory():
-        await _yd_prepare_files_impl(
-            callback=callback,
-            bot=bot,
-            SHM_DIR=SHM_DIR,
-            user_mgr=user_mgr,
-            files_to_process=files_to_process,
-            sunday=sunday,
-            paths=paths,
-            session_key=session_key,
-            nonce=nonce,
-        )
+        try:
+            await _yd_prepare_files_impl(
+                callback=callback,
+                bot=bot,
+                SHM_DIR=SHM_DIR,
+                user_mgr=user_mgr,
+                files_to_process=files_to_process,
+                sunday=sunday,
+                paths=paths,
+                session_key=session_key,
+                nonce=nonce,
+                status_msg=status_msg,
+                owner_user_id=owner_user_id,
+                chat_id=chat_id,
+            )
+        finally:
+            for item in files_to_process:
+                local_path = item.get("local_path")
+                if not local_path:
+                    continue
+                source = Path(local_path)
+                if (
+                    not source.parent.name.startswith("yd_upload_")
+                    or source.parent.parent.resolve() != Path(SHM_DIR).resolve()
+                ):
+                    logging.warning(
+                        f"[YD-PREP] Отказ от удаления файла вне staging-каталога: "
+                        f"{source}"
+                    )
+                    continue
+                try:
+                    source.unlink(missing_ok=True)
+                    source.parent.rmdir()
+                except OSError as e:
+                    logging.warning(
+                        f"[YD-PREP] Не удалось удалить временный файл "
+                        f"загрузки {source}: {e}"
+                    )
+                finally:
+                    async with yd_session_lock:
+                        yandex_state.yd_active_uploads.discard(
+                            source.parent.name
+                        )
 
     return await _run_worker_detached(
         temp_task_id, _factory, name="prepare",

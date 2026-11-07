@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import getpass
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,36 +26,99 @@ from pptx2png_core.yandex_disk import (
     resolve_sunday_paths,
 )
 
+from .config_utils import update_ini_file as _update_ini_file
+
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 CATEGORIES = {"sermon": "Проповедь", "opening": "Начало", "prayer": "Молитва"}
+DEFAULT_ROOT_PATH = "./obs_png"
 
 
-def load_config() -> dict[str, Any]:
+class OperationCancelled(Exception):
+    """Raised when the operator cancels an interactive OBS preparation."""
+
+
+def _read_yandex_token() -> str:
+    for path in (BASE_DIR / "config.ini", PROJECT_DIR / "config.ini"):
+        if not path.is_file():
+            continue
+        secrets = configparser.ConfigParser(interpolation=None)
+        secrets.read(path, encoding="utf-8")
+        token = secrets.get("YandexDisk", "token", fallback="").strip()
+        if token:
+            return token
+    return ""
+
+
+def load_config(
+    *,
+    interactive: bool = False,
+    input_fn=None,
+    secret_input_fn=None,
+) -> dict[str, Any]:
+    input_fn = input_fn or input
+    secret_input_fn = secret_input_fn or getpass.getpass
     settings = configparser.ConfigParser(interpolation=None)
-    secrets = configparser.ConfigParser(interpolation=None)
     settings_path = BASE_DIR / "settings.ini"
-    secrets_path = BASE_DIR / "config.ini"
-    if not secrets_path.exists():
-        secrets_path = PROJECT_DIR / "config.ini"
 
     if not settings.read(settings_path, encoding="utf-8"):
         raise RuntimeError(f"Не найден файл настроек: {settings_path}")
-    if not secrets.read(secrets_path, encoding="utf-8"):
-        raise RuntimeError(f"Не найден файл секретов: {secrets_path}")
 
-    token = secrets.get("YandexDisk", "token", fallback="").strip()
-    base_path = settings.get("YandexDisk", "base_path", fallback="").strip()
-    source_folder = settings.get(
-        "YandexDisk", "source_folder", fallback="Служение"
-    ).strip()
-    root_value = settings.get(
-        "OBS Local paths", "root_path", fallback=""
-    ).strip()
-    quality = settings.get(
-        "OBS Local paths", "quality", fallback="standard"
-    ).strip().lower()
+    def setting(section: str, option: str, fallback: str = "") -> str:
+        if not settings.has_section(section):
+            return fallback
+        return settings.get(section, option, fallback=fallback).strip()
+
+    base_path = setting("YandexDisk", "base_path")
+    source_folder = setting("YandexDisk", "source_folder", "Служение")
+    root_value = setting("OBS Local paths", "root_path")
+    quality = setting("OBS Local paths", "quality").lower()
+
+    settings_updates: dict[str, dict[str, str]] = {}
+    if not base_path and interactive:
+        base_path = input_fn(
+            "Путь к папке Яндекс.Диска с презентациями: "
+        ).strip()
+        if not base_path or "\n" in base_path:
+            raise RuntimeError("Путь к папке Яндекс.Диска не задан")
+        settings_updates.setdefault("YandexDisk", {})["base_path"] = base_path
+
+    if not root_value and interactive:
+        root_value = (
+            input_fn(
+                f"Локальный каталог для PNG [{DEFAULT_ROOT_PATH}]: "
+            ).strip()
+            or DEFAULT_ROOT_PATH
+        )
+        if "\n" in root_value:
+            raise RuntimeError("Путь для PNG должен быть одной строкой")
+        settings_updates.setdefault("OBS Local paths", {})["root_path"] = root_value
+
+    if quality not in {"standard", "2k", "4k"} and interactive:
+        while True:
+            quality = input_fn(
+                "Качество PNG [standard/2k/4k, по умолчанию standard]: "
+            ).strip().lower() or "standard"
+            if quality in {"standard", "2k", "4k"}:
+                break
+            print("Введите standard, 2k или 4k.")
+        settings_updates.setdefault("OBS Local paths", {})["quality"] = quality
+
+    if settings_updates:
+        _update_ini_file(settings_path, settings_updates)
+        settings.read(settings_path, encoding="utf-8")
+
+    token = _read_yandex_token()
+    if not token and interactive:
+        token = secret_input_fn("OAuth-токен Яндекс.Диска: ").strip()
+        if not token or "\n" in token:
+            raise RuntimeError("OAuth-токен Яндекс.Диска не задан")
+        _update_ini_file(
+            BASE_DIR / "config.ini",
+            {"YandexDisk": {"token": token}},
+            file_mode=0o600,
+        )
 
     if not token:
         raise RuntimeError("В config.ini не задан [YandexDisk] token")
@@ -68,18 +133,16 @@ def load_config() -> dict[str, Any]:
     if not root_path.is_absolute():
         root_path = PROJECT_DIR / root_path
 
-    legacy_keyword = settings.get(
-        "YandexDisk", "sermon_keyword", fallback="проповед"
-    )
+    legacy_keyword = setting("YandexDisk", "sermon_keyword", "проповед")
     raw_keywords = {
-        "sermon": settings.get(
-            "SlideCategories", "sermon_keywords", fallback=legacy_keyword
+        "sermon": setting(
+            "SlideCategories", "sermon_keywords", legacy_keyword
         ),
-        "opening": settings.get(
-            "SlideCategories", "opening_keywords", fallback="начало,в начале"
+        "opening": setting(
+            "SlideCategories", "opening_keywords", "начало,в начале"
         ),
-        "prayer": settings.get(
-            "SlideCategories", "prayer_keywords", fallback="молитва,молиться"
+        "prayer": setting(
+            "SlideCategories", "prayer_keywords", "молитва,молиться"
         ),
     }
     keywords = {
@@ -98,28 +161,73 @@ def load_config() -> dict[str, Any]:
 
 
 async def download_presentation(
-    config: dict[str, Any], sunday: datetime, temp_dir: Path
+    config: dict[str, Any],
+    sunday: datetime,
+    temp_dir: Path,
+    input_fn: Callable[[str], str] | None = None,
 ) -> Path:
+    if input_fn is None:
+        input_fn = input
+
     async with aiohttp.ClientSession() as http_session:
         client = YandexDiskClient(config["token"], http_session)
         accessible, error = await client.check_access()
         if not accessible:
             raise RuntimeError(f"Нет доступа к Яндекс.Диску: {error}")
 
-        paths = await resolve_sunday_paths(
-            client,
-            config["base_path"],
-            sunday,
-            source_folder=config["source_folder"],
-        )
-        if not paths:
-            raise RuntimeError(f"Не найдена папка служения за {sunday:%d.%m.%Y}")
-
-        files = await find_pptx_in_source(client, paths["source"], sunday)
-        if not files:
-            raise RuntimeError(
-                f"В {paths['source']} не найдены PPT/PPTX за {sunday:%d.%m.%Y}"
+        while True:
+            paths = await resolve_sunday_paths(
+                client,
+                config["base_path"],
+                sunday,
+                source_folder=config["source_folder"],
             )
+            files = (
+                await find_pptx_in_source(client, paths["source"], sunday)
+                if paths
+                else []
+            )
+            if files:
+                break
+
+            if paths:
+                problem = (
+                    f"В папке служения не найдены PPT/PPTX "
+                    f"за {sunday:%d.%m.%Y}."
+                )
+            else:
+                problem = f"Папка служения за {sunday:%d.%m.%Y} не найдена."
+            print(f"\n{problem}")
+            print("Можно продолжить подготовку одним из способов:")
+            print("  Enter       — повторить поиск на Яндекс.Диске")
+            print("  путь к PPTX — открыть локальный файл (.pptx или .ppt)")
+            print("  esc / exit  — введите для возврата в меню")
+            try:
+                answer = input_fn("Ваш выбор: ").strip()
+            except EOFError as error:
+                raise OperationCancelled from error
+
+            if answer.lower() in {
+                "\x1b",
+                "esc",
+                "exit",
+                "quit",
+                "q",
+                "выход",
+                "отмена",
+            }:
+                raise OperationCancelled
+            if not answer:
+                continue
+
+            local_path = Path(answer.strip("\"'")).expanduser()
+            if local_path.suffix.lower() not in {".ppt", ".pptx"}:
+                print("Укажите путь к файлу .ppt или .pptx.")
+                continue
+            if not local_path.is_file():
+                print(f"Файл не найден: {local_path}")
+                continue
+            return local_path
 
         print(f"\nПрезентации на {sunday:%d.%m.%Y}:")
         for index, item in enumerate(files, start=1):
@@ -127,7 +235,10 @@ async def download_presentation(
 
         while True:
             try:
-                choice = int(input("Номер презентации: ").strip()) - 1
+                answer = input_fn("Номер презентации [0 — отмена]: ").strip()
+                if answer.lower() in {"0", "q", "cancel", "отмена"}:
+                    raise OperationCancelled
+                choice = int(answer) - 1
             except ValueError:
                 choice = -1
             if 0 <= choice < len(files):
@@ -169,30 +280,120 @@ def _find_categories(
 
 def _select_range(
     results: dict[str, tuple[int | None, int | None, list[int]]], total_slides: int
-) -> tuple[str, int, int]:
-    print("\nВыберите: all, sermon, opening или prayer.")
+) -> tuple[str, list[tuple[int, int]]]:
     while True:
-        category = input("Категория [all]: ").strip().lower() or "all"
-        if category == "all" or category in CATEGORIES:
-            break
-        print("Неизвестная категория.")
+        print("\nВыберите способ обработки:")
+        print("  all      — все слайды")
+        print("  category — категория по заметкам или заданный вручную диапазон")
+        print("  custom   — произвольные номера и диапазоны")
+        print("  cancel   — отменить")
+        mode = input("Режим [all]: ").strip().lower() or "all"
+        aliases = {
+            "1": "all",
+            "2": "category",
+            "3": "custom",
+            "q": "cancel",
+            "отмена": "cancel",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"all", "category", "custom", "cancel"}:
+            print("Введите all, category, custom или cancel.")
+            continue
+        if mode == "cancel":
+            raise OperationCancelled
+        if mode == "all":
+            return "all", [(1, total_slides)]
 
-    if category == "all":
-        return category, 1, total_slides
+        category = "custom"
+        default = ""
+        if mode == "category":
+            print("\nКатегории:")
+            categories = list(CATEGORIES)
+            for index, key in enumerate(categories, start=1):
+                start, end, _ = results[key]
+                suggested = f"{start}-{end}" if start is not None else "не найден"
+                print(f"  {index}. {CATEGORIES[key]} ({suggested})")
+            while True:
+                answer = input("Номер категории [0 — назад]: ").strip()
+                if answer == "0":
+                    break
+                try:
+                    category_index = int(answer) - 1
+                except ValueError:
+                    category_index = -1
+                if 0 <= category_index < len(categories):
+                    category = categories[category_index]
+                    break
+                print("Введите номер категории из списка.")
+            if answer == "0":
+                continue
 
-    start, end, _ = results[category]
-    default = f"{start}-{end}" if start is not None and end is not None else ""
-    if not default:
-        print("Диапазон по заметкам не найден; введите его вручную.")
+            start, end, _ = results[category]
+            if start is not None and end is not None:
+                default = f"{start}-{end}"
+            else:
+                print("Диапазон по заметкам не найден; задайте его вручную.")
 
+        while True:
+            value = input(
+                f"Слайды [{default or 'обязательно'}; формат 1, 3-5]: "
+            ).strip() or default
+            try:
+                return category, _parse_slide_ranges(value, total_slides)
+            except ValueError as error:
+                print(f"{error} Например: 1, 3-5, 8.")
+
+
+def _parse_slide_ranges(value: str, total_slides: int) -> list[tuple[int, int]]:
+    if not value.strip():
+        raise ValueError("Введите хотя бы один слайд или диапазон.")
+
+    ranges = []
+    for part in value.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:[-–]\s*(\d+)\s*)?", part)
+        if not match:
+            raise ValueError(f"Некорректный диапазон: {part.strip()!r}.")
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if first < 1 or last < first or last > total_slides:
+            raise ValueError(
+                f"Номера слайдов должны быть от 1 до {total_slides}; "
+                f"получено {part.strip()!r}."
+            )
+        ranges.append((first, last))
+
+    merged = []
+    for first, last in sorted(set(ranges)):
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+        else:
+            merged.append((first, last))
+    return merged
+
+
+def _confirm_selection(
+    category: str,
+    ranges: list[tuple[int, int]],
+    total_slides: int,
+    input_fn=input,
+) -> bool:
+    selected = ", ".join(
+        str(first) if first == last else f"{first}-{last}"
+        for first, last in ranges
+    )
+    count = sum(last - first + 1 for first, last in ranges)
+    print(f"\nВыбрано: {selected} ({count} из {total_slides} слайдов)")
+    print(f"Каталог категории: {CATEGORIES.get(category, category)}")
     while True:
-        value = input(f"Диапазон [{default}]: ").strip() or default
-        match = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", value)
-        if match:
-            first, last = map(int, match.groups())
-            if 1 <= first <= last <= total_slides:
-                return category, first, last
-        print(f"Введите диапазон от 1 до {total_slides}, например 5-30.")
+        answer = input_fn("Продолжить? [Y — да, E — изменить, Q — отмена]: ")
+        answer = answer.strip().lower()
+        if answer in {"", "y", "yes", "д", "да"}:
+            return True
+        if answer in {"e", "edit", "и", "изменить"}:
+            return False
+        if answer in {"q", "quit", "cancel", "отмена"}:
+            raise OperationCancelled
+        print("Введите Y, E или Q.")
 
 
 def _safe_name(value: str) -> str:
@@ -215,16 +416,20 @@ async def prepare_obs_folder(
 
         results = _find_categories(notes, config["keywords"])
         total_slides = len(Presentation(str(normalized)).slides)
-        category, first, last = _select_range(results, total_slides)
+        while True:
+            category, ranges = _select_range(results, total_slides)
+            if _confirm_selection(category, ranges, total_slides):
+                break
 
         render_dir = temp_dir / "rendered"
         render_dir.mkdir()
         png_paths, _ = await convert_all_pngs(
             normalized, render_dir, config["quality"]
         )
-        if last > len(png_paths):
+        highest_slide = max(last for _, last in ranges)
+        if highest_slide > len(png_paths):
             raise RuntimeError(
-                f"В PDF {len(png_paths)} страниц, а выбран диапазон до {last}"
+                f"В PDF {len(png_paths)} страниц, а выбран слайд {highest_slide}"
             )
 
         run_id = datetime.now().strftime("%H%M%S_%f")
@@ -236,13 +441,14 @@ async def prepare_obs_folder(
             / category
         )
         output_dir.mkdir(parents=True, exist_ok=False)
-        for png_path in png_paths[first - 1 : last]:
-            shutil.copy2(png_path, output_dir / png_path.name)
+        for first, last in ranges:
+            for png_path in png_paths[first - 1 : last]:
+                shutil.copy2(png_path, output_dir / png_path.name)
         return output_dir
 
 
 async def run(date: datetime | None = None) -> Path:
-    config = load_config()
+    config = load_config(interactive=True)
     sunday = date or get_nearest_sunday()
     config["root_path"].mkdir(parents=True, exist_ok=True)
 
@@ -274,5 +480,7 @@ def main() -> None:
 
     try:
         asyncio.run(run(selected_date))
+    except OperationCancelled:
+        print("Подготовка отменена.")
     except Exception as error:
         parser.exit(1, f"Ошибка: {error}\n")

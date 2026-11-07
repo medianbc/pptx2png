@@ -26,3 +26,6 @@ __pycache__/
 # Локальные материалы и результаты OBS
 song_assets/
 obs_png/
+obs_local/song_title_aliases.json
+.pptx2png-version.json
+.pptx2png-files.json

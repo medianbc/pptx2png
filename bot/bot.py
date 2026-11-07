@@ -20,11 +20,12 @@ import aiohttp
 
 from .user_manager import UserManager
 from .handlers import router, task_lock_manager
+from .folder_setup import folder_setup_loop
 
 # ✅ Yandex-подсистема: конфиг и состояние
 from . import yandex_state
 from pptx2png_core.yandex_disk import YandexDiskClient
-from .yandex_state import yd_active_tasks, yd_session_lock
+from .yandex_state import yd_active_tasks, yd_active_uploads, yd_session_lock
 
 
 # ==========================================
@@ -117,7 +118,19 @@ def setup_environment():
             "⚠️ sermon_keyword пустой — использую значение по умолчанию 'проповед'"
         )
         yandex_sermon_keyword = "проповед"
-    yandex_template_file = settings_config.get("YandexDisk", "template_file", fallback="template.yaml").strip()
+    yandex_template_file = settings_config.get(
+        "YandexDisk", "template_file", fallback="template.yaml"
+    ).strip()
+    yandex_template_path = Path(yandex_template_file).expanduser()
+    if not yandex_template_path.is_absolute():
+        yandex_template_path = app_dir / yandex_template_path
+
+    folder_setup_enabled = settings_config.getboolean(
+        "FolderSetup", "enabled", fallback=True
+    )
+    folder_setup_interval_sec = settings_config.getint(
+        "FolderSetup", "retry_interval_sec", fallback=600
+    )
 
     # ✅ Таймауты и cleanup (из settings.ini, секция [Timeouts])
     prompt_timeout_sec = settings_config.getint(
@@ -146,9 +159,14 @@ def setup_environment():
         _invalid.append(
             f"Timeouts.cleanup_max_age_sec={cleanup_max_age_sec} (нужно > 0)"
         )
+    if folder_setup_interval_sec <= 0:
+        _invalid.append(
+            "FolderSetup.retry_interval_sec="
+            f"{folder_setup_interval_sec} (нужно > 0)"
+        )
     if _invalid:
         msg = (
-            "❌ Ошибка в settings.ini, секция [Timeouts]:\n  "
+            "❌ Ошибка в settings.ini:\n  "
             + "\n  ".join(_invalid)
         )
         print(msg, file=sys.stderr)
@@ -199,6 +217,9 @@ def setup_environment():
         "yandex_opening_folder": yandex_opening_folder,  # ✅ НОВОЕ
         "yandex_sermon_keyword": yandex_sermon_keyword,
         "yandex_template_file": yandex_template_file,
+        "yandex_template_path": yandex_template_path,
+        "folder_setup_enabled": folder_setup_enabled,
+        "folder_setup_interval_sec": folder_setup_interval_sec,
         # ✅ Таймауты
         "prompt_timeout_sec": prompt_timeout_sec,
         "cleanup_interval_sec": cleanup_interval_sec,
@@ -256,13 +277,14 @@ async def cleanup_old_tasks_async(shm_dir: Path, max_age_seconds: int = 7200):
     current_time = time.time()
     deleted = 0
 
-    # ✅ Снимок активных Yandex-задач под локом
+    # Снимок активных Yandex-задач и загруженных для /sunday файлов.
     async with yd_session_lock:
-        active_yd = set(yd_active_tasks)
+        active_yd = set(yd_active_tasks) | set(yd_active_uploads)
 
     for item in shm_dir.iterdir():
-        # ✅ Обрабатываем и task_*, и yd_task_*
-        if not item.is_dir() or not item.name.startswith(("task_", "yd_task_")):
+        if not item.is_dir() or not item.name.startswith(
+            ("task_", "yd_task_", "yd_upload_")
+        ):
             continue
         task_id = item.name
 
@@ -381,6 +403,13 @@ def create_bot_and_dispatcher(cfg: dict):
                 callback_data="toggle_cat_other",
             ),
         )
+        if user_id == cfg["admin_id"]:
+            b.row(
+                InlineKeyboardButton(
+                    text="🛠 Доп. функции",
+                    callback_data="admin_tools",
+                )
+            )
         return b.as_markup()
 
     async def check_access_by_user(user: types.User, bot: Bot) -> bool:
@@ -421,6 +450,7 @@ def create_bot_and_dispatcher(cfg: dict):
         "http_session": http_session,
         "bot": bot,
         "ADMIN_ID": cfg["admin_id"],
+        "YANDEX_TEMPLATE_PATH": cfg["yandex_template_path"],
     })
 
     dp.include_router(router)
@@ -442,6 +472,22 @@ async def main():
     logging.info(f"📄 Логи: {cfg['log_dir']}")
 
     bot, dp, user_mgr, http_session = create_bot_and_dispatcher(cfg)
+    folder_setup_task = None
+    if cfg["folder_setup_enabled"]:
+        if yandex_state.config.client is None:
+            logging.warning(
+                "⚠️ Автосоздание папок отключено: Яндекс.Диск не настроен"
+            )
+        else:
+            folder_setup_task = asyncio.create_task(
+                folder_setup_loop(
+                    yandex_state.config.client,
+                    yandex_state.config.base_path,
+                    cfg["yandex_template_path"],
+                    interval_sec=cfg["folder_setup_interval_sec"],
+                ),
+                name="yandex-sunday-folder-setup",
+            )
 
     # ✅ Cleaner с параметрами из settings.ini
     asyncio.create_task(cleanup_loop(
@@ -464,6 +510,13 @@ async def main():
         logging.error(f"❌ Критическая ошибка в поллинге: {e}", exc_info=True)
         raise
     finally:
+        if folder_setup_task is not None:
+            folder_setup_task.cancel()
+            try:
+                await folder_setup_task
+            except asyncio.CancelledError:
+                pass
+
         # ✅ Дожидаемся отложенных cleanup из yandex_flow, чтобы
         # папки задач на /dev/shm были удалены, а не брошены.
         # Делаем это ДО закрытия session.

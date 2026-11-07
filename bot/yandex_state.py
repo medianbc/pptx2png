@@ -59,6 +59,9 @@ yd_active_sessions: Dict[str, str] = {}
 # Реестр активных Yandex-задач (защита от cleaner)
 yd_active_tasks: Set[str] = set()
 
+# Каталоги файлов, загруженных для /sunday и ещё используемых.
+yd_active_uploads: Set[str] = set()
+
 
 # ==========================================
 # НИЗКОУРОВНЕВЫЕ ПРИМИТИВЫ БЛОКИРОВОК

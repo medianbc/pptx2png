@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import logging
 import tempfile
@@ -6,7 +7,7 @@ import unittest
 import zipfile
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from xml.etree import ElementTree
 
 from obs_local import prepare_songs
@@ -136,6 +137,80 @@ class SongMatchingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_program_url_is_prompted_and_validated_before_save(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            obs_dir = Path(directory) / "obs_local"
+            obs_dir.mkdir()
+            settings_path = obs_dir / "settings.ini"
+            settings_path.write_text(
+                "# Preserve this comment.\n"
+                "[Song preparation]\n"
+                "local_zip_dir = ./song_assets/zip\n",
+                encoding="utf-8",
+            )
+            config = {"program_url": ""}
+            answers = iter(
+                [
+                    "https://docs.yandex.ru/view/d/not-a-public-key",
+                    "https://disk.yandex.ru/d/public-program",
+                ]
+            )
+
+            with patch.object(prepare_songs, "BASE_DIR", obs_dir):
+                result = prepare_songs.ensure_program_url(
+                    config, input_fn=lambda _: next(answers)
+                )
+
+            saved = settings_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result, "https://disk.yandex.ru/d/public-program")
+        self.assertEqual(config["program_url"], "")
+        self.assertIn("# Preserve this comment.", saved)
+        self.assertNotIn("program_url =", saved)
+
+    def test_song_title_aliases_are_saved_and_loaded(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            aliases_path = Path(directory) / "song_title_aliases.json"
+            aliases = {"песня вторая": "Другое название"}
+            prepare_songs.save_song_title_aliases(aliases, aliases_path)
+
+            self.assertEqual(
+                prepare_songs.load_song_title_aliases(aliases_path), aliases
+            )
+            self.assertFalse(
+                list(Path(directory).glob(".song_title_aliases.json.*"))
+            )
+
+    def test_macos_uses_user_log_directory_instead_of_linux_shm_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            obs_dir = project_dir / "obs_local"
+            obs_dir.mkdir()
+            (obs_dir / "settings.ini").write_text(
+                "[OBS Local paths]\n"
+                "root_path = ./obs_png\n"
+                "[Logging]\n"
+                "log_dir = /dev/shm/pptx2png_tasks/obs_local/logs\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(prepare_songs, "BASE_DIR", obs_dir),
+                patch.object(prepare_songs, "PROJECT_DIR", project_dir),
+                patch.object(prepare_songs.sys, "platform", "darwin"),
+                patch.object(Path, "home", return_value=project_dir),
+            ):
+                config = prepare_songs.load_config()
+
+        self.assertEqual(
+            config["log_dir"],
+            project_dir / "Library" / "Logs" / "pptx2png" / "obs_local",
+        )
+
     def test_png_zip_paths_url_and_cache_flag_are_loaded(self):
         with tempfile.TemporaryDirectory() as directory:
             project_dir = Path(directory)
@@ -214,6 +289,20 @@ class ConfigTests(unittest.TestCase):
 
 
 class SongOutputTests(unittest.TestCase):
+    def test_network_errors_have_actionable_user_message(self):
+        self.assertIn(
+            "Проверьте интернет-подключение",
+            prepare_songs.format_user_error(
+                prepare_songs.aiohttp.ClientConnectionError()
+            ),
+        )
+
+    def test_timeout_errors_have_actionable_user_message(self):
+        self.assertIn(
+            "Истекло время ожидания",
+            prepare_songs.format_user_error(TimeoutError()),
+        )
+
     def test_docs_view_link_is_rejected_as_not_a_disk_public_key(self):
         docs_url = (
             "https://docs.yandex.ru/view/d/"
@@ -275,6 +364,41 @@ class SongOutputTests(unittest.TestCase):
                 root_logger.addHandler(handler)
             root_logger.setLevel(original_level)
 
+    def test_traceback_is_kept_in_debug_log_but_hidden_from_normal_console(self):
+        root_logger = logging.getLogger()
+        original_handlers = root_logger.handlers[:]
+        original_level = root_logger.level
+        try:
+            with tempfile.TemporaryDirectory(
+                dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+            ) as directory, contextlib.redirect_stderr(io.StringIO()) as console:
+                prepare_songs.setup_logging(Path(directory))
+                try:
+                    raise RuntimeError("synthetic failure")
+                except RuntimeError as error:
+                    prepare_songs.log_user_error(
+                        error, "Проверка понятного сообщения"
+                    )
+                for handler in root_logger.handlers:
+                    handler.flush()
+
+                console_output = console.getvalue()
+                debug_output = (
+                    Path(directory) / "debug.log"
+                ).read_text(encoding="utf-8")
+
+            self.assertNotIn("Traceback", console_output)
+            self.assertIn("Проверка понятного сообщения", console_output)
+            self.assertIn("Traceback", debug_output)
+            self.assertIn("synthetic failure", debug_output)
+        finally:
+            for handler in root_logger.handlers[:]:
+                root_logger.removeHandler(handler)
+                handler.close()
+            for handler in original_handlers:
+                root_logger.addHandler(handler)
+            root_logger.setLevel(original_level)
+
     def test_public_program_http_error_includes_api_diagnostics_without_link(self):
         public_url = "https://disk.yandex.ru/d/example_public_key"
 
@@ -296,6 +420,12 @@ class SongOutputTests(unittest.TestCase):
                 )
 
         class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
             def get(self, *_args, **_kwargs):
                 return FakeResponse()
 
@@ -313,6 +443,120 @@ class SongOutputTests(unittest.TestCase):
             self.assertIn("disk.yandex.ru/d/[share-id redacted]", "\n".join(logs.output))
 
         asyncio.run(execute())
+
+    def test_public_program_rate_limit_has_actionable_error(self):
+        public_url = "https://disk.yandex.ru/d/example_public_key"
+
+        class FakeResponse:
+            status = 429
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def text(self):
+                return (
+                    '{"error":"TooManyRequestsError",'
+                    '"description":"Too Many Requests"}'
+                )
+
+        class FakeSession:
+            def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def execute():
+            with self.assertRaisesRegex(
+                prepare_songs.ProgramRateLimitError,
+                "временно ограничил частоту запросов.*HTTP 429",
+            ):
+                await prepare_songs.download_program_docx(
+                    FakeSession(), public_url, Path("program.docx")
+                )
+
+        asyncio.run(execute())
+
+    def test_rate_limit_retries_only_on_enter_and_accepts_local_docx(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            local_program = root / "program.docx"
+            _create_docx(local_program)
+            invalid_program = root / "invalid.docx"
+            invalid_program.write_text("not a DOCX", encoding="utf-8")
+            missing_program = root / "missing.docx"
+            config = {
+                "program_url": "https://disk.yandex.ru/i/example_program",
+                "song_title_aliases_path": root / "aliases.json",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": root / "Трансляция" / "Песни",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+
+            class FakeResponse:
+                status = 429
+                headers = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                async def text(self):
+                    return (
+                        '{"error":"TooManyRequestsError",'
+                        '"description":"Too Many Requests"}'
+                    )
+
+            class FakeSession:
+                def __init__(self):
+                    self.get_calls = 0
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                def get(self, *_args, **_kwargs):
+                    self.get_calls += 1
+                    return FakeResponse()
+
+            session = FakeSession()
+            inputs = iter(
+                [
+                    "",
+                    str(missing_program),
+                    str(invalid_program),
+                    str(local_program),
+                    "",
+                    "",
+                ]
+            )
+            with patch.object(
+                prepare_songs.aiohttp,
+                "ClientSession",
+                return_value=session,
+            ):
+                results = asyncio.run(
+                    prepare_songs.run(
+                        date(2026, 10, 4),
+                        config=config,
+                        interactive=True,
+                        input_fn=lambda _prompt: next(inputs),
+                    )
+                )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(session.get_calls, 2)
 
     def test_download_rejects_docs_view_link_before_api_call(self):
         docs_url = (
@@ -591,6 +835,7 @@ class SongOutputTests(unittest.TestCase):
             (output_dir / "old-result.txt").write_text("preserve", encoding="utf-8")
             config = {
                 "program_url": "",
+                "song_title_aliases_path": root / "song_title_aliases.json",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
                 "yandex_zip_png_paths": [],
@@ -637,6 +882,7 @@ class SongOutputTests(unittest.TestCase):
             output_dir = root / "Трансляция" / "Песни"
             config = {
                 "program_url": "",
+                "song_title_aliases_path": root / "song_title_aliases.json",
                 "zip_dir": zip_dir,
                 "pptx_dir": pptx_dir,
                 "yandex_zip_png_paths": [],
@@ -669,6 +915,199 @@ class SongOutputTests(unittest.TestCase):
             )
             self.assertTrue(prepare_songs._zip_has_valid_pngs(zip_dir / "Песня первая.zip"))
 
+    def test_missing_song_can_be_found_and_remembered_by_alternative_title(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            program_path = root / "program.docx"
+            _create_docx(program_path)
+            zip_dir = root / "zip"
+            pptx_dir = root / "pptx"
+            zip_dir.mkdir()
+            pptx_dir.mkdir()
+            with zipfile.ZipFile(zip_dir / "Песня первая.zip", "w") as archive:
+                archive.writestr("slide_1.png", PNG)
+            with zipfile.ZipFile(zip_dir / "Alt title.zip", "w") as archive:
+                archive.writestr("slide_1.png", PNG)
+            aliases_path = root / "song_title_aliases.json"
+            output_dir = root / "Трансляция" / "Песни"
+            config = {
+                "program_url": "",
+                "song_title_aliases_path": aliases_path,
+                "zip_dir": zip_dir,
+                "pptx_dir": pptx_dir,
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": output_dir,
+                "quality": "standard",
+                "yandex_token": "",
+            }
+
+            first_answers = iter(["Alt title"])
+            first_results = asyncio.run(
+                prepare_songs.run(
+                    date(2026, 10, 4),
+                    program_path,
+                    config=config,
+                    interactive=True,
+                    input_fn=lambda _: next(first_answers),
+                )
+            )
+            first_song_dir = output_dir / "02 - Песня вторая"
+            self.assertTrue(
+                (first_song_dir / "slide_001.png").is_file(),
+                f"Output contents: {list(output_dir.iterdir())}",
+            )
+            self.assertTrue(aliases_path.is_file())
+
+            second_results = asyncio.run(
+                prepare_songs.run(
+                    date(2026, 10, 4),
+                    program_path,
+                    config=config,
+                    interactive=True,
+                    input_fn=Mock(
+                        side_effect=AssertionError("unexpected alias prompt")
+                    ),
+                )
+            )
+            saved_aliases = prepare_songs.load_song_title_aliases(aliases_path)
+
+        self.assertEqual(first_results[1].status, "ready")
+        self.assertEqual(first_results[1].title, "Песня вторая")
+        self.assertEqual(
+            saved_aliases, {"песня вторая": "Alt title"}
+        )
+        self.assertEqual(second_results[1].status, "ready")
+        self.assertEqual(second_results[1].title, "Песня вторая")
+
+    def test_saved_alias_falls_back_to_original_title_if_alias_is_missing(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            program_path = root / "program.docx"
+            _create_docx(program_path)
+            zip_dir = root / "zip"
+            pptx_dir = root / "pptx"
+            zip_dir.mkdir()
+            pptx_dir.mkdir()
+            with zipfile.ZipFile(zip_dir / "Песня вторая.zip", "w") as archive:
+                archive.writestr("slide_1.png", PNG)
+            aliases_path = root / "song_title_aliases.json"
+            prepare_songs.save_song_title_aliases(
+                {"песня вторая": "Old alias"}, aliases_path
+            )
+            config = {
+                "program_url": "",
+                "song_title_aliases_path": aliases_path,
+                "zip_dir": zip_dir,
+                "pptx_dir": pptx_dir,
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": root / "Трансляция" / "Песни",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+
+            results = asyncio.run(
+                prepare_songs.run(date(2026, 10, 4), program_path, config=config)
+            )
+
+        self.assertEqual(results[1].status, "ready")
+        self.assertEqual(results[1].source, str(zip_dir / "Песня вторая.zip"))
+
+    def test_prompted_program_url_is_saved_only_after_docx_validation(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            obs_dir = root / "obs_local"
+            obs_dir.mkdir()
+            settings_path = obs_dir / "settings.ini"
+            settings_path.write_text(
+                "[OBS Local paths]\n"
+                "root_path = ./obs_png\n"
+                "[Song preparation]\n"
+                "program_url =\n",
+                encoding="utf-8",
+            )
+            program_path = root / "program.docx"
+            _create_docx(program_path)
+            config = {
+                "program_url": "",
+                "song_title_aliases_path": root / "aliases.json",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": root / "Трансляция" / "Песни",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+            inputs = iter(
+                [
+                    "https://disk.yandex.ru/d/not-a-docx",
+                    "https://disk.yandex.ru/d/valid-docx",
+                    "",
+                    "",
+                ]
+            )
+
+            async def download_docx(_session, _url, destination):
+                if _url.endswith("not-a-docx"):
+                    destination.write_bytes(b"invalid")
+                    raise RuntimeError("Скачанный файл не похож на DOCX")
+                _create_docx(destination)
+
+            with (
+                patch.object(prepare_songs, "BASE_DIR", obs_dir),
+                patch.object(
+                    prepare_songs,
+                    "download_program_docx",
+                    side_effect=download_docx,
+                ),
+            ):
+                results = asyncio.run(
+                    prepare_songs.run(
+                        date(2026, 10, 4),
+                        config=config,
+                        interactive=True,
+                        input_fn=lambda _: next(inputs),
+                    )
+                )
+                saved_settings = settings_path.read_text(encoding="utf-8")
+
+        self.assertEqual(config["program_url"], "https://disk.yandex.ru/d/valid-docx")
+        self.assertIn(
+            "program_url = https://disk.yandex.ru/d/valid-docx",
+            saved_settings,
+        )
+        self.assertEqual(len(results), 2)
+
+    def test_local_program_file_keeps_interactive_retry_prompt_enabled(self):
+        config = {"log_dir": Path("/dev/shm")}
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "prepare_songs",
+                    "--program-file",
+                    "/dev/shm/program.docx",
+                ],
+            ),
+            patch("sys.stdin", MagicMock(isatty=Mock(return_value=True))),
+            patch.object(prepare_songs, "load_config", return_value=config),
+            patch.object(prepare_songs, "setup_logging"),
+            patch.object(prepare_songs, "run", new_callable=AsyncMock) as run,
+        ):
+            prepare_songs.main()
+
+        self.assertTrue(run.await_args.kwargs["interactive"])
 
 if __name__ == "__main__":
     unittest.main()

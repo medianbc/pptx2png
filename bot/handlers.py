@@ -8,6 +8,7 @@ import shutil
 import logging
 import secrets
 import asyncio
+from datetime import date, datetime
 from pathlib import Path
 import html as html_module
 from typing import Optional, Dict, List, Tuple
@@ -29,6 +30,8 @@ from .utils import (
 from . import yandex_state
 from .yandex_state import sessions, yd_session_lock, yd_active_tasks
 from pptx2png_core.yandex_disk import YandexDiskError
+from pptx2png_core.yandex_disk import get_nearest_sunday
+from .folder_setup import ensure_sunday_folder_tree
 from .yandex_flow import (
     router as yandex_router,
     render_sermon_prompt,
@@ -37,6 +40,8 @@ from .yandex_flow import (
     cleanup_task as yd_cleanup_task,
     is_sermon_slide,
     prompt_timeout_watchdog,
+    _is_awaiting_sunday_upload,
+    handle_sunday_upload,
 )
 
 import pptx2png_core.converter_engine as converter_engine
@@ -1192,6 +1197,132 @@ async def handle_admin_decision(callback: types.CallbackQuery, user_mgr, bot: Bo
     await callback.answer()
 
 
+def _admin_tools_keyboard(sunday: date):
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(
+        text=f"📁 Создать структуру на {sunday:%d.%m.%Y}",
+        callback_data="admin_create_sunday_tree",
+    )
+    keyboard.adjust(1)
+    return keyboard.as_markup()
+
+
+@router.callback_query(F.data == "admin_tools")
+async def handle_admin_tools(
+    callback: types.CallbackQuery,
+    ADMIN_ID: int,
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    if yandex_state.config.client is None or not yandex_state.config.base_path:
+        await callback.answer(
+            "❌ Яндекс.Диск не настроен.", show_alert=True
+        )
+        return
+
+    sunday = get_nearest_sunday().date()
+    await callback.message.answer(
+        "Дополнительные функции администратора.\n"
+        "Создание дерева добавляет недостающие папки для ближайшего "
+        "воскресенья по шаблону бота.",
+        reply_markup=_admin_tools_keyboard(sunday),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_create_sunday_tree")
+async def handle_admin_create_sunday_tree(
+    callback: types.CallbackQuery,
+    ADMIN_ID: int,
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+
+    sunday = get_nearest_sunday().date()
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(
+        text="✅ Подтвердить",
+        callback_data=f"admin_confirm_sunday_tree:{sunday.isoformat()}",
+    )
+    keyboard.button(text="Отмена", callback_data="admin_cancel_sunday_tree")
+    keyboard.adjust(1)
+    await callback.message.answer(
+        f"Создать недостающие папки для воскресенья "
+        f"{sunday:%d.%m.%Y}?",
+        reply_markup=keyboard.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_cancel_sunday_tree")
+async def handle_admin_cancel_sunday_tree(
+    callback: types.CallbackQuery,
+    ADMIN_ID: int,
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    await callback.message.edit_text("Создание структуры папок отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_confirm_sunday_tree:"))
+async def handle_admin_confirm_sunday_tree(
+    callback: types.CallbackQuery,
+    ADMIN_ID: int,
+    YANDEX_TEMPLATE_PATH: Path,
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    try:
+        requested_sunday = date.fromisoformat(
+            callback.data.partition(":")[2]
+        )
+    except ValueError:
+        await callback.answer("❌ Некорректная дата.", show_alert=True)
+        return
+
+    sunday = get_nearest_sunday()
+    if requested_sunday != sunday.date():
+        await callback.answer(
+            "Дата устарела. Откройте дополнительные функции ещё раз.",
+            show_alert=True,
+        )
+        return
+    if yandex_state.config.client is None or not yandex_state.config.base_path:
+        await callback.answer(
+            "❌ Яндекс.Диск не настроен.", show_alert=True
+        )
+        return
+
+    await callback.answer("⏳ Создаю структуру папок...")
+    status_message = await callback.message.answer(
+        f"Создаю структуру папок на {requested_sunday:%d.%m.%Y}..."
+    )
+    try:
+        sunday_path = await ensure_sunday_folder_tree(
+            yandex_state.config.client,
+            yandex_state.config.base_path,
+            datetime.combine(requested_sunday, datetime.min.time()),
+            YANDEX_TEMPLATE_PATH,
+        )
+    except Exception as error:
+        logging.exception("Администратор не смог создать дерево папок")
+        await status_message.edit_text(
+            f"❌ Не удалось создать структуру папок: {str(error)[:500]}"
+        )
+        return
+
+    await status_message.edit_text(
+        f"✅ Структура папок на {requested_sunday:%d.%m.%Y} готова:\n"
+        f"<code>{html_module.escape(sunday_path)}</code>",
+        parse_mode="HTML",
+    )
+
+
 # ==========================================
 # 9. НАСТРОЙКИ КАЧЕСТВА И PDF
 # ==========================================
@@ -1308,7 +1439,18 @@ async def handle_toggle_cat_other(
 # ==========================================
 
 @router.message(F.document.file_name.lower().endswith(('.pptx', '.ppt')))
-async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, check_access):
+async def handle_pptx_document(
+    message: types.Message,
+    bot: Bot,
+    SHM_DIR: str,
+    check_access,
+    user_mgr,
+):
+    if _is_awaiting_sunday_upload(message):
+        await handle_sunday_upload(
+            message, bot, SHM_DIR, user_mgr, check_access
+        )
+        return
     if not await check_access(message):
         return
     document = message.document
@@ -1379,6 +1521,11 @@ async def handle_pptx_document(message: types.Message, bot: Bot, SHM_DIR: str, c
 @router.message(F.document)
 async def handle_docs(message: types.Message, bot: Bot, SHM_DIR: str, check_access,
                       user_mgr, get_settings_keyboard):
+    if _is_awaiting_sunday_upload(message):
+        await handle_sunday_upload(
+            message, bot, SHM_DIR, user_mgr, check_access
+        )
+        return
     if not await check_access(message):
         return
     safe_name = safe_filename(message.document.file_name)
