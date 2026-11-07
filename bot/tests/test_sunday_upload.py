@@ -306,9 +306,16 @@ class SundayUploadTests(unittest.IsolatedAsyncioTestCase):
         update = Update(update_id=1, message=message)
         bot = Bot(token="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
         try:
-            with patch.object(
-                handlers, "handle_sunday_upload", new_callable=AsyncMock
-            ) as sunday_handler:
+            with (
+                patch.object(
+                    handlers, "handle_sunday_upload", new_callable=AsyncMock
+                ) as sunday_handler,
+                patch.object(
+                    flow_handlers,
+                    "get_nearest_sunday",
+                    return_value=datetime(2026, 11, 8),
+                ),
+            ):
                 await handlers.router.propagate_event(
                     "message",
                     message,

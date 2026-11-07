@@ -259,7 +259,10 @@ class ArchiveUpdateTests(unittest.TestCase):
                     side_effect=updater.UpdateError("dependency failure"),
                 ),
             ):
-                with self.assertRaisesRegex(updater.UpdateError, "dependency failure"):
+                with self.assertRaisesRegex(
+                    updater.UpdateError,
+                    "исходники архивной установки восстановлены",
+                ):
                     updater.install_update(info)
 
             version = json.loads(
@@ -474,7 +477,8 @@ class GitCheckoutUpdateTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(
-                    updater.UpdateError, "исходная ревизия восстановлена"
+                    updater.UpdateError,
+                    "исходная ревизия и локальные изменения восстановлены",
                 ):
                     updater.install_update(info)
 
@@ -491,6 +495,49 @@ class GitCheckoutUpdateTests(unittest.TestCase):
                 "untracked local data\n",
             )
             self.assertFalse((checkout / "remote.txt").exists())
+            self.assertEqual(self._git(checkout, "stash", "list"), "")
+
+    def test_dependency_install_uses_restored_local_requirement_pins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            previous_revision = self._git(checkout, "rev-parse", "HEAD")
+            remote_revision = self._push_remote_change(seed, "remote\n")
+            requirements = checkout / "obs_local" / "requirements.txt"
+            requirements.parent.mkdir()
+            requirements.write_text("custom-package==1.2.3\n", encoding="utf-8")
+            info = updater.UpdateInfo(
+                branch="main",
+                local_revision=previous_revision,
+                remote_revision=remote_revision,
+                available=True,
+                is_git_checkout=True,
+            )
+
+            def verify_local_requirements():
+                self.assertEqual(
+                    requirements.read_text(encoding="utf-8"),
+                    "custom-package==1.2.3\n",
+                )
+
+            with (
+                patch.object(updater, "PROJECT_DIR", checkout),
+                patch.object(
+                    updater,
+                    "_install_python_dependencies",
+                    side_effect=verify_local_requirements,
+                ) as install_dependencies,
+            ):
+                updater.install_update(info)
+
+            install_dependencies.assert_called_once_with()
+            self.assertEqual(
+                self._git(checkout, "rev-parse", "HEAD"),
+                remote_revision,
+            )
+            self.assertEqual(
+                requirements.read_text(encoding="utf-8"),
+                "custom-package==1.2.3\n",
+            )
             self.assertEqual(self._git(checkout, "stash", "list"), "")
 
     def test_stash_conflict_keeps_backup_in_stash(self):
