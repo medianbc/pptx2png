@@ -92,13 +92,14 @@ class ArchiveUpdateTests(unittest.TestCase):
             response.read.return_value = archive_buffer.getvalue()
             response.__enter__ = Mock(return_value=response)
             response.__exit__ = Mock(return_value=None)
-            with patch.object(updater, "urlopen", return_value=response):
-                updater._download_archive("main", Path(temp_dir))
+            with patch.object(updater, "urlopen", return_value=response) as urlopen:
+                updater._download_archive("a" * 40, Path(temp_dir))
 
             self.assertEqual(
                 (Path(temp_dir) / "obs_local" / "updater.py").read_bytes(),
                 b"module source",
             )
+            self.assertTrue(urlopen.call_args.args[0].full_url.endswith("/" + "a" * 40))
 
     def test_update_preserves_local_data_and_installs_dependencies(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -143,11 +144,19 @@ class ArchiveUpdateTests(unittest.TestCase):
 
             with (
                 patch.object(updater, "PROJECT_DIR", project_dir),
-                patch.object(updater, "_download_archive", side_effect=create_archive_source),
+                patch.object(
+                    updater,
+                    "_download_archive",
+                    side_effect=create_archive_source,
+                ) as download_archive,
                 patch.object(updater, "_install_python_dependencies") as install_deps,
             ):
                 updater.install_update(info)
 
+            self.assertEqual(
+                download_archive.call_args.args[0],
+                info.remote_revision,
+            )
             self.assertEqual(
                 (project_dir / "obs_local" / "settings.ini").read_text(
                     encoding="utf-8"
@@ -269,7 +278,7 @@ class ArchiveUpdateTests(unittest.TestCase):
                 response.__exit__ = Mock(return_value=None)
                 urlopen.return_value = response
                 with self.assertRaises(updater.UpdateError):
-                    updater._download_archive("main", Path(temp_dir))
+                    updater._download_archive("b" * 40, Path(temp_dir))
 
 
 class GitCheckoutUpdateTests(unittest.TestCase):

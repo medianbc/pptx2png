@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REPOSITORY = "medianbc/pptx2png"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/commits"
-ARCHIVE_URL = f"https://codeload.github.com/{REPOSITORY}/tar.gz/refs/heads"
+ARCHIVE_URL = f"https://codeload.github.com/{REPOSITORY}/tar.gz"
 VERSION_FILE = ".pptx2png-version.json"
 MANIFEST_FILE = ".pptx2png-files.json"
 ARCHIVE_MARKER = ".pptx2png-archive-install"
@@ -263,8 +263,10 @@ def _restore_stash() -> None:
         )
 
 
-def _download_archive(branch: str, destination: Path) -> None:
-    url = f"{ARCHIVE_URL}/{quote(branch, safe='')}"
+def _download_archive(revision: str, destination: Path) -> None:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+        raise UpdateError("Нельзя скачать архив: некорректный номер ревизии.")
+    url = f"{ARCHIVE_URL}/{quote(revision, safe='')}"
     request = Request(url, headers={"User-Agent": "pptx2png-obs-local-updater"})
     try:
         with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
@@ -314,7 +316,7 @@ def _update_archive_install(info: UpdateInfo) -> None:
         backup = Path(temp_dir) / "backup"
         staging.mkdir()
         backup.mkdir()
-        _download_archive(info.branch, staging)
+        _download_archive(info.remote_revision, staging)
 
         new_files = _archive_source_files(staging)
         old_files = _read_installed_manifest()

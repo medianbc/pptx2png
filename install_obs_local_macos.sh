@@ -4,7 +4,7 @@ set -Eeuo pipefail
 REPOSITORY_URL="https://github.com/medianbc/pptx2png.git"
 SOURCE_BRANCH="${PPTX2PNG_BRANCH:-main}"
 CUSTOM_ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-}"
-SOURCE_REVISION=""
+SOURCE_REVISION="${PPTX2PNG_SOURCE_REVISION:-}"
 ARCHIVE_URL=""
 ARCHIVE_DOWNLOADED=false
 DEFAULT_INSTALL_DIR="${HOME}/pptx2png"
@@ -49,19 +49,21 @@ if [[ -e "$INSTALL_DIR" ]]; then
     fi
 else
     if [[ -z "$CUSTOM_ARCHIVE_URL" ]]; then
-        if SOURCE_REVISION="$(curl --fail --location --silent --show-error \
-            "https://api.github.com/repos/medianbc/pptx2png/commits/${SOURCE_BRANCH}" |
-            "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"; then
-            [[ "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{40,64}$ ]] ||
-                die "GitHub returned an invalid source revision."
-            ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/${SOURCE_REVISION}"
-        else
-            printf 'Warning: could not resolve the branch revision; update checking will require an initial refresh.\n' >&2
-            ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/refs/heads/${SOURCE_BRANCH}"
-            SOURCE_REVISION=""
+        if [[ -z "$SOURCE_REVISION" ]]; then
+            SOURCE_REVISION="$(curl --fail --location --silent --show-error \
+                "https://api.github.com/repos/medianbc/pptx2png/commits/${SOURCE_BRANCH}" |
+                "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["sha"])')" ||
+                die "Could not resolve the source branch to a commit SHA."
         fi
+        [[ "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{40,64}$ ]] ||
+            die "Source revision must be a full Git commit SHA."
+        ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/${SOURCE_REVISION}"
     else
-        ARCHIVE_URL="$CUSTOM_ARCHIVE_URL"
+        [[ "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{40,64}$ ]] ||
+            die "PPTX2PNG_SOURCE_REVISION is required with a custom archive URL."
+        ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/${SOURCE_REVISION}"
+        [[ "$CUSTOM_ARCHIVE_URL" == "$ARCHIVE_URL" ]] ||
+            die "Custom archive URL must point to the official archive for PPTX2PNG_SOURCE_REVISION."
     fi
     printf 'Downloading the project archive...\n'
     staging_dir="$(mktemp -d "$(dirname "$INSTALL_DIR")/.pptx2png-install.XXXXXX")"
