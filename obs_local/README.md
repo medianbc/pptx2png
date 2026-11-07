@@ -115,10 +115,15 @@ files with their first update. Archive updates are staged and roll back source
 files if installation fails. Git checkouts preserve both working-tree and
 staged changes. After source updates, the current Python environment is
 updated from `core` and `obs_local/requirements.txt`, then checked with
-`pip check`. A successful update asks you to restart the workflow. System
-dependencies such as LibreOffice are not installed automatically by the
-updater; install those using the platform installer if a new version requires
-them.
+`pip check`. A successful update asks you to restart the workflow. If
+dependency installation fails, a Git update returns to the previous revision
+and restores local changes; an archive update restores the previous source
+files. If local changes conflict with the new version, the update is cancelled
+and the previous revision is restored. If local changes cannot be restored
+automatically, their backup remains in `git stash`; follow the error message.
+System dependencies such as LibreOffice are not installed automatically by
+the updater; install those using the platform installer if a new version
+requires them.
 
 To run song preparation directly with debug logging (for example, when
 diagnosing an issue), use:
