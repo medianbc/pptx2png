@@ -107,8 +107,17 @@ def get_resolution_multiplier(quality_str, page):
 
 def _find_libreoffice() -> str:
     """Ищет LibreOffice в системе."""
+    configured_path = os.environ.get("PPTX2PNG_LIBREOFFICE_PATH", "").strip()
+    if configured_path:
+        if os.path.isfile(configured_path) and os.access(configured_path, os.X_OK):
+            return configured_path
+        raise FileNotFoundError(
+            "Настроенный исполняемый файл LibreOffice не найден или недоступен: "
+            f"{configured_path}"
+        )
+
     mac_path = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-    if os.path.exists(mac_path):
+    if os.path.isfile(mac_path) and os.access(mac_path, os.X_OK):
         return mac_path
     if shutil.which("soffice") is not None:
         return "soffice"

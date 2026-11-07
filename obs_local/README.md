@@ -40,10 +40,15 @@ not update source files in an existing checkout.
 
 - macOS with Homebrew installed and available in Terminal.
 - Internet access to GitHub and Homebrew/PyPI package repositories.
-- Python 3.10 or later. The installer installs Python through Homebrew; the
-  shared package declares `requires-python >= 3.10`.
-- LibreOffice for PPT/PPTX-to-PDF/PNG conversion. The installer installs the
-  application using the Homebrew cask.
+- Python 3.10 or later. The shared package declares
+  `requires-python >= 3.10`; the installer uses a compatible Python already
+  available and installs one through Homebrew only when needed.
+- LibreOffice for PPT/PPTX-to-PDF/PNG conversion. If it is not found in a
+  standard application location or on `PATH`, the installer installs it using
+  the Homebrew cask. The selected path is saved in the generated launchers.
+  Set `PPTX2PNG_LIBREOFFICE_PATH` when running the installer to use an
+  executable in a non-standard location; it can also be overridden when
+  launching a workflow.
 
 The repository does not specify a minimum macOS version. The
 `OBS macOS installation` GitHub Actions workflow installs the package on a
@@ -73,7 +78,11 @@ on the target machine as well.
 
    The command downloads the `main` source archive and extracts it into
    `$HOME/pptx2png`. Replace that path to choose a different installation
-   directory. The installer uses Homebrew to install Python and LibreOffice,
+   directory. Before installing anything, the installer validates the
+   destination and checks for Python 3.10+ with `venv`/`pip` and LibreOffice.
+   It skips components that are already available and uses Homebrew only for
+   missing ones. The selected Python executable is used by its full path, even
+   if another `python3` command shadows it in `PATH`. The installer then
    creates `.venv`, installs `core` and local application dependencies, and
    creates `start_obs_local.sh` and `prepare_obs_songs.sh`. Git is not required
    for a fresh installation. If you run the installer
@@ -89,7 +98,9 @@ on the target machine as well.
    ```
 
    If LibreOffice is installed elsewhere, ensure `soffice` is available on
-   `PATH`.
+   `PATH`, or set `PPTX2PNG_LIBREOFFICE_PATH` to the executable's full path
+   when running the installer. The selected path is saved in both launchers
+   and used by presentation and song conversion.
 
 4. Configure `obs_local/settings.ini` and `config.ini` as described below.
    Interactive presentation preparation requires a Yandex Disk OAuth token
@@ -115,10 +126,15 @@ files with their first update. Archive updates are staged and roll back source
 files if installation fails. Git checkouts preserve both working-tree and
 staged changes. After source updates, the current Python environment is
 updated from `core` and `obs_local/requirements.txt`, then checked with
-`pip check`. A successful update asks you to restart the workflow. System
-dependencies such as LibreOffice are not installed automatically by the
-updater; install those using the platform installer if a new version requires
-them.
+`pip check`. A successful update asks you to restart the workflow. If
+dependency installation fails, a Git update returns to the previous revision
+and restores local changes; an archive update restores the previous source
+files. If local changes conflict with the new version, the update is cancelled
+and the previous revision is restored. If local changes cannot be restored
+automatically, their backup remains in `git stash`; follow the error message.
+System dependencies such as LibreOffice are not installed automatically by
+the updater; install those using the platform installer if a new version
+requires them.
 
 To run song preparation directly with debug logging (for example, when
 diagnosing an issue), use:
