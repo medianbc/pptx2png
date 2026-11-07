@@ -187,21 +187,24 @@ for current, directories, filenames in os.walk(project):
 PY
 fi
 
-cat > start_obs_local.sh <<'LAUNCHER'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$PROJECT_DIR/.venv/bin/python" -m obs_local "$@"
-LAUNCHER
-chmod +x start_obs_local.sh
+write_launcher() {
+    local launcher="$1"
+    local module="$2"
+    local quoted_soffice_path
+    printf -v quoted_soffice_path '%q' "$SOFFICE"
+    {
+        printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+        printf 'PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        printf 'if [[ -z "${PPTX2PNG_LIBREOFFICE_PATH:-}" ]]; then\n'
+        printf '    export PPTX2PNG_LIBREOFFICE_PATH=%s\n' "$quoted_soffice_path"
+        printf 'fi\n'
+        printf 'exec "$PROJECT_DIR/.venv/bin/python" -m %s "$@"\n' "$module"
+    } > "$launcher"
+    chmod +x "$launcher"
+}
 
-cat > prepare_obs_songs.sh <<'LAUNCHER'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$PROJECT_DIR/.venv/bin/python" -m obs_local.prepare_songs "$@"
-LAUNCHER
-chmod +x prepare_obs_songs.sh
+write_launcher start_obs_local.sh obs_local
+write_launcher prepare_obs_songs.sh obs_local.prepare_songs
 
 CONFIG_FILE="$INSTALL_DIR/config.ini"
 if [[ ! -f "$CONFIG_FILE" ]]; then

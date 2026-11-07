@@ -101,7 +101,12 @@ esac
         )
         self._write_executable(
             self.install_dir / ".venv" / "bin" / "python",
-            "#!/bin/sh\nexit 0\n",
+            """#!/bin/sh
+if [ "$1" = "-m" ]; then
+    printf '%s' "$PPTX2PNG_LIBREOFFICE_PATH" > "$LAUNCHER_ENV_LOG"
+fi
+exit 0
+""",
         )
 
     def _write_executable(self, path: Path, contents: str) -> None:
@@ -131,6 +136,7 @@ exit 0
                 "PATH": str(self.bin_dir),
                 "PYTHON_LOG": str(self.python_log),
                 "PPTX2PNG_LIBREOFFICE_PATH": str(self.soffice_path),
+                "LAUNCHER_ENV_LOG": str(self.root / "launcher-env.log"),
             }
         )
         return subprocess.run(
@@ -149,6 +155,24 @@ exit 0
             for line in self.brew_log.read_text(encoding="utf-8").splitlines()
             if line.startswith("install ")
         ]
+
+    def _run_launcher(self, launcher_name: str) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(self.home),
+                "PATH": str(self.bin_dir),
+                "LAUNCHER_ENV_LOG": str(self.root / "launcher-env.log"),
+            }
+        )
+        env.pop("PPTX2PNG_LIBREOFFICE_PATH", None)
+        return subprocess.run(
+            ["/bin/bash", str(self.install_dir / launcher_name)],
+            capture_output=True,
+            check=False,
+            env=env,
+            text=True,
+        )
 
     def test_prefers_compatible_homebrew_python_over_shadowed_old_python(self):
         self._add_python(
@@ -217,6 +241,37 @@ exit 0
             result.stdout,
         )
         self.assertTrue(self.soffice_path.is_file())
+
+    def test_launcher_persists_custom_libreoffice_path(self):
+        custom_path = self.root / "Custom LibreOffice" / "soffice"
+        self._write_executable(
+            custom_path,
+            "#!/bin/sh\nexit 0\n",
+        )
+        self.soffice_path = custom_path
+        self._add_python(
+            self.python_prefix / "libexec" / "bin" / "python3",
+            compatible=True,
+            label="existing-python",
+        )
+
+        result = self._run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        for launcher_name in ("start_obs_local.sh", "prepare_obs_songs.sh"):
+            with self.subTest(launcher=launcher_name):
+                result = self._run_launcher(launcher_name)
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    result.stdout + result.stderr,
+                )
+                self.assertEqual(
+                    (self.root / "launcher-env.log").read_text(
+                        encoding="utf-8"
+                    ),
+                    str(custom_path),
+                )
 
 
 if __name__ == "__main__":
