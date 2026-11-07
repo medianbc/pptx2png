@@ -227,6 +227,12 @@ class ArchiveUpdateTests(unittest.TestCase):
     def test_dependency_failure_does_not_mark_archive_revision_current(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
+            (project_dir / "old_module.py").write_text(
+                "previous source", encoding="utf-8"
+            )
+            (project_dir / updater.MANIFEST_FILE).write_text(
+                json.dumps(["old_module.py"]), encoding="utf-8"
+            )
             (project_dir / updater.VERSION_FILE).write_text(
                 json.dumps({"branch": "main", "revision": "a" * 40}),
                 encoding="utf-8",
@@ -260,6 +266,15 @@ class ArchiveUpdateTests(unittest.TestCase):
                 (project_dir / updater.VERSION_FILE).read_text(encoding="utf-8")
             )
             self.assertEqual(version["revision"], "a" * 40)
+            self.assertEqual(
+                (project_dir / "old_module.py").read_text(encoding="utf-8"),
+                "previous source",
+            )
+            self.assertFalse((project_dir / "new_module.py").exists())
+            manifest = json.loads(
+                (project_dir / updater.MANIFEST_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest, ["old_module.py"])
 
     def test_archive_extraction_rejects_parent_directory_paths(self):
         archive_buffer = io.BytesIO()
@@ -430,6 +445,53 @@ class GitCheckoutUpdateTests(unittest.TestCase):
             self.assertEqual(self._git(checkout, "show", ":tracked.txt"), "staged")
             self.assertEqual((checkout / "tracked.txt").read_text(), "unstaged\n")
             self.assertIn("MM tracked.txt", self._git(checkout, "status", "--short"))
+
+    def test_dependency_failure_restores_previous_revision_and_local_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            previous_revision = self._git(checkout, "rev-parse", "HEAD")
+            remote_revision = self._push_remote_change(seed, "remote\n")
+            (checkout / "tracked.txt").write_text(
+                "local edit\n", encoding="utf-8"
+            )
+            (checkout / "local-only.txt").write_text(
+                "untracked local data\n", encoding="utf-8"
+            )
+            info = updater.UpdateInfo(
+                branch="main",
+                local_revision=previous_revision,
+                remote_revision=remote_revision,
+                available=True,
+                is_git_checkout=True,
+            )
+
+            with (
+                patch.object(updater, "PROJECT_DIR", checkout),
+                patch.object(
+                    updater,
+                    "_install_python_dependencies",
+                    side_effect=updater.UpdateError("dependency failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    updater.UpdateError, "исходная ревизия восстановлена"
+                ):
+                    updater.install_update(info)
+
+            self.assertEqual(
+                self._git(checkout, "rev-parse", "HEAD"),
+                previous_revision,
+            )
+            self.assertEqual(
+                (checkout / "tracked.txt").read_text(encoding="utf-8"),
+                "local edit\n",
+            )
+            self.assertEqual(
+                (checkout / "local-only.txt").read_text(encoding="utf-8"),
+                "untracked local data\n",
+            )
+            self.assertFalse((checkout / "remote.txt").exists())
+            self.assertEqual(self._git(checkout, "stash", "list"), "")
 
     def test_stash_conflict_keeps_backup_in_stash(self):
         with tempfile.TemporaryDirectory() as temp_dir:

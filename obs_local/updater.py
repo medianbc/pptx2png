@@ -160,10 +160,9 @@ def check_for_updates() -> UpdateInfo:
 def install_update(info: UpdateInfo) -> None:
     try:
         if info.is_git_checkout:
-            _update_git_checkout(info)
+            _update_git_checkout(info, install_dependencies=True)
         else:
-            _update_archive_install(info)
-        _install_python_dependencies()
+            _update_archive_install(info, install_dependencies=True)
         if not info.is_git_checkout:
             _write_version(info.branch, info.remote_revision)
     except UpdateError:
@@ -172,8 +171,13 @@ def install_update(info: UpdateInfo) -> None:
         raise UpdateError(f"Ошибка при установке обновления: {error}") from error
 
 
-def _update_git_checkout(info: UpdateInfo) -> None:
+def _update_git_checkout(
+    info: UpdateInfo,
+    *,
+    install_dependencies: bool = False,
+) -> None:
     status = _run_git("status", "--porcelain", "--untracked-files=normal")
+    previous_revision = _run_git("rev-parse", "HEAD")
     stash_created = False
     if status:
         previous_stash = _run_git(
@@ -227,6 +231,23 @@ def _update_git_checkout(info: UpdateInfo) -> None:
                 "обновлена автоматически без риска потери изменений."
             )
         _run_git("merge", "--ff-only", "FETCH_HEAD")
+        if install_dependencies:
+            try:
+                _install_python_dependencies()
+            except Exception as error:
+                try:
+                    _run_git("reset", "--hard", previous_revision)
+                except UpdateError as rollback_error:
+                    raise UpdateError(
+                        "Не удалось установить Python-зависимости и вернуть "
+                        "исходную ревизию. Резервная копия пользовательских "
+                        f"изменений сохранена отдельно. {rollback_error}"
+                    ) from error
+                raise UpdateError(
+                    "Не удалось установить Python-зависимости; исходная "
+                    "ревизия восстановлена. После устранения ошибки "
+                    "повторите обновление."
+                ) from error
     except Exception:
         if stash_created:
             _restore_stash()
@@ -308,7 +329,11 @@ def _download_archive(revision: str, destination: Path) -> None:
         raise UpdateError(f"Не удалось распаковать обновление: {error}") from error
 
 
-def _update_archive_install(info: UpdateInfo) -> None:
+def _update_archive_install(
+    info: UpdateInfo,
+    *,
+    install_dependencies: bool = False,
+) -> None:
     with tempfile.TemporaryDirectory(
         prefix=".pptx2png-update-", dir=PROJECT_DIR.parent
     ) as temp_dir:
@@ -361,6 +386,8 @@ def _update_archive_install(info: UpdateInfo) -> None:
                 sorted(new_files),
             )
             changed_files.add(MANIFEST_FILE)
+            if install_dependencies:
+                _install_python_dependencies()
         except (OSError, UpdateError) as error:
             _rollback_archive_update(
                 changed_files,

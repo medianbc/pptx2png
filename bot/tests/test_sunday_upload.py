@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ class SundayUploadTests(unittest.IsolatedAsyncioTestCase):
             "task_ids": [],
             "processing": False,
             "awaiting_upload": True,
+            "upload_expires_at": time.time() + 3600,
             "cancelled": False,
         }
         yandex_state.sessions[self.session_key] = self.session
@@ -242,10 +244,48 @@ class SundayUploadTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=self.user_id),
             chat=SimpleNamespace(id=self.chat_id),
         )
-        self.assertTrue(flow_handlers._is_awaiting_sunday_upload(message))
+        with patch.object(
+            flow_handlers, "get_nearest_sunday", return_value=datetime(2026, 11, 8)
+        ):
+            self.assertTrue(
+                flow_handlers._is_awaiting_sunday_upload(message)
+            )
 
         message.from_user.id = self.user_id + 1
         self.assertFalse(flow_handlers._is_awaiting_sunday_upload(message))
+
+    def test_expired_upload_wait_is_removed(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.user_id),
+            chat=SimpleNamespace(id=self.chat_id),
+        )
+        self.session["upload_expires_at"] = 0
+
+        with patch.object(
+            flow_handlers, "get_nearest_sunday", return_value=datetime(2026, 11, 8)
+        ):
+            self.assertFalse(
+                flow_handlers._is_awaiting_sunday_upload(message)
+            )
+
+        self.assertNotIn(self.session_key, yandex_state.sessions)
+
+    def test_upload_wait_for_previous_sunday_is_removed(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.user_id),
+            chat=SimpleNamespace(id=self.chat_id),
+        )
+
+        with patch.object(
+            flow_handlers,
+            "get_nearest_sunday",
+            return_value=datetime(2026, 11, 15),
+        ):
+            self.assertFalse(
+                flow_handlers._is_awaiting_sunday_upload(message)
+            )
+
+        self.assertNotIn(self.session_key, yandex_state.sessions)
 
     async def test_document_router_routes_waiting_sunday_upload_before_regular_handler(self):
         message = Message(
