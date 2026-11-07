@@ -118,10 +118,13 @@ on the target machine as well.
    ```
 
 The menu offers presentation preparation (`1`), song preparation (`2`),
-update checking (`3`), settings (`4`), and exit (`0`). Settings lists numbered
+settings (`3`), and exit (`0`). Settings lists numbered
 parameters from the current OS settings file and saves edits while preserving comments.
 A separate numbered action accepts a hidden Yandex token and saves it in
-private `config.ini` files. Empty input keeps the current parameter value.
+private `config.ini` files. Another numbered action in Settings checks updates;
+its number follows the token action. Empty input keeps the current parameter value.
+If settings are missing, unreadable, or malformed, the menu reports the error
+and still offers token entry (`1`), update checking (`2`), and back (`0`).
 Update checking contacts GitHub only
 after you select it. If a newer revision exists, the menu asks before changing
 files. Git checkouts are updated with a fast-forward only; uncommitted changes
@@ -212,6 +215,16 @@ prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to the current OS file and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
 
+Manual category ranges survive returning to selection and switching categories
+within the current presentation preparation, but are not persisted after exit.
+Mode `2` converts one category. Mode `4` prepares multiple categories: `1`–`3`
+edit a category and select it, `5` toggles selection by category number, and
+`4` confirms the selected categories. Detected categories are selected initially;
+missing categories need a manual range. Changing the confirmation retains edits
+and selection. The renderer runs once and publishes each selected category to
+its own `sermon`/`opening`/`prayer` subfolder under a shared run directory.
+The reported batch result path is that directory; single-category paths are unchanged.
+
 If the upcoming Sunday's service folder or presentation is missing on Yandex
 Disk, the workflow reports it and offers numbered actions: retry (`1`),
 open a local `.ppt`/`.pptx` file (`2`, then enter its path), or cancel (`0` or Enter).
@@ -232,16 +245,24 @@ a backup.
 
 Yandex API search uses `yandex_zip_png_paths` and `yandex_pptx_paths` together
 with an OAuth token. Configured shared-folder URLs do not replace these paths
-and do not enable search by themselves. `program_url` selects the DOCX program;
-if it is empty, the interactive workflow asks for a public Yandex Disk file
-link and saves it to the current OS settings file. When a song from the program
+and do not enable search by themselves. `priority_cloud_disk` selects the
+program source (`google` or `yandex`), using `program_google_url` or
+`program_yandex_url`. There is no automatic switch to the other cloud on failure.
+New installations default to Google. Existing settings without a priority retain
+their `program_url` source; that legacy URL remains a fallback only for the
+selected cloud when its dedicated URL is empty.
+Saved program URLs and cloud priority are validated only when that configured
+program is requested. Invalid program settings do not block a local DOCX,
+an explicit `--program-url`, independent library updates, or the settings menu.
+If the selected source has no URL, the interactive workflow asks for a public
+link from that cloud and saves it to the current OS settings file. When a song from the program
 cannot be found, the workflow reports the status of every song and lets the
 operator enter an alternative title to retry the search. Successful
 alternatives are stored locally in the ignored
 `obs_local/song_title_aliases.json` file and reused on later runs. Enter an
 empty response to skip an alternative. If a saved alias no longer finds a
 match, the original program title is tried as a fallback. A prompted program
-link is saved only after Yandex Disk returns a valid DOCX. Non-interactive runs
+link is saved only after the selected service returns a valid DOCX. Non-interactive runs
 can still use `--program-file` or `--program-url`.
 If Yandex Disk responds with HTTP 429, the interactive workflow explains that
 the public API is rate-limiting requests and lets the operator retry or provide
@@ -340,7 +361,27 @@ tail -n 100 /dev/shm/pptx2png_tasks/obs_local/logs/debug.log
 Use `--debug` to also print DEBUG messages in the console, or `--log-dir PATH`
 to select another log directory. The public document link and temporary
 download URL are redacted from diagnostic messages.
-The configured `program_url` must be a public file link from Yandex Disk in
+The configured `program_url` accepts a public Google Docs link
+`https://docs.google.com/document/d/<id>/edit` (including `?usp=sharing`).
+Set sharing to **Anyone with the link** and allow viewers to download the
+document. The workflow exports it as DOCX without Google credentials and applies
+the same 50 MB limit and DOCX validation as Yandex downloads. Login/CAPTCHA pages
+are rejected; download failures use the existing retry/local DOCX/cancel menu.
+In the settings menu choose `priority_cloud_disk` → `1` (Google) or `2`
+(Yandex), then enter the matching `program_google_url` or `program_yandex_url`.
+The menu exposes these options even for older OS settings files. For example:
+
+```ini
+[Song preparation]
+priority_cloud_disk = google
+program_google_url = https://docs.google.com/document/d/<id>/edit?usp=sharing
+program_yandex_url = https://disk.yandex.ru/d/<public-key>
+```
+
+`--program-url` overrides the selected source for one run; local
+`--program-file` still takes priority. This does not change Yandex song search.
+
+For Yandex Disk, use a public file link in
 `https://disk.yandex.ru/d/<public-key>` or `https://disk.yandex.ru/i/<public-key>`
 format. A
 `https://docs.yandex.ru/view/d/<id>` link opens the document viewer but its ID

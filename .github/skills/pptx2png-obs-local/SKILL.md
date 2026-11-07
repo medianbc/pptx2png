@@ -36,7 +36,9 @@ feature exists. For a new checkout/chat, use the
 ## Current workflow and behavior
 
 - `python -m obs_local` opens the main menu: `1` presentations, `2` songs,
-  `3` updates, `4` settings, `0`/Enter exit.
+  `3` settings, `0`/Enter exit. Settings contains the numbered update-check
+  action after token entry; successful installation exits the whole menu for
+  restart, cancellation/failure/no update returns to settings.
 - The songs submenu offers `1` read program, `2` update local song library,
   `0`/Enter back. Library updates work independently of the meeting program:
   download missing configured remote materials and create PNG ZIP cache,
@@ -52,6 +54,10 @@ feature exists. For a new checkout/chat, use the
 - Song cancellation uses `prepare_songs.OperationCancelled`; both the menu and
   direct CLI handle it normally without an error or traceback. Presentation
   recovery keeps its own `1` retry, `2` local file, `0` cancel numbering.
+- Presentation category ranges are kept only during the current preparation,
+  including back/change-selection paths. Mode `2` converts one category; mode
+  `4` edits/selects multiple categories, renders once and writes separate
+  category folders under one run directory. Do not persist edits to source files.
 - Song search prioritizes local PNG ZIPs, then local PPTX, then configured
   Yandex Disk ZIP/PPTX sources. Matching supports strong partial title matches;
   ambiguous candidates are not selected automatically.
@@ -87,9 +93,16 @@ feature exists. For a new checkout/chat, use the
   `%LOCALAPPDATA%/pptx2png/obs_local/logs` with a home AppData fallback.
   The old Linux default is replaced on migration to another OS; custom paths
   are retained, so verify them on a new computer. Do not delete old logs.
-- The configured program URL must be a public Yandex Disk file link accepted by
-  the public-resource API; a Yandex document viewer URL is not necessarily an
-  API public key.
+- The configured program URL accepts public Yandex Disk file links or Google
+  Docs `/document/d/<id>/edit` links. Google Docs is exported as DOCX without
+  credentials and requires public viewing and downloads enabled. Both sources
+  use DOCX validation, size limits and the same recovery menu. A Yandex document
+  viewer URL is not necessarily an API public key.
+- `priority_cloud_disk` selects `google` or `yandex` and its dedicated
+  `program_google_url`/`program_yandex_url`. New templates default to Google;
+  existing settings retain their legacy `program_url` source when no priority
+  is set. A failed priority source immediately offers recovery, never an
+  automatic request to the other cloud. `--program-url` overrides for one run.
 - Public program download still uses the public-resource API. A direct
   `?download=1` page can return HTML CAPTCHA with HTTP 200, not DOCX; validate
   content and do not bypass CAPTCHA.
