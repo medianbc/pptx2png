@@ -105,5 +105,5 @@ printf '\nУстановка завершена.\n'
 printf 'Проект: %s\n' "$INSTALL_DIR"
 printf 'Локальный режим OBS: cd "%s" && ./start_obs_local.sh\n' "$INSTALL_DIR"
 printf 'Подготовка песен:   cd "%s" && ./prepare_obs_songs.sh --debug\n' "$INSTALL_DIR"
-printf 'Настройки OBS:       %s/obs_local/settings.ini\n' "$INSTALL_DIR"
+printf 'Настройки OBS:       %s/obs_local/settings.linux.ini (создаётся при первом запуске)\n' "$INSTALL_DIR"
 printf 'Токен Яндекс.Диска:  %s/config.ini\n' "$INSTALL_DIR"

@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ import aiohttp
 from pptx2png_core.converter_engine import convert_all_pngs
 from pptx2png_core.yandex_disk import YandexDiskClient, get_nearest_sunday
 
-from .config_utils import update_ini_file
+from .config_utils import default_log_dir, get_settings_path, update_ini_file
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,12 +43,15 @@ MAX_ZIP_PNG_BYTES = 512 * 1024 * 1024
 MAX_ZIP_PNG_FILES = 1000
 MAX_PROGRAM_DOCX_BYTES = 50 * 1024 * 1024
 MAX_YANDEX_SEARCH_DEPTH = 3
-DEFAULT_RAM_LOG_DIR = "/dev/shm/pptx2png_tasks/obs_local/logs"
 LOGGER = logging.getLogger(__name__)
 
 
 class ProgramRateLimitError(RuntimeError):
     """Raised when Yandex Disk temporarily rate-limits the public API."""
+
+
+class OperationCancelled(Exception):
+    """Raised when the operator cancels song preparation."""
 
 
 def format_user_error(error: Exception) -> str:
@@ -114,19 +118,23 @@ def _load_yandex_token() -> str:
 
 def load_config() -> dict[str, Any]:
     settings = configparser.ConfigParser(interpolation=None)
-    settings_path = BASE_DIR / "settings.ini"
+    settings_path = get_settings_path(BASE_DIR)
     if not settings.read(settings_path, encoding="utf-8"):
         raise RuntimeError(f"Не найден файл настроек: {settings_path}")
 
     if not settings.has_section("OBS Local paths"):
-        raise RuntimeError("В settings.ini отсутствует секция [OBS Local paths]")
+        raise RuntimeError(
+            f"В {settings_path.name} отсутствует секция [OBS Local paths]"
+        )
     song_settings = settings["Song preparation"] if settings.has_section(
         "Song preparation"
     ) else {}
     obs_settings = settings["OBS Local paths"]
     root_path = _resolve_path(obs_settings.get("root_path", "").strip())
     if not str(obs_settings.get("root_path", "")).strip():
-        raise RuntimeError("В settings.ini не задан [OBS Local paths] root_path")
+        raise RuntimeError(
+            f"В {settings_path.name} не задан [OBS Local paths] root_path"
+        )
 
     quality = obs_settings.get("quality", "standard").strip().lower()
     if quality not in {"standard", "2k", "4k"}:
@@ -139,22 +147,9 @@ def load_config() -> dict[str, Any]:
     configured_log_dir = settings.get(
         "Logging", "log_dir", fallback=""
     ).strip()
-    if sys.platform == "darwin" and configured_log_dir in {
-        "",
-        DEFAULT_RAM_LOG_DIR,
-    }:
-        log_dir = Path.home() / "Library" / "Logs" / "pptx2png" / "obs_local"
-        if configured_log_dir:
-            logging.warning(
-                "Настройка log_dir=%s предназначена для Linux; "
-                "на macOS используется %s",
-                configured_log_dir,
-                log_dir,
-            )
-    elif configured_log_dir:
-        log_dir = _resolve_path(configured_log_dir)
-    else:
-        log_dir = Path(DEFAULT_RAM_LOG_DIR)
+    log_dir = (
+        _resolve_path(configured_log_dir) if configured_log_dir else default_log_dir()
+    )
 
     return {
         "program_url": song_settings.get("program_url", "").strip(),
@@ -186,7 +181,7 @@ def load_config() -> dict[str, Any]:
 
 
 def setup_logging(log_dir: Path, console_debug: bool = False) -> None:
-    """Configure rotating INFO and DEBUG logs, matching the bot's log layout."""
+    """Keep rotating OBS logs separate from the concise interactive console."""
     log_dir.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
@@ -198,7 +193,7 @@ def setup_logging(log_dir: Path, console_debug: bool = False) -> None:
         "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     )
     info_handler = RotatingFileHandler(
-        log_dir / "bot.log",
+        log_dir / "obs_local.log",
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -218,7 +213,7 @@ def setup_logging(log_dir: Path, console_debug: bool = False) -> None:
     root_logger.addHandler(debug_handler)
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if console_debug else logging.INFO)
+    console_handler.setLevel(logging.DEBUG if console_debug else logging.WARNING)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
     logging.info("Логирование OBS song preparation настроено: %s", log_dir)
@@ -254,7 +249,7 @@ def _table_rows(table: ElementTree.Element) -> list[list[str]]:
 
 
 def _normalize(value: str) -> str:
-    normalized = value.casefold().replace("ё", "е")
+    normalized = unicodedata.normalize("NFC", value).casefold().replace("ё", "е")
     return re.sub(r"[\W_]+", " ", normalized, flags=re.UNICODE).strip()
 
 
@@ -329,7 +324,7 @@ def ensure_program_url(
             raise RuntimeError(
                 "Ссылка на программу не введена. Запустите подготовку "
                 "в интерактивном терминале или задайте program_url "
-                "в settings.ini."
+                "в настройках текущей ОС."
             ) from error
         if not url:
             print("Ссылка не может быть пустой.")
@@ -1226,33 +1221,43 @@ async def run(
                                 session, url, program_file
                             )
                             downloaded_program = True
-                        except ProgramRateLimitError as error:
+                        except (
+                            RuntimeError, aiohttp.ClientError, asyncio.TimeoutError
+                        ) as error:
                             if not interactive:
                                 raise
-                            print(f"\n{error}")
-                            print(
-                                "Введите путь к локальному DOCX; нажмите "
-                                "Enter, чтобы повторить запрос, или введите "
-                                "esc/exit для отмены."
-                            )
+                            log_user_error(error, "Ошибка загрузки программы")
+                            print(f"\n{format_user_error(error)}")
                             input_fn = input_fn or input
                             retry_requested = False
                             while True:
+                                print(
+                                    "1. Повторить запрос\n"
+                                    "2. Ввести путь к локальному файлу DOCX\n"
+                                    "3. Отменить, вернуться назад"
+                                )
                                 try:
                                     answer = input_fn(
-                                        "Путь к DOCX или Enter для повтора: "
-                                    ).strip()
+                                        "Действие [3 — отмена]: "
+                                    ).strip() or "3"
                                 except EOFError as input_error:
-                                    raise RuntimeError(
-                                        "Подготовка песен отменена."
-                                    ) from input_error
-                                if answer.casefold() in {"esc", "exit", "q"}:
-                                    raise RuntimeError(
-                                        "Подготовка песен отменена."
-                                    )
-                                if not answer:
+                                    raise OperationCancelled from input_error
+                                if answer == "3":
+                                    raise OperationCancelled
+                                if answer == "1":
                                     retry_requested = True
                                     break
+                                if answer != "2":
+                                    print("Введите 1, 2 или 3.")
+                                    continue
+                                try:
+                                    answer = input_fn(
+                                        "Путь к DOCX [Enter — назад]: "
+                                    ).strip()
+                                except EOFError as input_error:
+                                    raise OperationCancelled from input_error
+                                if not answer:
+                                    continue
 
                                 local_program = Path(
                                     answer.strip("\"' ")
@@ -1260,8 +1265,7 @@ async def run(
                                 if not local_program.is_file():
                                     print(
                                         f"Файл не найден: {local_program}. "
-                                        "Введите путь ещё раз или Enter для "
-                                        "повтора запроса."
+                                        "Выберите действие повторно."
                                     )
                                     continue
                                 try:
@@ -1269,8 +1273,7 @@ async def run(
                                 except RuntimeError as file_error:
                                     print(
                                         f"Некорректный DOCX: {file_error}. "
-                                        "Укажите другой файл или нажмите "
-                                        "Enter для повтора запроса."
+                                        "Выберите действие повторно."
                                     )
                                     continue
                                 program_file = local_program
@@ -1286,20 +1289,14 @@ async def run(
                                 "подождите или укажите локальный DOCX."
                             )
                             continue
-                        except RuntimeError as error:
-                            if not prompted_program_url:
-                                raise
-                            print(f"Не удалось проверить DOCX: {error}")
-                            url = ensure_program_url(config, input_fn)
-                            continue
                         break
                     if prompted_program_url and downloaded_program:
                         update_ini_file(
-                            BASE_DIR / "settings.ini",
+                            get_settings_path(BASE_DIR),
                             {"Song preparation": {"program_url": url}},
                         )
                         config["program_url"] = url
-                        print("Ссылка сохранена в obs_local/settings.ini.")
+                        print("Ссылка сохранена в настройках текущей ОС.")
 
             LOGGER.info("Разбор программы: %s", program_file.name)
             songs = extract_song_titles(program_file, target_date)
@@ -1528,7 +1525,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--program-url",
-        help="Публичная ссылка на DOCX; если не задана, берётся из settings.ini.",
+        help="Публичная ссылка на DOCX; если не задана, берётся из настроек текущей ОС.",
     )
     parser.add_argument(
         "--log-dir",
@@ -1567,6 +1564,8 @@ def main() -> None:
                 interactive=sys.stdin.isatty(),
             )
         )
+    except OperationCancelled:
+        print("Подготовка песен отменена.")
     except Exception as error:
         if logging.getLogger().handlers:
             log_user_error(error, "Подготовка песен завершилась ошибкой")

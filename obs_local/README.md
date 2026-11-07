@@ -3,6 +3,9 @@
 > Russian version: [README.RU.md](README.RU.md). Keep both files aligned whenever
 > the local OBS workflow documentation changes.
 
+For everyday operation and the menu map, see the
+[Russian user guide](USER_GUIDE.RU.md).
+
 This package downloads a presentation from Yandex Disk, lets the operator
 select a category and slide range, and writes PNG files to the configured
 local OBS directory. Conversion and Yandex Disk operations are shared with the
@@ -102,7 +105,8 @@ on the target machine as well.
    when running the installer. The selected path is saved in both launchers
    and used by presentation and song conversion.
 
-4. Configure `obs_local/settings.ini` and `config.ini` as described below.
+4. Configure `obs_local/settings.macos.ini` (created on first launch) and
+   `config.ini` as described below.
    Interactive presentation preparation requires a Yandex Disk OAuth token
    and `[YandexDisk] base_path`. The installer can prompt for the token and
    saves the secret file with owner-only permissions.
@@ -114,12 +118,16 @@ on the target machine as well.
    ```
 
 The menu offers presentation preparation (`1`), song preparation (`2`),
-update checking (`3`), and exit (`0`). Update checking contacts GitHub only
+update checking (`3`), settings (`4`), and exit (`0`). Settings lists numbered
+parameters from the current OS settings file and saves edits while preserving comments.
+A separate numbered action accepts a hidden Yandex token and saves it in
+private `config.ini` files. Empty input keeps the current parameter value.
+Update checking contacts GitHub only
 after you select it. If a newer revision exists, the menu asks before changing
 files. Git checkouts are updated with a fast-forward only; uncommitted changes
 are stashed and restored, and local commits that cannot be fast-forwarded are
 not overwritten. Archive installations download the matching branch while
-preserving `.venv`, `config.ini`, `obs_local/settings.ini`, song assets, and
+preserving `.venv`, `config.ini`, all local OBS settings files, song assets, and
 generated launchers. The updater tracks installed source files and removes
 obsolete tracked files; installations predating the manifest begin tracking
 files with their first update. Archive updates are staged and roll back source
@@ -159,7 +167,16 @@ obs_local.run_obs_local` and `python -m obs_local.prepare_songs`.
 
 ## Configuration
 
-- `obs_local/settings.ini` contains non-secret options. `[YandexDisk]` defines
+- Non-secret options live in independent `obs_local/settings.linux.ini`,
+  `obs_local/settings.macos.ini`, and `obs_local/settings.windows.ini` files.
+  The OS is selected automatically; there is no runtime merging between files.
+  On first launch, the current OS file is created from the legacy
+  `obs_local/settings.ini` with existing values and comments preserved.
+  The standard Linux log path is replaced with the OS default during this
+  one-time migration; custom paths are preserved. Later edits affect only the
+  selected file. These local files are ignored by Git and preserved by updates.
+  `settings.ini` remains only an initial template/legacy migration source.
+  `[YandexDisk]` defines
   `base_path` and `source_folder` used to fetch the upcoming Sunday's
   presentation.
 - `[OBS Local paths]` defines `root_path` and quality (`standard`, `2k`, or
@@ -185,22 +202,27 @@ token = YOUR_OAUTH_TOKEN
 `python -m obs_local` (or `start_obs_local.sh`) opens a menu to choose
 presentation or song preparation. The presentation workflow lists
 presentations for the upcoming Sunday from Yandex Disk and asks the operator to
-select one (`0`, `q`, or `cancel` cancels the selection). It reads speaker notes and lets the
+select one (`0` or Enter cancels the selection). It reads speaker notes and lets the
 operator prepare all slides, select a detected category, or enter one or more
 custom slide ranges (for example `1-4, 7, 9-11`). The chosen slides and output
 category are shown for confirmation before rendering; the operator can return
 to selection or cancel. Output is written to
 `root_path/YYYY-MM-DD/presentation/run-id/category`. The interactive workflow
 prompts for missing paths, quality and Yandex Disk token on first run, saves
-ordinary settings to `settings.ini` and the token to a private `config.ini`.
+ordinary settings to the current OS file and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
 
 If the upcoming Sunday's service folder or presentation is missing on Yandex
-Disk, the workflow reports it and offers to retry the search (press Enter), use
-a local `.ppt`/`.pptx` file (enter its path), or cancel (enter `esc` or `exit`).
+Disk, the workflow reports it and offers numbered actions: retry (`1`),
+open a local `.ppt`/`.pptx` file (`2`, then enter its path), or cancel (`0` or Enter).
 Cancelling returns to the main menu, so song preparation can still be selected.
 
-The song-preparation menu option reads song titles from the DOCX tables for the
+The song submenu offers `1` to read the program, `2` to update the local song
+library, and `0` to return. Library updating scans the configured Yandex Disk
+directories and caches missing materials as PNG ZIPs without reading a program
+or changing the meeting output. Existing valid cached ZIPs are kept.
+Menu choices use numbers, not words or letters; bracketed defaults apply on Enter.
+Reading the program extracts song titles from the DOCX tables for the
 selected Sunday, searches local PNG ZIPs and PPTX files, and
 then searches Yandex Disk ZIP/PPTX files when remote paths and a token are
 configured. PPTX files are rendered to PNG and placed in separate numbered
@@ -212,7 +234,7 @@ Yandex API search uses `yandex_zip_png_paths` and `yandex_pptx_paths` together
 with an OAuth token. Configured shared-folder URLs do not replace these paths
 and do not enable search by themselves. `program_url` selects the DOCX program;
 if it is empty, the interactive workflow asks for a public Yandex Disk file
-link and saves it to `obs_local/settings.ini`. When a song from the program
+link and saves it to the current OS settings file. When a song from the program
 cannot be found, the workflow reports the status of every song and lets the
 operator enter an alternative title to retry the search. Successful
 alternatives are stored locally in the ignored
@@ -223,7 +245,16 @@ link is saved only after Yandex Disk returns a valid DOCX. Non-interactive runs
 can still use `--program-file` or `--program-url`.
 If Yandex Disk responds with HTTP 429, the interactive workflow explains that
 the public API is rate-limiting requests and lets the operator retry or provide
-a local DOCX program instead.
+a local DOCX program instead. Network errors, timeouts, and an invalid downloaded
+file also offer numbered actions: retry (`1`), use a local DOCX (`2`), or cancel
+(`3` or Enter), returning to the songs submenu without reporting cancellation
+as an error. Empty input at the local path prompt returns to the recovery menu.
+The same menu handles failures of newly entered program links.
+No automatic retry loop is started.
+The shared link normally opens a viewer page rather than delivering DOCX bytes.
+Even HTTP 200 may be CAPTCHA HTML; it does not guarantee a working API-free
+download. The workflow uses the public API for shared links and validates the
+downloaded DOCX; it does not bypass CAPTCHA.
 
 ## Test song preparation for OBS
 
@@ -241,8 +272,10 @@ is still created and marked `(не найдено)` when no matching material is
 Matching prefers a complete song title in the filename; if none is found, a
 candidate with at least 75% of the title's words in common may be used.
 Ambiguous candidates are not selected automatically.
+Titles and filenames are normalized to Unicode NFC before matching, so
+composed and decomposed letters (such as `й`) match identically.
 
-Configure `[Song preparation]` in `obs_local/settings.ini` and place local files
+Configure `[Song preparation]` in the current OS settings file and place local files
 in `local_zip_dir` or `local_pptx_dir`. To test with a local DOCX instead of
 downloading the configured program:
 
@@ -273,17 +306,23 @@ set `cache_missing_yandex_song_zips = true` in `[Song preparation]`.
 `yandex_zip_png_url` is currently retained as configuration metadata; it does
 not drive API search. Search uses the configured folder paths and OAuth token.
 
-On macOS, song-preparation logs are written to
-`~/Library/Logs/pptx2png/obs_local/` when the settings file contains the
-repository's Linux `/dev/shm` default. On Linux, the default remains
-`/dev/shm/pptx2png_tasks/obs_local/logs/`. A custom directory can be passed
-with `--log-dir PATH`.
+Log directories are initialized for the selected OS, as described below.
+A custom directory can be passed with `--log-dir PATH`.
 
 ## Logs and troubleshooting
 
-Song preparation writes rotating `bot.log` (INFO and above) and `debug.log`
+Song preparation writes rotating `obs_local.log` (INFO and above) and `debug.log`
 (DEBUG and above) files to the directory configured by `[Logging] log_dir`.
-The default on Raspberry Pi is:
+Default directories:
+
+- Linux: `/dev/shm/pptx2png_tasks/obs_local/logs/`.
+- macOS: `~/Library/Logs/pptx2png/obs_local/`.
+- Windows: `%LOCALAPPDATA%/pptx2png/obs_local/logs/` (falls back to
+  `~/AppData/Local/pptx2png/obs_local/logs/`).
+
+The console normally shows warnings/errors only; INFO and DEBUG remain in the
+files. Existing `bot.log` files are left untouched; new runs use `obs_local.log`.
+The Linux directory is:
 
 ```text
 /dev/shm/pptx2png_tasks/obs_local/logs/

@@ -108,6 +108,10 @@ class ArchiveUpdateTests(unittest.TestCase):
             (project_dir / "obs_local" / "settings.ini").write_text(
                 "local settings", encoding="utf-8"
             )
+            for platform in ("linux", "macos", "windows"):
+                (project_dir / "obs_local" / f"settings.{platform}.ini").write_text(
+                    f"local {platform} settings", encoding="utf-8"
+                )
             (project_dir / "config.ini").write_text(
                 "private token", encoding="utf-8"
             )
@@ -135,6 +139,10 @@ class ArchiveUpdateTests(unittest.TestCase):
                 (destination / "obs_local" / "settings.ini").write_text(
                     "default settings", encoding="utf-8"
                 )
+                for platform in ("linux", "macos", "windows"):
+                    (destination / "obs_local" / f"settings.{platform}.ini").write_text(
+                        "archive must not overwrite local settings", encoding="utf-8"
+                    )
                 (destination / "obs_local" / "menu.py").write_text(
                     "new source", encoding="utf-8"
                 )
@@ -163,6 +171,13 @@ class ArchiveUpdateTests(unittest.TestCase):
                 ),
                 "local settings",
             )
+            for platform in ("linux", "macos", "windows"):
+                self.assertEqual(
+                    (project_dir / "obs_local" / f"settings.{platform}.ini").read_text(
+                        encoding="utf-8"
+                    ),
+                    f"local {platform} settings",
+                )
             self.assertEqual(
                 (project_dir / "config.ini").read_text(encoding="utf-8"),
                 "private token",

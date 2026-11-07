@@ -4,10 +4,133 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import configparser
+import getpass
 import logging
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+from pptx2png_core.yandex_disk import YandexDiskClient
 
 from . import app, prepare_songs, updater
+from .config_utils import get_settings_path, update_ini_file
+
+
+def _settings_menu(input_fn: Callable[[str], str]) -> None:
+    while True:
+        try:
+            path = get_settings_path(app.BASE_DIR)
+            settings = configparser.ConfigParser(interpolation=None)
+            if not settings.read(path, encoding="utf-8"):
+                print(f"Не найден файл настроек: {path}")
+                return
+            entries = [
+                (section, key, value)
+                for section in settings.sections()
+                for key, value in settings.items(section)
+                if key.lower() != "token"
+            ]
+            print("\nНастройки OBS")
+            for index, (section, key, value) in enumerate(entries, 1):
+                print(f"  {index}. [{section}] {key} = {value}")
+            token_choice = str(len(entries) + 1)
+            print(f"  {token_choice}. Ввести токен Яндекс.Диска")
+            print("  0. Назад")
+            choice = input_fn("Параметр [0]: ").strip() or "0"
+            if choice == "0":
+                return
+            if choice == token_choice:
+                token = getpass.getpass("OAuth-токен (ввод скрыт): ").strip()
+                if not token or "\n" in token or "\r" in token:
+                    raise ValueError("Токен должен быть непустой строкой.")
+                update_ini_file(
+                    app.PROJECT_DIR / "config.ini",
+                    {"YandexDisk": {"token": token}},
+                    file_mode=0o600,
+                )
+                local_config = app.BASE_DIR / "config.ini"
+                if local_config.is_file():
+                    update_ini_file(
+                        local_config,
+                        {"YandexDisk": {"token": token}},
+                        file_mode=0o600,
+                    )
+                print("Токен сохранён.")
+                continue
+            if not choice.isdecimal() or not 1 <= int(choice) <= len(entries):
+                print("Введите номер из списка.")
+                continue
+            section, key, old_value = entries[int(choice) - 1]
+            value = input_fn(f"Новое значение [{old_value}] (Enter — оставить): ")
+            if not value.strip():
+                continue
+            value = value.strip()
+            if "\n" in value or "\r" in value:
+                raise ValueError("Значение должно занимать одну строку.")
+            if key == "quality" and value not in {"standard", "2k", "4k"}:
+                raise ValueError("Качество: standard, 2k или 4k.")
+            if key == "cache_missing_yandex_song_zips":
+                if value.lower() not in configparser.ConfigParser.BOOLEAN_STATES:
+                    raise ValueError("Укажите true или false.")
+            if key == "program_url":
+                prepare_songs._normalize_program_public_key(value)
+            update_ini_file(path, {section: {key: value}})
+            print("Настройка сохранена.")
+        except EOFError:
+            return
+        except configparser.Error as error:
+            print(f"Не удалось прочитать настройки: {error}")
+            return
+        except OSError as error:
+            print(f"Не удалось изменить настройки: {error}")
+            return
+        except (ValueError, RuntimeError) as error:
+            print(f"Не удалось изменить настройки: {error}")
+
+
+async def _update_song_library(config: dict[str, Any]) -> None:
+    if not config["yandex_token"]:
+        raise RuntimeError("Для обновления библиотеки нужен токен Яндекс.Диска.")
+    if not config["yandex_zip_png_paths"] and not config["yandex_pptx_paths"]:
+        raise RuntimeError("Не заданы каталоги песен на Яндекс.Диске.")
+    with tempfile.TemporaryDirectory(prefix="song_library_") as directory:
+        async with aiohttp.ClientSession() as session:
+            client = YandexDiskClient(config["yandex_token"], session)
+            cached, failed = await prepare_songs._cache_remote_song_zips(
+                client, config, Path(directory)
+            )
+    print(f"Обновление библиотеки: создано ZIP {cached}, ошибок {failed}.")
+    if failed:
+        raise RuntimeError("Некоторые материалы не обработаны; подробности в журнале.")
+
+
+def _songs_menu(input_fn: Callable[[str], str], *, debug: bool) -> None:
+    while True:
+        print(
+            "\nПодготовка песен\n  1. Прочитать программу\n"
+            "  2. Обновить локальную папку песен\n  0. Назад"
+        )
+        try:
+            choice = input_fn("Действие [0]: ").strip() or "0"
+        except EOFError:
+            return
+        if choice == "0":
+            return
+        if choice == "1":
+            _prepare_songs(console_debug=debug)
+        elif choice == "2":
+            try:
+                config = prepare_songs.load_config()
+                prepare_songs.setup_logging(config["log_dir"], console_debug=debug)
+                asyncio.run(_update_song_library(config))
+            except Exception as error:
+                prepare_songs.log_user_error(error, "Ошибка обновления библиотеки")
+                print(f"Ошибка обновления библиотеки: {error}")
+        else:
+            print("Введите 1, 2 или 0.")
 
 
 def _prepare_presentation() -> None:
@@ -36,6 +159,8 @@ def _prepare_songs(console_debug: bool = False) -> None:
                 interactive=True,
             )
         )
+    except prepare_songs.OperationCancelled:
+        print("Подготовка песен отменена.")
     except Exception as error:
         if logging.getLogger().handlers:
             prepare_songs.log_user_error(
@@ -72,11 +197,11 @@ def _check_updates(input_fn: Callable[[str], str]) -> bool:
             f"(ветка {update.branch})."
         )
     try:
-        answer = input_fn("Установить обновление и проверить зависимости? [y/N]: ")
+        answer = input_fn("1. Установить обновление\n0. Отмена\nВаш выбор [0]: ")
     except EOFError:
         print("Обновление отменено.")
         return False
-    if answer.strip().lower() not in {"y", "yes", "д", "да"}:
+    if answer.strip() != "1":
         print("Обновление отменено.")
         return False
 
@@ -107,6 +232,7 @@ def run_menu(
         for key, (label, _) in actions.items():
             print(f"  {key}. {label}")
         print("  3. Проверить обновления")
+        print("  4. Настройки")
         print("  0. Выход")
 
         try:
@@ -115,18 +241,21 @@ def run_menu(
             print("\nВыход.")
             return
 
-        if choice in {"0", "q", "quit", "exit", "выход"}:
+        if choice == "0" or not choice:
             return
+        if choice == "4":
+            _settings_menu(input_fn)
+            continue
         if choice == "3":
             if _check_updates(input_fn):
                 return
             continue
         action = actions.get(choice)
         if action is None:
-            print("Введите 1, 2, 3 или 0.")
+            print("Введите 1, 2, 3, 4 или 0.")
             continue
         if choice == "2":
-            _prepare_songs(console_debug=debug)
+            _songs_menu(input_fn, debug=debug)
         else:
             action[1]()
 
