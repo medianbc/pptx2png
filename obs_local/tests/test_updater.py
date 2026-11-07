@@ -540,9 +540,10 @@ class GitCheckoutUpdateTests(unittest.TestCase):
             )
             self.assertEqual(self._git(checkout, "stash", "list"), "")
 
-    def test_stash_conflict_keeps_backup_in_stash(self):
+    def test_stash_conflict_restores_previous_revision_and_local_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             _, seed, checkout = self._create_checkout(Path(temp_dir))
+            previous_revision = self._git(checkout, "rev-parse", "HEAD")
             (checkout / "tracked.txt").write_text("local edit\n", encoding="utf-8")
             (seed / "tracked.txt").write_text("remote edit\n", encoding="utf-8")
             self._git(seed, "add", "tracked.txt")
@@ -550,11 +551,21 @@ class GitCheckoutUpdateTests(unittest.TestCase):
             self._git(seed, "push", "origin", "main")
             remote_revision = self._git(seed, "rev-parse", "HEAD")
 
-            with self.assertRaisesRegex(updater.UpdateError, "без конфликта"):
+            with self.assertRaisesRegex(
+                updater.UpdateError,
+                "исходная ревизия и локальные изменения восстановлены",
+            ):
                 self._apply_update(checkout, "main", remote_revision)
 
-            self.assertIn("stash@{0}", self._git(checkout, "stash", "list"))
-            self.assertEqual(self._git(checkout, "rev-parse", "HEAD"), remote_revision)
+            self.assertEqual(self._git(checkout, "stash", "list"), "")
+            self.assertEqual(
+                self._git(checkout, "rev-parse", "HEAD"),
+                previous_revision,
+            )
+            self.assertEqual(
+                (checkout / "tracked.txt").read_text(encoding="utf-8"),
+                "local edit\n",
+            )
 
 
 if __name__ == "__main__":

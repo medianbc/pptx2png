@@ -220,10 +220,27 @@ def _update_git_checkout(
             text=True,
         )
         if result.returncode != 0:
+            try:
+                _run_git("reset", "--hard", previous_revision)
+            except Exception as rollback_error:
+                raise UpdateError(
+                    "Не удалось вернуть исходную ревизию после конфликта "
+                    "локальных изменений. Резервная копия осталась в git stash. "
+                    f"{rollback_error}"
+                ) from rollback_error
+            try:
+                _restore_stash()
+            except Exception as restore_error:
+                raise UpdateError(
+                    "Исходная ревизия восстановлена, но локальные изменения "
+                    "не удалось вернуть автоматически. Резервная копия "
+                    "осталась в git stash. "
+                    f"{restore_error}"
+                ) from restore_error
             raise UpdateError(
-                "Исходники обновлены, но локальные изменения не удалось "
-                "вернуть без конфликта. Резервная копия осталась в git stash; "
-                "разрешите конфликт вручную. "
+                "Локальные изменения конфликтуют с обновлением; исходная "
+                "ревизия и локальные изменения восстановлены. Разрешите "
+                "конфликт локально и повторите обновление через меню OBS. "
                 f"{result.stderr.strip()}"
             )
 
