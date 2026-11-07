@@ -45,7 +45,10 @@ not update source files in an existing checkout.
   available and installs one through Homebrew only when needed.
 - LibreOffice for PPT/PPTX-to-PDF/PNG conversion. If it is not found in a
   standard application location or on `PATH`, the installer installs it using
-  the Homebrew cask.
+  the Homebrew cask. The selected path is saved in the generated launchers.
+  Set `PPTX2PNG_LIBREOFFICE_PATH` when running the installer to use an
+  executable in a non-standard location; it can also be overridden when
+  launching a workflow.
 
 The repository does not specify a minimum macOS version. The
 `OBS macOS installation` GitHub Actions workflow installs the package on a
@@ -95,7 +98,9 @@ on the target machine as well.
    ```
 
    If LibreOffice is installed elsewhere, ensure `soffice` is available on
-   `PATH`.
+   `PATH`, or set `PPTX2PNG_LIBREOFFICE_PATH` to the executable's full path
+   when running the installer. The selected path is saved in both launchers
+   and used by presentation and song conversion.
 
 4. Configure `obs_local/settings.ini` and `config.ini` as described below.
    Interactive presentation preparation requires a Yandex Disk OAuth token
