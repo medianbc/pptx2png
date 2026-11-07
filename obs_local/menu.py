@@ -22,26 +22,29 @@ from .config_utils import get_settings_path, update_ini_file
 def _settings_menu(input_fn: Callable[[str], str]) -> bool:
     while True:
         try:
-            path = get_settings_path(app.BASE_DIR)
-            settings = configparser.ConfigParser(interpolation=None)
-            if not settings.read(path, encoding="utf-8"):
-                print(f"Не найден файл настроек: {path}")
-                return False
-            entries = [
-                (section, key, value)
-                for section in settings.sections()
-                for key, value in settings.items(section)
-                if key.lower() != "token"
-            ]
-            legacy_url = settings.get("Song preparation", "program_url", fallback="")
-            default_cloud = prepare_songs._legacy_program_cloud(legacy_url)
-            for key, default in (
-                ("priority_cloud_disk", default_cloud),
-                ("program_google_url", ""),
-                ("program_yandex_url", ""),
-            ):
-                if not settings.has_option("Song preparation", key):
-                    entries.append(("Song preparation", key, default))
+            entries = []
+            try:
+                path = get_settings_path(app.BASE_DIR)
+                settings = configparser.ConfigParser(interpolation=None)
+                with path.open(encoding="utf-8") as source:
+                    settings.read_file(source)
+                entries = [
+                    (section, key, value)
+                    for section in settings.sections()
+                    for key, value in settings.items(section)
+                    if key.lower() != "token"
+                ]
+                legacy_url = settings.get("Song preparation", "program_url", fallback="")
+                default_cloud = prepare_songs._legacy_program_cloud(legacy_url)
+                for key, default in (
+                    ("priority_cloud_disk", default_cloud),
+                    ("program_google_url", ""),
+                    ("program_yandex_url", ""),
+                ):
+                    if not settings.has_option("Song preparation", key):
+                        entries.append(("Song preparation", key, default))
+            except (configparser.Error, OSError, UnicodeError) as error:
+                print(f"Не удалось прочитать настройки: {error}")
             print("\nНастройки OBS")
             for index, (section, key, value) in enumerate(entries, 1):
                 print(f"  {index}. [{section}] {key} = {value}")
