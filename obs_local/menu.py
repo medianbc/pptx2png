@@ -8,7 +8,6 @@ import configparser
 import getpass
 import logging
 import tempfile
-from urllib.parse import urlparse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -35,7 +34,7 @@ def _settings_menu(input_fn: Callable[[str], str]) -> bool:
                 if key.lower() != "token"
             ]
             legacy_url = settings.get("Song preparation", "program_url", fallback="")
-            default_cloud = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
+            default_cloud = prepare_songs._legacy_program_cloud(legacy_url)
             for key, default in (
                 ("priority_cloud_disk", default_cloud),
                 ("program_google_url", ""),

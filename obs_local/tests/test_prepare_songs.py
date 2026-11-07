@@ -211,9 +211,62 @@ class ConfigTests(unittest.TestCase):
                         "[OBS Local paths]\nroot_path = ./png\n[Song preparation]\n" + options,
                         encoding="utf-8",
                     )
-                    with patch.object(prepare_songs, "get_settings_path", return_value=path):
-                        with self.assertRaises(RuntimeError):
-                            prepare_songs.load_config()
+                    with (
+                        patch.object(prepare_songs, "get_settings_path", return_value=path),
+                        patch.object(prepare_songs, "_load_yandex_token", return_value=""),
+                    ):
+                        config = prepare_songs.load_config()
+                    with self.assertRaises(RuntimeError):
+                        asyncio.run(prepare_songs.run(date(2026, 10, 4), config=config))
+
+    def test_bad_saved_program_does_not_block_local_file_override_or_library(self):
+        from obs_local import menu
+
+        for priority in ("google", "invalid"):
+            with self.subTest(priority=priority), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "settings.ini"
+                path.write_text(
+                    "[OBS Local paths]\nroot_path = " + str(root / "output") + "\n"
+                    "[Song preparation]\n"
+                    f"priority_cloud_disk = {priority}\n"
+                    "program_url = https://[broken\n"
+                    "program_google_url = https://[broken\n"
+                    "yandex_zip_png_paths = /synthetic/zip\n",
+                    encoding="utf-8",
+                )
+                with (
+                    patch.object(prepare_songs, "get_settings_path", return_value=path),
+                    patch.object(prepare_songs, "_load_yandex_token", return_value="synthetic-token"),
+                ):
+                    config = prepare_songs.load_config()
+                program = root / "local.docx"
+                _create_docx(program)
+                with (
+                    patch.object(prepare_songs, "_process_songs", new_callable=AsyncMock, return_value=[]),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    asyncio.run(prepare_songs.run(
+                        date(2026, 10, 4), program_file=program, config=config,
+                    ))
+                    async def download(_session, _url, destination):
+                        destination.write_bytes(program.read_bytes())
+                    with patch.object(
+                        prepare_songs, "download_program_docx",
+                        new_callable=AsyncMock, side_effect=download,
+                    ) as download_mock:
+                        asyncio.run(prepare_songs.run(
+                            date(2026, 10, 4), program_url=GoogleProgramDownloadTests.URL,
+                            config=config,
+                        ))
+                    download_mock.assert_awaited_once()
+                with (
+                    patch.object(menu.prepare_songs, "_cache_remote_song_zips",
+                                 new_callable=AsyncMock, return_value=(0, 0)) as cache,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    asyncio.run(menu._update_song_library(config))
+                cache.assert_awaited_once()
 
     def test_template_defaults_to_google_priority(self):
         with (

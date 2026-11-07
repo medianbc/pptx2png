@@ -178,6 +178,28 @@ class MainMenuTests(unittest.TestCase):
             settings.read(menu.get_settings_path(root), encoding="utf-8")
             self.assertEqual(settings.get("Song preparation", "program_url"), url)
 
+    def test_malformed_legacy_url_does_not_trap_settings_or_updates(self):
+        for answers, expected in (
+            (["0"], "https://[broken"),
+            (["1", "https://disk.yandex.ru/d/repaired", "0"], "https://disk.yandex.ru/d/repaired"),
+            (["6", "0"], "https://[broken"),
+        ):
+            with self.subTest(answers=answers), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.ini"
+                path.write_text("[Song preparation]\nprogram_url = https://[broken\n", encoding="utf-8")
+                input_fn = Mock(side_effect=answers)
+                with (
+                    patch.object(menu, "get_settings_path", return_value=path),
+                    patch.object(menu, "_check_updates", return_value=False) as check,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertFalse(menu._settings_menu(input_fn))
+                self.assertEqual(input_fn.call_count, len(answers))
+                self.assertEqual(check.call_count, int(answers[0] == "6"))
+                settings = configparser.ConfigParser()
+                settings.read(path, encoding="utf-8")
+                self.assertEqual(settings.get("Song preparation", "program_url"), expected)
+
     def test_settings_exposes_priority_and_cloud_links_for_existing_configs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

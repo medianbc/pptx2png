@@ -239,6 +239,9 @@ program source (`google` or `yandex`), using `program_google_url` or
 New installations default to Google. Existing settings without a priority retain
 their `program_url` source; that legacy URL remains a fallback only for the
 selected cloud when its dedicated URL is empty.
+Saved program URLs and cloud priority are validated only when that configured
+program is requested. Invalid program settings do not block a local DOCX,
+an explicit `--program-url`, independent library updates, or the settings menu.
 If the selected source has no URL, the interactive workflow asks for a public
 link from that cloud and saves it to the current OS settings file. When a song from the program
 cannot be found, the workflow reports the status of every song and lets the

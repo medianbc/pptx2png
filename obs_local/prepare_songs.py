@@ -121,6 +121,15 @@ def _load_yandex_token() -> str:
     return ""
 
 
+def _legacy_program_cloud(url: str) -> str:
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        LOGGER.warning("Сохранённая ссылка программы некорректна; исправьте её в настройках.")
+        return "yandex"
+    return "google" if host == "docs.google.com" else "yandex"
+
+
 def load_config() -> dict[str, Any]:
     settings = configparser.ConfigParser(interpolation=None)
     settings_path = get_settings_path(BASE_DIR)
@@ -159,15 +168,11 @@ def load_config() -> dict[str, Any]:
     if "priority_cloud_disk" in song_settings:
         priority = song_settings["priority_cloud_disk"].strip().lower()
     else:
-        priority = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
-    if priority not in {"google", "yandex"}:
-        raise RuntimeError("priority_cloud_disk должен быть google или yandex")
+        priority = _legacy_program_cloud(legacy_url)
     program_url_option = f"program_{priority}_url"
     program_url = song_settings.get(program_url_option, "").strip()
-    if program_url:
-        _validate_program_cloud_url(program_url, priority)
-    elif legacy_url:
-        legacy_cloud = "google" if urlparse(legacy_url).hostname == "docs.google.com" else "yandex"
+    if not program_url and legacy_url:
+        legacy_cloud = _legacy_program_cloud(legacy_url)
         if legacy_cloud == priority:
             program_url = legacy_url
             if "priority_cloud_disk" not in song_settings:
@@ -809,7 +814,10 @@ def _zip_has_valid_pngs(zip_path: Path) -> bool:
 
 
 def _normalize_program_public_key(url: str) -> str:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as error:
+        raise RuntimeError("Ссылка программы содержит некорректный адрес") from error
     if parsed.scheme != "https":
         raise RuntimeError(
             "Ссылка программы должна использовать HTTPS"
@@ -1251,6 +1259,11 @@ async def run(
 ) -> list[SongResult]:
     config = config or load_config()
     url = (program_url or config["program_url"]).strip()
+    if program_file is None and program_url is None:
+        priority = config.get("priority_cloud_disk")
+        if priority is not None:
+            if priority not in {"google", "yandex"}:
+                raise RuntimeError("priority_cloud_disk должен быть google или yandex")
     prompted_program_url = False
     if program_file is None and not url and interactive:
         url = ensure_program_url(config, input_fn)
@@ -1292,6 +1305,10 @@ async def run(
                     downloaded_program = False
                     while True:
                         try:
+                            if program_url is None and config.get("priority_cloud_disk"):
+                                _validate_program_cloud_url(
+                                    url, config["priority_cloud_disk"],
+                                )
                             await download_program_docx(
                                 session, url, program_file
                             )
