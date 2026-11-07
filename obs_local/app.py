@@ -27,6 +27,7 @@ from pptx2png_core.yandex_disk import (
 )
 
 from .config_utils import update_ini_file as _update_ini_file
+from .config_utils import get_settings_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,7 +61,7 @@ def load_config(
     input_fn = input_fn or input
     secret_input_fn = secret_input_fn or getpass.getpass
     settings = configparser.ConfigParser(interpolation=None)
-    settings_path = BASE_DIR / "settings.ini"
+    settings_path = get_settings_path(BASE_DIR)
 
     if not settings.read(settings_path, encoding="utf-8"):
         raise RuntimeError(f"Не найден файл настроек: {settings_path}")
@@ -97,12 +98,13 @@ def load_config(
 
     if quality not in {"standard", "2k", "4k"} and interactive:
         while True:
-            quality = input_fn(
-                "Качество PNG [standard/2k/4k, по умолчанию standard]: "
-            ).strip().lower() or "standard"
+            choice = input_fn(
+                "Качество PNG: 1. standard, 2. 2k, 3. 4k [1]: "
+            ).strip() or "1"
+            quality = {"1": "standard", "2": "2k", "3": "4k"}.get(choice, "")
             if quality in {"standard", "2k", "4k"}:
                 break
-            print("Введите standard, 2k или 4k.")
+            print("Введите 1, 2 или 3.")
         settings_updates.setdefault("OBS Local paths", {})["quality"] = quality
 
     if settings_updates:
@@ -123,9 +125,9 @@ def load_config(
     if not token:
         raise RuntimeError("В config.ini не задан [YandexDisk] token")
     if not base_path:
-        raise RuntimeError("В settings.ini не задан [YandexDisk] base_path")
+        raise RuntimeError(f"В {settings_path.name} не задан [YandexDisk] base_path")
     if not root_value:
-        raise RuntimeError("В settings.ini не задан [OBS Local paths] root_path")
+        raise RuntimeError(f"В {settings_path.name} не задан [OBS Local paths] root_path")
     if quality not in {"standard", "2k", "4k"}:
         raise RuntimeError("quality должен быть standard, 2k или 4k")
 
@@ -199,26 +201,25 @@ async def download_presentation(
                 problem = f"Папка служения за {sunday:%d.%m.%Y} не найдена."
             print(f"\n{problem}")
             print("Можно продолжить подготовку одним из способов:")
-            print("  Enter       — повторить поиск на Яндекс.Диске")
-            print("  путь к PPTX — открыть локальный файл (.pptx или .ppt)")
-            print("  esc / exit  — введите для возврата в меню")
+            print("  1. Повторить поиск на Яндекс.Диске")
+            print("  2. Открыть локальный файл (.pptx или .ppt)")
+            print("  0. Вернуться в меню")
             try:
-                answer = input_fn("Ваш выбор: ").strip()
+                answer = input_fn("Ваш выбор [0]: ").strip() or "0"
             except EOFError as error:
                 raise OperationCancelled from error
 
-            if answer.lower() in {
-                "\x1b",
-                "esc",
-                "exit",
-                "quit",
-                "q",
-                "выход",
-                "отмена",
-            }:
+            if answer == "0":
                 raise OperationCancelled
-            if not answer:
+            if answer == "1":
                 continue
+            if answer != "2":
+                print("Введите 1, 2 или 0.")
+                continue
+            try:
+                answer = input_fn("Путь к файлу PPT/PPTX: ").strip()
+            except EOFError as error:
+                raise OperationCancelled from error
 
             local_path = Path(answer.strip("\"'")).expanduser()
             if local_path.suffix.lower() not in {".ppt", ".pptx"}:
@@ -235,10 +236,12 @@ async def download_presentation(
 
         while True:
             try:
-                answer = input_fn("Номер презентации [0 — отмена]: ").strip()
-                if answer.lower() in {"0", "q", "cancel", "отмена"}:
+                answer = input_fn("Номер презентации [0 — отмена]: ").strip() or "0"
+                if answer == "0":
                     raise OperationCancelled
                 choice = int(answer) - 1
+            except EOFError as error:
+                raise OperationCancelled from error
             except ValueError:
                 choice = -1
             if 0 <= choice < len(files):
@@ -283,21 +286,23 @@ def _select_range(
 ) -> tuple[str, list[tuple[int, int]]]:
     while True:
         print("\nВыберите способ обработки:")
-        print("  all      — все слайды")
-        print("  category — категория по заметкам или заданный вручную диапазон")
-        print("  custom   — произвольные номера и диапазоны")
-        print("  cancel   — отменить")
-        mode = input("Режим [all]: ").strip().lower() or "all"
+        print("  1. Все слайды")
+        print("  2. Категория по заметкам / изменить диапазон категории")
+        print("  3. Произвольные номера и диапазоны")
+        print("  0. Отменить")
+        try:
+            choice = input("Режим [1]: ").strip() or "1"
+        except EOFError as error:
+            raise OperationCancelled from error
         aliases = {
             "1": "all",
             "2": "category",
             "3": "custom",
-            "q": "cancel",
-            "отмена": "cancel",
+            "0": "cancel",
         }
-        mode = aliases.get(mode, mode)
+        mode = aliases.get(choice)
         if mode not in {"all", "category", "custom", "cancel"}:
-            print("Введите all, category, custom или cancel.")
+            print("Введите 1, 2, 3 или 0.")
             continue
         if mode == "cancel":
             raise OperationCancelled
@@ -314,7 +319,10 @@ def _select_range(
                 suggested = f"{start}-{end}" if start is not None else "не найден"
                 print(f"  {index}. {CATEGORIES[key]} ({suggested})")
             while True:
-                answer = input("Номер категории [0 — назад]: ").strip()
+                try:
+                    answer = input("Номер категории [0 — назад]: ").strip() or "0"
+                except EOFError as error:
+                    raise OperationCancelled from error
                 if answer == "0":
                     break
                 try:
@@ -335,9 +343,14 @@ def _select_range(
                 print("Диапазон по заметкам не найден; задайте его вручную.")
 
         while True:
-            value = input(
-                f"Слайды [{default or 'обязательно'}; формат 1, 3-5]: "
-            ).strip() or default
+            try:
+                value = input(
+                    f"Слайды [{default or 'обязательно'}; формат 1, 3-5; 0 — назад]: "
+                ).strip() or default
+            except EOFError as error:
+                raise OperationCancelled from error
+            if value == "0":
+                break
             try:
                 return category, _parse_slide_ranges(value, total_slides)
             except ValueError as error:
@@ -385,15 +398,19 @@ def _confirm_selection(
     print(f"\nВыбрано: {selected} ({count} из {total_slides} слайдов)")
     print(f"Каталог категории: {CATEGORIES.get(category, category)}")
     while True:
-        answer = input_fn("Продолжить? [Y — да, E — изменить, Q — отмена]: ")
-        answer = answer.strip().lower()
-        if answer in {"", "y", "yes", "д", "да"}:
+        try:
+            answer = input_fn(
+                "1. Конвертировать выбранные\n2. Изменить выбор\n0. Отмена\nВаш выбор [1]: "
+            ).strip() or "1"
+        except EOFError as error:
+            raise OperationCancelled from error
+        if answer == "1":
             return True
-        if answer in {"e", "edit", "и", "изменить"}:
+        if answer == "2":
             return False
-        if answer in {"q", "quit", "cancel", "отмена"}:
+        if answer == "0":
             raise OperationCancelled
-        print("Введите Y, E или Q.")
+        print("Введите 1, 2 или 0.")
 
 
 def _safe_name(value: str) -> str:

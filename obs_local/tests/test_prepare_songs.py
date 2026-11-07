@@ -98,6 +98,31 @@ class ExtractSongTitlesTests(unittest.TestCase):
 
 
 class SongMatchingTests(unittest.TestCase):
+    def test_match_quality_accepts_decomposed_unicode_in_either_title(self):
+        for composed, decomposed in (
+            ("Долг мой уплатил", "Долг мои\u0306 уплатил"),
+            ("Всё прекрасно", "Все\u0308 прекрасно"),
+        ):
+            for filename, title in ((composed, decomposed), (decomposed, composed)):
+                with self.subTest(filename=filename, title=title):
+                    self.assertEqual(
+                        prepare_songs._song_match_quality(filename, title), 2
+                    )
+
+    def test_local_search_matches_decomposed_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for suffix in (".zip", ".pptx"):
+                candidate = root / f"Долг мои\u0306 уплатил{suffix}"
+                candidate.touch()
+                with self.subTest(suffix=suffix):
+                    self.assertEqual(
+                        prepare_songs._find_local_matches(
+                            root, "Долг мой уплатил", suffix
+                        ),
+                        [candidate],
+                    )
+
     def test_match_quality_accepts_strong_partial_title_and_yo_variant(self):
         self.assertEqual(
             prepare_songs._song_match_quality(
@@ -203,6 +228,7 @@ class ConfigTests(unittest.TestCase):
                 patch.object(prepare_songs, "PROJECT_DIR", project_dir),
                 patch.object(prepare_songs.sys, "platform", "darwin"),
                 patch.object(Path, "home", return_value=project_dir),
+                self.assertNoLogs(level="WARNING"),
             ):
                 config = prepare_songs.load_config()
 
@@ -341,21 +367,28 @@ class SongOutputTests(unittest.TestCase):
         original_handlers = root_logger.handlers[:]
         original_level = root_logger.level
         try:
-            with tempfile.TemporaryDirectory() as directory:
+            with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(
+                io.StringIO()
+            ) as console:
                 log_dir = Path(directory)
                 prepare_songs.setup_logging(log_dir)
                 logging.info("info diagnostic test")
                 logging.debug("debug diagnostic test")
+                logging.warning("warning diagnostic test")
                 for handler in root_logger.handlers:
                     handler.flush()
 
-                self.assertIn("info diagnostic test", (log_dir / "bot.log").read_text(
+                self.assertIn("info diagnostic test", (log_dir / "obs_local.log").read_text(
                     encoding="utf-8"
                 ))
                 self.assertIn(
                     "debug diagnostic test",
                     (log_dir / "debug.log").read_text(encoding="utf-8"),
                 )
+                self.assertNotIn("info diagnostic test", console.getvalue())
+                self.assertNotIn("debug diagnostic test", console.getvalue())
+                self.assertIn("warning diagnostic test", console.getvalue())
+                self.assertFalse((log_dir / "bot.log").exists())
         finally:
             for handler in root_logger.handlers[:]:
                 root_logger.removeHandler(handler)
@@ -533,9 +566,12 @@ class SongOutputTests(unittest.TestCase):
             session = FakeSession()
             inputs = iter(
                 [
-                    "",
+                    "1",
+                    "2",
                     str(missing_program),
+                    "2",
                     str(invalid_program),
+                    "2",
                     str(local_program),
                     "",
                     "",
@@ -580,6 +616,110 @@ class SongOutputTests(unittest.TestCase):
                     )
 
         asyncio.run(execute())
+
+    def test_download_failures_offer_local_docx_without_another_request(self):
+        failures = (
+            prepare_songs.ProgramRateLimitError("HTTP 429"),
+            RuntimeError("HTML CAPTCHA вместо DOCX"),
+            prepare_songs.aiohttp.ClientConnectionError("connection failed"),
+            asyncio.TimeoutError(),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                local_program = root / "local.docx"
+                _create_docx(local_program)
+                config = {
+                    "program_url": "https://disk.yandex.ru/i/example_program",
+                    "song_title_aliases_path": root / "aliases.json",
+                    "zip_dir": root / "zip",
+                    "pptx_dir": root / "pptx",
+                    "yandex_zip_png_paths": [],
+                    "yandex_pptx_paths": [],
+                    "cache_missing_yandex_song_zips": False,
+                    "output_dir": root / "output",
+                    "quality": "standard",
+                    "yandex_token": "",
+                }
+                inputs = iter(["invalid", "2", "", "2", str(root / "missing.docx"),
+                               "2", str(local_program), "", ""])
+                with patch.object(
+                    prepare_songs, "download_program_docx",
+                    new_callable=AsyncMock, side_effect=failure,
+                ) as download:
+                    results = asyncio.run(
+                        prepare_songs.run(
+                            date(2026, 10, 4), config=config, interactive=True,
+                            input_fn=lambda _: next(inputs),
+                        )
+                    )
+                self.assertEqual(len(results), 2)
+                download.assert_awaited_once()
+
+    def test_empty_recovery_choice_cancels_without_replacing_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            (output / "keep.png").write_bytes(PNG)
+            config = {
+                "program_url": "https://disk.yandex.ru/i/example_program",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "output_dir": output,
+                "quality": "standard",
+                "yandex_token": "",
+            }
+            with patch.object(
+                prepare_songs, "download_program_docx",
+                new_callable=AsyncMock,
+                side_effect=prepare_songs.ProgramRateLimitError("HTTP 429"),
+            ) as download:
+                with self.assertRaises(prepare_songs.OperationCancelled):
+                    asyncio.run(
+                        prepare_songs.run(
+                            date(2026, 10, 4), config=config, interactive=True,
+                            input_fn=lambda _: "",
+                        )
+                    )
+            download.assert_awaited_once()
+            self.assertEqual((output / "keep.png").read_bytes(), PNG)
+
+    def test_new_program_link_failure_can_cancel_with_three_or_eof(self):
+        for choice in ("3", EOFError()):
+            with self.subTest(choice=choice), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = {
+                    "program_url": "", "zip_dir": root / "zip",
+                    "pptx_dir": root / "pptx", "output_dir": root / "output",
+                    "yandex_zip_png_paths": [], "yandex_pptx_paths": [],
+                    "quality": "standard", "yandex_token": "",
+                }
+                answers = Mock(side_effect=[
+                    "https://disk.yandex.ru/d/new-program", choice,
+                ])
+                with (
+                    patch.object(prepare_songs, "download_program_docx",
+                                 new_callable=AsyncMock,
+                                 side_effect=RuntimeError("invalid DOCX")) as download,
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    with self.assertRaises(prepare_songs.OperationCancelled):
+                        asyncio.run(prepare_songs.run(
+                            date(2026, 10, 4), config=config,
+                            interactive=True, input_fn=answers,
+                        ))
+                self.assertIn(
+                    "1. Повторить запрос\n"
+                    "2. Ввести путь к локальному файлу DOCX\n"
+                    "3. Отменить, вернуться назад",
+                    output.getvalue(),
+                )
+                download.assert_awaited_once()
+                self.assertEqual(config["program_url"], "")
+                self.assertFalse(config["output_dir"].exists())
 
     def test_download_passes_disk_public_link_to_api(self):
         public_url = "https://disk.yandex.ru/d/example_public_key"
@@ -983,6 +1123,49 @@ class SongOutputTests(unittest.TestCase):
         self.assertEqual(second_results[1].status, "ready")
         self.assertEqual(second_results[1].title, "Песня вторая")
 
+    def test_legacy_alias_for_decomposed_title_still_finds_material(self):
+        for title in ("Долг мои\u0306 уплатил", "Долг мой уплатил"):
+            with self.subTest(title=title), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                zip_dir = root / "zip"
+                zip_dir.mkdir()
+                archive_path = zip_dir / "Alt title.zip"
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("slide_1.png", PNG)
+                aliases_path = root / "aliases.json"
+                aliases_path.write_text(
+                    '{"долг мои уплатил": "Alt title"}', encoding="utf-8"
+                )
+                aliases = prepare_songs.load_song_title_aliases(aliases_path)
+                staging = root / "output"
+                staging.mkdir()
+                results = asyncio.run(prepare_songs._process_songs(
+                    [title], staging,
+                    {"zip_dir": zip_dir, "pptx_dir": root / "pptx",
+                     "quality": "standard"},
+                    None, root, aliases,
+                ))
+                self.assertEqual(results[0].status, "ready")
+                self.assertEqual(results[0].source, str(archive_path))
+                self.assertEqual(results[0].title, title)
+
+    def test_nfc_alias_takes_precedence_over_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "output"
+            staging.mkdir()
+            aliases = {"долг мой уплатил": "Current", "долг мои уплатил": "Legacy"}
+            with patch.object(
+                prepare_songs, "_process_song", new_callable=AsyncMock,
+                return_value=prepare_songs.SongResult(
+                    "Current", staging / "song", status="ready"
+                ),
+            ) as process:
+                asyncio.run(prepare_songs._process_songs(
+                    ["Долг мои\u0306 уплатил"], staging, {}, None, root, aliases
+                ))
+            self.assertEqual(process.await_args.args[0], "Current")
+
     def test_saved_alias_falls_back_to_original_title_if_alias_is_missing(self):
         with tempfile.TemporaryDirectory(
             dir="/dev/shm" if Path("/dev/shm").is_dir() else None
@@ -1052,14 +1235,18 @@ class SongOutputTests(unittest.TestCase):
             inputs = iter(
                 [
                     "https://disk.yandex.ru/d/not-a-docx",
-                    "https://disk.yandex.ru/d/valid-docx",
+                    "1",
                     "",
                     "",
                 ]
             )
 
+            download_attempts = 0
+
             async def download_docx(_session, _url, destination):
-                if _url.endswith("not-a-docx"):
+                nonlocal download_attempts
+                download_attempts += 1
+                if download_attempts == 1:
                     destination.write_bytes(b"invalid")
                     raise RuntimeError("Скачанный файл не похож на DOCX")
                 _create_docx(destination)
@@ -1080,14 +1267,15 @@ class SongOutputTests(unittest.TestCase):
                         input_fn=lambda _: next(inputs),
                     )
                 )
-                saved_settings = settings_path.read_text(encoding="utf-8")
+                saved_settings = prepare_songs.get_settings_path(obs_dir).read_text(encoding="utf-8")
 
-        self.assertEqual(config["program_url"], "https://disk.yandex.ru/d/valid-docx")
+        self.assertEqual(config["program_url"], "https://disk.yandex.ru/d/not-a-docx")
         self.assertIn(
-            "program_url = https://disk.yandex.ru/d/valid-docx",
+            "program_url = https://disk.yandex.ru/d/not-a-docx",
             saved_settings,
         )
         self.assertEqual(len(results), 2)
+        self.assertEqual(download_attempts, 2)
 
     def test_local_program_file_keeps_interactive_retry_prompt_enabled(self):
         config = {"log_dir": Path("/dev/shm")}

@@ -163,7 +163,9 @@ from pathlib import Path
 project = Path(sys.argv[1])
 preserved = {
     ".git", ".venv", "config.ini", "obs_local/config.ini",
-    "obs_local/settings.ini", "obs_local/song_title_aliases.json",
+    "obs_local/settings.ini", "obs_local/settings.linux.ini",
+    "obs_local/settings.macos.ini", "obs_local/settings.windows.ini",
+    "obs_local/song_title_aliases.json",
     "obs_png", "prepare_obs_songs.sh", "song_assets", "start_obs_local.sh",
     ".pptx2png-version.json", ".pptx2png-files.json",
     ".pptx2png-archive-install",
@@ -247,5 +249,5 @@ printf '\nInstallation complete.\n'
 printf 'Project:             %s\n' "$INSTALL_DIR"
 printf 'Local OBS workflow:  cd "%s" && ./start_obs_local.sh\n' "$INSTALL_DIR"
 printf 'Prepare song slides: cd "%s" && ./prepare_obs_songs.sh --debug\n' "$INSTALL_DIR"
-printf 'OBS settings:        %s/obs_local/settings.ini\n' "$INSTALL_DIR"
+printf 'OBS settings:        %s/obs_local/settings.macos.ini (created on first launch)\n' "$INSTALL_DIR"
 printf 'Yandex Disk token:   %s/config.ini\n' "$INSTALL_DIR"

@@ -1,12 +1,18 @@
 import unittest
-from unittest.mock import Mock, patch
+import asyncio
+import configparser
+import contextlib
+import io
+import tempfile
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 from obs_local import menu
 
 
 class MainMenuTests(unittest.TestCase):
     def test_routes_to_each_workflow_and_exits(self):
-        answers = iter(["invalid", "1", "2", "0"])
+        answers = iter(["invalid", "1", "2", "1", "0", "0"])
 
         with (
             patch.object(menu, "_prepare_presentation") as prepare_presentation,
@@ -21,7 +27,7 @@ class MainMenuTests(unittest.TestCase):
         menu.run_menu(input_fn=Mock(side_effect=EOFError))
 
     def test_cancelling_presentation_returns_to_menu_for_song_preparation(self):
-        answers = iter(["1", "2", "0"])
+        answers = iter(["1", "2", "1", "0", "0"])
         with (
             patch.object(
                 menu.app,
@@ -66,7 +72,7 @@ class MainMenuTests(unittest.TestCase):
         app_main.assert_not_called()
 
     def test_update_check_can_install_and_exits_menu_afterwards(self):
-        answers = iter(["3", "y"])
+        answers = iter(["3", "1"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -83,7 +89,7 @@ class MainMenuTests(unittest.TestCase):
         install_update.assert_called_once_with(update)
 
     def test_update_check_can_be_cancelled(self):
-        answers = iter(["3", "n", "0"])
+        answers = iter(["3", "0", "0"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -99,6 +105,150 @@ class MainMenuTests(unittest.TestCase):
 
         install_update.assert_not_called()
 
+    def test_settings_edits_parameter_and_preserves_comments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings_path = root / "settings.ini"
+            settings_path.write_text(
+                "# keep\n[OBS Local paths]\nquality = standard\n",
+                encoding="utf-8",
+            )
+            answers = iter(["1", "2k", "0"])
+            with patch.object(menu.app, "BASE_DIR", root):
+                menu._settings_menu(lambda _: next(answers))
+            text = menu.get_settings_path(root).read_text(encoding="utf-8")
+            self.assertIn("# keep", text)
+            self.assertIn("quality = 2k", text)
+            self.assertIn("quality = standard", settings_path.read_text(encoding="utf-8"))
+
+    def test_settings_rejects_invalid_quality_and_keeps_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.ini"
+            original = "[OBS Local paths]\nquality = standard\n"
+            path.write_text(original, encoding="utf-8")
+            answers = iter(["1", "bad", "0"])
+            with patch.object(menu.app, "BASE_DIR", root):
+                menu._settings_menu(lambda _: next(answers))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertIn(
+                "quality = standard",
+                menu.get_settings_path(root).read_text(encoding="utf-8"),
+            )
+
+    def test_missing_settings_returns_without_repeated_prompts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(menu.app, "BASE_DIR", Path(directory)),
+                patch("builtins.print") as output,
+            ):
+                input_fn = Mock(side_effect=AssertionError("unexpected prompt"))
+                menu._settings_menu(input_fn)
+            input_fn.assert_not_called()
+            self.assertIn("Не найден файл настроек", output.call_args.args[0])
+
+    def test_token_is_hidden_saved_privately_and_updates_local_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "obs_local"
+            local.mkdir()
+            (local / "settings.ini").write_text(
+                "[OBS Local paths]\nquality = standard\n", encoding="utf-8"
+            )
+            (local / "config.ini").write_text(
+                "[YandexDisk]\ntoken = old\n", encoding="utf-8"
+            )
+            answers = iter(["3", "0"])
+            with (
+                patch.object(menu.app, "BASE_DIR", local),
+                patch.object(menu.app, "PROJECT_DIR", root),
+                patch.object(menu.getpass, "getpass", return_value="synthetic-token"),
+            ):
+                menu._settings_menu(lambda _: next(answers))
+            for path in (root / "config.ini", local / "config.ini"):
+                parser = configparser.ConfigParser()
+                parser.read(path)
+                self.assertEqual(parser.get("YandexDisk", "token"), "synthetic-token")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_song_library_menu_does_not_read_program(self):
+        answers = iter(["2", "0"])
+        config = {"log_dir": Path("/dev/shm")}
+        with (
+            patch.object(menu.prepare_songs, "load_config", return_value=config),
+            patch.object(menu.prepare_songs, "setup_logging"),
+            patch.object(menu, "_update_song_library", new_callable=AsyncMock) as update,
+            patch.object(menu, "_prepare_songs") as read_program,
+        ):
+            menu._songs_menu(lambda _: next(answers), debug=False)
+        update.assert_awaited_once_with(config)
+        read_program.assert_not_called()
+
+    def test_library_update_calls_shared_cache_without_program(self):
+        config = {
+            "yandex_token": "synthetic-token",
+            "yandex_zip_png_paths": ["/zip"],
+            "yandex_pptx_paths": ["/pptx"],
+        }
+        with (
+            patch.object(menu, "YandexDiskClient") as client,
+            patch.object(menu.prepare_songs, "_cache_remote_song_zips",
+                         new_callable=AsyncMock, return_value=(2, 0)) as cache,
+            patch.object(menu.prepare_songs, "download_program_docx") as download,
+        ):
+            asyncio.run(menu._update_song_library(config))
+        self.assertEqual(cache.await_args.args[:2], (client.return_value, config))
+        download.assert_not_called()
+
+    def test_library_update_reports_partial_failures(self):
+        config = {
+            "yandex_token": "synthetic-token",
+            "yandex_zip_png_paths": ["/zip"],
+            "yandex_pptx_paths": [],
+        }
+        with (
+            patch.object(menu, "YandexDiskClient"),
+            patch.object(menu.prepare_songs, "_cache_remote_song_zips",
+                         new_callable=AsyncMock, return_value=(1, 1)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Некоторые материалы"):
+                asyncio.run(menu._update_song_library(config))
+
+    def test_library_update_requires_token(self):
+        with self.assertRaisesRegex(RuntimeError, "токен"):
+            asyncio.run(menu._update_song_library({"yandex_token": ""}))
+
+    def test_song_cancellation_returns_to_submenu_without_error(self):
+        answers = iter(["1", "0"])
+        with (
+            patch.object(menu.prepare_songs, "load_config",
+                         return_value={"log_dir": Path("/synthetic/logs")}),
+            patch.object(menu.prepare_songs, "setup_logging"),
+            patch.object(menu.prepare_songs, "run", new_callable=AsyncMock,
+                         side_effect=menu.prepare_songs.OperationCancelled),
+            patch.object(menu.prepare_songs, "log_user_error") as log_error,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            menu._songs_menu(lambda _: next(answers), debug=False)
+        self.assertEqual(output.getvalue().count("1. Прочитать программу"), 2)
+        self.assertIn("Подготовка песен отменена.", output.getvalue())
+        self.assertNotIn("Ошибка подготовки", output.getvalue())
+        log_error.assert_not_called()
+
+    def test_direct_song_cli_cancellation_is_not_an_error(self):
+        with (
+            patch("sys.argv", ["prepare_songs"]),
+            patch.object(menu.prepare_songs, "load_config",
+                         return_value={"log_dir": Path("/synthetic/logs")}),
+            patch.object(menu.prepare_songs, "setup_logging"),
+            patch.object(menu.prepare_songs, "run", new_callable=AsyncMock,
+                         side_effect=menu.prepare_songs.OperationCancelled),
+            patch.object(menu.prepare_songs, "log_user_error") as log_error,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            menu.prepare_songs.main()
+        self.assertIn("Подготовка песен отменена.", output.getvalue())
+        log_error.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

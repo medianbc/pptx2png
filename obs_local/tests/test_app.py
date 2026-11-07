@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from obs_local import app
 
@@ -23,10 +23,14 @@ class SlideRangeTests(unittest.TestCase):
                 app._parse_slide_ranges(value, 12)
 
     def test_all_slides_mode_returns_full_range(self):
-        with patch("builtins.input", side_effect=["all"]):
+        with patch("builtins.input", side_effect=["1"]):
             category, ranges = app._select_range({}, 12)
 
         self.assertEqual((category, ranges), ("all", [(1, 12)]))
+
+    def test_empty_input_uses_all_slides_default(self):
+        with patch("builtins.input", return_value=""):
+            self.assertEqual(app._select_range({}, 12), ("all", [(1, 12)]))
 
     def test_category_mode_uses_detected_range_by_default(self):
         results = {
@@ -34,7 +38,7 @@ class SlideRangeTests(unittest.TestCase):
             "opening": (None, None, []),
             "prayer": (None, None, []),
         }
-        with patch("builtins.input", side_effect=["category", "1", ""]):
+        with patch("builtins.input", side_effect=["2", "1", ""]):
             category, ranges = app._select_range(results, 12)
 
         self.assertEqual((category, ranges), ("sermon", [(3, 8)]))
@@ -45,7 +49,7 @@ class SlideRangeTests(unittest.TestCase):
             "opening": (None, None, []),
             "prayer": (None, None, []),
         }
-        with patch("builtins.input", side_effect=["category", "2", "2-4, 7"]):
+        with patch("builtins.input", side_effect=["2", "2", "2-4, 7"]):
             category, ranges = app._select_range(results, 12)
 
         self.assertEqual((category, ranges), ("opening", [(2, 4), (7, 7)]))
@@ -53,7 +57,7 @@ class SlideRangeTests(unittest.TestCase):
     def test_confirmation_can_return_to_selection(self):
         self.assertFalse(
             app._confirm_selection(
-                "custom", [(1, 2)], 12, input_fn=lambda _: "e"
+                "custom", [(1, 2)], 12, input_fn=lambda _: "2"
             )
         )
 
@@ -78,6 +82,22 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
         self.client.check_access = AsyncMock(return_value=(True, ""))
         self.client.download_file = AsyncMock(return_value=True)
 
+    def test_empty_remote_selection_cancels(self):
+        with (
+            patch.object(app.aiohttp, "ClientSession", return_value=self.session_context),
+            patch.object(app, "YandexDiskClient", return_value=self.client),
+            patch.object(app, "resolve_sunday_paths", new_callable=AsyncMock,
+                         return_value={"source": "/presentations/source"}),
+            patch.object(app, "find_pptx_in_source", new_callable=AsyncMock,
+                         return_value=[{"name": "deck.pptx"}]),
+        ):
+            with self.assertRaises(app.OperationCancelled):
+                asyncio.run(app.download_presentation(
+                    self.config, datetime(2026, 11, 8), self.temp_dir,
+                    input_fn=lambda _: "",
+                ))
+        self.client.download_file.assert_not_awaited()
+
     def test_missing_remote_folder_accepts_a_local_presentation(self):
         local_presentation = self.temp_dir / "local-deck.pptx"
         local_presentation.write_bytes(b"synthetic pptx placeholder")
@@ -98,7 +118,7 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
                     self.config,
                     datetime(2026, 11, 8),
                     self.temp_dir,
-                    input_fn=lambda _: str(local_presentation),
+                    input_fn=Mock(side_effect=["2", str(local_presentation)]),
                 )
             )
 
@@ -132,14 +152,14 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
                     self.config,
                     datetime(2026, 11, 8),
                     self.temp_dir,
-                    input_fn=lambda _: str(local_presentation),
+                    input_fn=Mock(side_effect=["2", str(local_presentation)]),
                 )
             )
 
         self.assertEqual(result, local_presentation)
         self.client.download_file.assert_not_awaited()
 
-    def test_enter_retries_yandex_search(self):
+    def test_numeric_choice_retries_yandex_search(self):
         paths = {"source": "/presentations/source"}
         presentation = {
             "name": "remote-deck.pptx",
@@ -163,7 +183,7 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
                 return_value=[presentation],
             ),
         ):
-            answers = iter(["", "1"])
+            answers = iter(["1", "1"])
             result = asyncio.run(
                 app.download_presentation(
                     self.config,
@@ -198,7 +218,7 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
                         self.config,
                         datetime(2026, 11, 8),
                         self.temp_dir,
-                        input_fn=lambda _: "exit",
+                        input_fn=lambda _: "0",
                     )
                 )
 
@@ -217,7 +237,7 @@ class InteractiveConfigTests(unittest.TestCase):
                 "source_folder = Meeting\n",
                 encoding="utf-8",
             )
-            answers = iter(["/disk/presentations", "", "invalid", "2k"])
+            answers = iter(["/disk/presentations", "", "invalid", "2"])
 
             with (
                 patch.object(app, "BASE_DIR", obs_dir),
@@ -229,7 +249,7 @@ class InteractiveConfigTests(unittest.TestCase):
                     secret_input_fn=lambda _: "test-token",
                 )
 
-            saved_settings = settings_path.read_text(encoding="utf-8")
+            saved_settings = app.get_settings_path(obs_dir).read_text(encoding="utf-8")
             secret_path = obs_dir / "config.ini"
             self.assertIn("# Keep user comments.", saved_settings)
             self.assertIn("# Keep section comment.", saved_settings)

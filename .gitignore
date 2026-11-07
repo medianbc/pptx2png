@@ -27,5 +27,8 @@ __pycache__/
 song_assets/
 obs_png/
 obs_local/song_title_aliases.json
+obs_local/settings.linux.ini
+obs_local/settings.macos.ini
+obs_local/settings.windows.ini
 .pptx2png-version.json
 .pptx2png-files.json
