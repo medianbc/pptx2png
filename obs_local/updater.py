@@ -160,10 +160,9 @@ def check_for_updates() -> UpdateInfo:
 def install_update(info: UpdateInfo) -> None:
     try:
         if info.is_git_checkout:
-            _update_git_checkout(info)
+            _update_git_checkout(info, install_dependencies=True)
         else:
-            _update_archive_install(info)
-        _install_python_dependencies()
+            _update_archive_install(info, install_dependencies=True)
         if not info.is_git_checkout:
             _write_version(info.branch, info.remote_revision)
     except UpdateError:
@@ -172,32 +171,13 @@ def install_update(info: UpdateInfo) -> None:
         raise UpdateError(f"Ошибка при установке обновления: {error}") from error
 
 
-def _update_git_checkout(info: UpdateInfo) -> None:
-    status = _run_git("status", "--porcelain", "--untracked-files=normal")
-    stash_created = False
-    if status:
-        previous_stash = _run_git(
-            "rev-parse", "--verify", "refs/stash", check=False
-        )
-        _run_git(
-            "stash",
-            "push",
-            "--include-untracked",
-            "-m",
-            "pptx2png OBS update backup",
-        )
-        current_stash = _run_git(
-            "rev-parse", "--verify", "refs/stash", check=False
-        )
-        stash_created = current_stash != previous_stash
-        remaining_status = _run_git(
-            "status", "--porcelain", "--untracked-files=normal"
-        )
-        if remaining_status:
-            raise UpdateError(
-                "Не удалось безопасно сохранить локальные изменения перед "
-                "обновлением; рабочая копия не обновлена."
-            )
+def _update_git_checkout(
+    info: UpdateInfo,
+    *,
+    install_dependencies: bool = False,
+) -> None:
+    previous_revision = _run_git("rev-parse", "HEAD")
+    stash_created = _stash_worktree_changes()
 
     try:
         _run_git("fetch", "origin", info.branch)
@@ -240,12 +220,92 @@ def _update_git_checkout(info: UpdateInfo) -> None:
             text=True,
         )
         if result.returncode != 0:
+            try:
+                _run_git("reset", "--hard", previous_revision)
+            except Exception as rollback_error:
+                raise UpdateError(
+                    "Не удалось вернуть исходную ревизию после конфликта "
+                    "локальных изменений. Резервная копия осталась в git stash. "
+                    f"{rollback_error}"
+                ) from rollback_error
+            try:
+                _restore_stash()
+            except Exception as restore_error:
+                raise UpdateError(
+                    "Исходная ревизия восстановлена, но локальные изменения "
+                    "не удалось вернуть автоматически. Резервная копия "
+                    "осталась в git stash. "
+                    f"{restore_error}"
+                ) from restore_error
             raise UpdateError(
-                "Исходники обновлены, но локальные изменения не удалось "
-                "вернуть без конфликта. Резервная копия осталась в git stash; "
-                "разрешите конфликт вручную. "
+                "Локальные изменения конфликтуют с обновлением; исходная "
+                "ревизия и локальные изменения восстановлены. Разрешите "
+                "конфликт локально и повторите обновление через меню OBS. "
                 f"{result.stderr.strip()}"
             )
+
+    if install_dependencies:
+        try:
+            _install_python_dependencies()
+        except Exception as error:
+            try:
+                _rollback_git_checkout(previous_revision)
+            except UpdateError as rollback_error:
+                raise UpdateError(
+                    "Не удалось установить Python-зависимости и вернуть "
+                    "предыдущую ревизию. Локальные изменения могут остаться "
+                    "в git stash. "
+                    f"{rollback_error}"
+                ) from error
+            raise UpdateError(
+                "Не удалось установить Python-зависимости; исходная ревизия "
+                "и локальные изменения восстановлены. После устранения "
+                "ошибки повторите обновление через меню OBS."
+            ) from error
+
+
+def _stash_worktree_changes() -> bool:
+    status = _run_git("status", "--porcelain", "--untracked-files=normal")
+    if not status:
+        return False
+
+    previous_stash = _run_git(
+        "rev-parse", "--verify", "refs/stash", check=False
+    )
+    _run_git(
+        "stash",
+        "push",
+        "--include-untracked",
+        "-m",
+        "pptx2png OBS update backup",
+    )
+    current_stash = _run_git(
+        "rev-parse", "--verify", "refs/stash", check=False
+    )
+    stash_created = current_stash != previous_stash
+    remaining_status = _run_git(
+        "status", "--porcelain", "--untracked-files=normal"
+    )
+    if remaining_status:
+        if stash_created:
+            _restore_stash()
+        raise UpdateError(
+            "Не удалось безопасно сохранить локальные изменения перед "
+            "обновлением; рабочая копия не обновлена."
+        )
+    return stash_created
+
+
+def _rollback_git_checkout(previous_revision: str) -> None:
+    stash_created = _stash_worktree_changes()
+    try:
+        _run_git("reset", "--hard", previous_revision)
+    except Exception:
+        if stash_created:
+            _restore_stash()
+        raise
+    if stash_created:
+        _restore_stash()
 
 
 def _restore_stash() -> None:
@@ -308,7 +368,11 @@ def _download_archive(revision: str, destination: Path) -> None:
         raise UpdateError(f"Не удалось распаковать обновление: {error}") from error
 
 
-def _update_archive_install(info: UpdateInfo) -> None:
+def _update_archive_install(
+    info: UpdateInfo,
+    *,
+    install_dependencies: bool = False,
+) -> None:
     with tempfile.TemporaryDirectory(
         prefix=".pptx2png-update-", dir=PROJECT_DIR.parent
     ) as temp_dir:
@@ -337,6 +401,7 @@ def _update_archive_install(info: UpdateInfo) -> None:
             if (PROJECT_DIR / path).is_file()
         }
         changed_files: set[str] = set()
+        dependencies_failed = False
         try:
             for relative_name in backup_files:
                 backup_path = backup / relative_name
@@ -361,13 +426,25 @@ def _update_archive_install(info: UpdateInfo) -> None:
                 sorted(new_files),
             )
             changed_files.add(MANIFEST_FILE)
-        except (OSError, UpdateError) as error:
+            if install_dependencies:
+                try:
+                    _install_python_dependencies()
+                except Exception:
+                    dependencies_failed = True
+                    raise
+        except Exception as error:
             _rollback_archive_update(
                 changed_files,
                 backup_files,
                 backup,
             )
             if isinstance(error, UpdateError):
+                if dependencies_failed:
+                    raise UpdateError(
+                        "Не удалось установить Python-зависимости; "
+                        "исходники архивной установки восстановлены. После "
+                        "устранения ошибки повторите обновление через меню OBS."
+                    ) from error
                 raise
             raise UpdateError(
                 "Не удалось полностью установить архивное обновление; "
@@ -520,6 +597,6 @@ def _install_python_dependencies() -> None:
     except (OSError, subprocess.CalledProcessError) as error:
         raise UpdateError(
             "Исходники обновлены, но не удалось установить или проверить "
-            "Python-зависимости. Подробности выше; повторно запустите "
-            "установщик после устранения ошибки."
+            "Python-зависимости. Подробности выше; повторите обновление "
+            "через меню OBS после устранения ошибки."
         ) from error

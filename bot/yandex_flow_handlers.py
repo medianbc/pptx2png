@@ -230,6 +230,10 @@ async def cmd_sunday(message: types.Message, check_access, bot: Bot):
                         "cancelled": False,
                         "processing": False,
                         "awaiting_upload": True,
+                        "upload_expires_at": (
+                            time.time()
+                            + yandex_state.config.prompt_timeout_sec
+                        ),
                     }
 
             if race_detected:
@@ -417,13 +421,34 @@ def _is_awaiting_sunday_upload(message: types.Message) -> bool:
         return False
     session_key = f"yd_{message.from_user.id}_{message.chat.id}"
     session = sessions.get(session_key)
-    return bool(
+    if not (
         session
         and session.get("user_id") == message.from_user.id
         and session.get("chat_id") == message.chat.id
         and session.get("awaiting_upload")
         and not session.get("cancelled")
-    )
+    ):
+        return False
+
+    saved_sunday = session.get("sunday")
+    if hasattr(saved_sunday, "date"):
+        saved_sunday = saved_sunday.date()
+    current_sunday = get_nearest_sunday().date()
+    expires_at = session.get("upload_expires_at")
+    if expires_at is None:
+        expires_at = session.get("created_at", 0) + (
+            yandex_state.config.prompt_timeout_sec
+        )
+    if saved_sunday != current_sunday or time.time() >= expires_at:
+        if sessions.get(session_key) is session:
+            sessions.pop(session_key, None)
+        logging.info(
+            f"[YD-UPLOAD] Истекла сессия ожидания загрузки для "
+            f"{session_key}: воскресенье={saved_sunday}, "
+            f"актуальное={current_sunday}"
+        )
+        return False
+    return True
 
 
 @router.message(F.document, _is_awaiting_sunday_upload)
