@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -97,6 +98,12 @@ class ArchiveUpdateTests(unittest.TestCase):
             (project_dir / "start_obs_local.sh").write_text(
                 "local launcher", encoding="utf-8"
             )
+            (project_dir / "removed_module.py").write_text(
+                "obsolete", encoding="utf-8"
+            )
+            (project_dir / updater.MANIFEST_FILE).write_text(
+                json.dumps(["removed_module.py"]), encoding="utf-8"
+            )
             (project_dir / ".venv").mkdir()
             (project_dir / ".venv" / "keep").touch()
             info = updater.UpdateInfo(
@@ -141,6 +148,7 @@ class ArchiveUpdateTests(unittest.TestCase):
                 "local launcher",
             )
             self.assertTrue((project_dir / ".venv" / "keep").is_file())
+            self.assertFalse((project_dir / "removed_module.py").exists())
             self.assertEqual(
                 (project_dir / "obs_local" / "menu.py").read_text(
                     encoding="utf-8"
@@ -151,7 +159,46 @@ class ArchiveUpdateTests(unittest.TestCase):
                 (project_dir / updater.VERSION_FILE).read_text(encoding="utf-8")
             )
             self.assertEqual(version, {"branch": "main", "revision": "b" * 40})
+            manifest = json.loads(
+                (project_dir / updater.MANIFEST_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(manifest), {"obs_local/menu.py", "new_module.py"})
             install_deps.assert_called_once_with()
+
+    def test_failed_archive_replacement_restores_original_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / "a.py").write_text("old a", encoding="utf-8")
+            (project_dir / "z.py").write_text("old z", encoding="utf-8")
+            info = updater.UpdateInfo(
+                branch="main",
+                local_revision="a" * 40,
+                remote_revision="b" * 40,
+                available=True,
+                is_git_checkout=False,
+            )
+
+            def create_archive_source(_branch: str, destination: Path) -> None:
+                (destination / "a.py").write_text("new a", encoding="utf-8")
+                (destination / "z.py").write_text("new z", encoding="utf-8")
+
+            real_replace = updater.os.replace
+
+            def fail_on_second_source(source, target):
+                if Path(source).name == "z.py":
+                    raise OSError("simulated disk failure")
+                return real_replace(source, target)
+
+            with (
+                patch.object(updater, "PROJECT_DIR", project_dir),
+                patch.object(updater, "_download_archive", side_effect=create_archive_source),
+                patch.object(updater.os, "replace", side_effect=fail_on_second_source),
+            ):
+                with self.assertRaisesRegex(updater.UpdateError, "восстановлены"):
+                    updater._update_archive_install(info)
+
+            self.assertEqual((project_dir / "a.py").read_text(), "old a")
+            self.assertEqual((project_dir / "z.py").read_text(), "old z")
 
     def test_archive_extraction_rejects_parent_directory_paths(self):
         archive_buffer = io.BytesIO()
@@ -171,6 +218,173 @@ class ArchiveUpdateTests(unittest.TestCase):
                 urlopen.return_value = response
                 with self.assertRaises(updater.UpdateError):
                     updater._download_archive("main", Path(temp_dir))
+
+
+class GitCheckoutUpdateTests(unittest.TestCase):
+    def _git(self, directory: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def _create_checkout(self, root: Path) -> tuple[Path, Path, Path]:
+        origin = root / "origin.git"
+        seed = root / "seed"
+        checkout = root / "checkout"
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(origin)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(seed)],
+            check=True,
+            capture_output=True,
+        )
+        self._git(seed, "config", "user.name", "Updater Tests")
+        self._git(seed, "config", "user.email", "updater-tests@example.invalid")
+        (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(seed, "add", "tracked.txt")
+        self._git(seed, "commit", "-m", "base")
+        self._git(seed, "remote", "add", "origin", str(origin))
+        self._git(seed, "push", "-u", "origin", "main")
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                str(origin),
+                str(checkout),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self._git(checkout, "config", "user.name", "Updater Tests")
+        self._git(checkout, "config", "user.email", "updater-tests@example.invalid")
+        return origin, seed, checkout
+
+    def _push_remote_change(self, seed: Path, content: str) -> str:
+        (seed / "remote.txt").write_text(content, encoding="utf-8")
+        self._git(seed, "add", "remote.txt")
+        self._git(seed, "commit", "-m", "remote update")
+        self._git(seed, "push", "origin", "main")
+        return self._git(seed, "rev-parse", "HEAD")
+
+    def _apply_update(self, checkout: Path, branch: str, revision: str) -> None:
+        info = updater.UpdateInfo(
+            branch=branch,
+            local_revision=self._git(checkout, "rev-parse", "HEAD"),
+            remote_revision=revision,
+            available=True,
+            is_git_checkout=True,
+        )
+        with patch.object(updater, "PROJECT_DIR", checkout):
+            updater._update_git_checkout(info)
+
+    def test_clean_checkout_fast_forwards(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            remote_revision = self._push_remote_change(seed, "remote\n")
+
+            self._apply_update(checkout, "main", remote_revision)
+
+            self.assertEqual(self._git(checkout, "rev-parse", "HEAD"), remote_revision)
+            self.assertEqual((checkout / "remote.txt").read_text(), "remote\n")
+
+    def test_fetch_head_updates_branch_without_remote_tracking_ref(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            self._git(seed, "switch", "-c", "release")
+            (seed / "release.txt").write_text("release\n", encoding="utf-8")
+            self._git(seed, "add", "release.txt")
+            self._git(seed, "commit", "-m", "release update")
+            self._git(seed, "push", "origin", "release")
+            self._git(checkout, "switch", "-c", "release")
+            remote_revision = self._git(seed, "rev-parse", "HEAD")
+            self.assertNotEqual(
+                subprocess.run(
+                ["git", "-C", str(checkout), "show-ref", "--verify", "refs/remotes/origin/release"],
+                check=False,
+                capture_output=True,
+                ).returncode,
+                0,
+            )
+
+            self._apply_update(checkout, "release", remote_revision)
+
+            self.assertEqual(self._git(checkout, "rev-parse", "HEAD"), remote_revision)
+            self.assertEqual((checkout / "release.txt").read_text(), "release\n")
+
+    def test_dirty_worktree_and_staged_selection_are_restored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            remote_revision = self._push_remote_change(seed, "remote\n")
+            (checkout / "tracked.txt").write_text("staged\n", encoding="utf-8")
+            self._git(checkout, "add", "tracked.txt")
+            (checkout / "tracked.txt").write_text("unstaged\n", encoding="utf-8")
+
+            self._apply_update(checkout, "main", remote_revision)
+
+            self.assertEqual(
+                self._git(checkout, "show", ":tracked.txt"),
+                "staged",
+            )
+            self.assertEqual((checkout / "tracked.txt").read_text(), "unstaged\n")
+            self.assertIn("MM tracked.txt", self._git(checkout, "status", "--short"))
+            self.assertEqual(self._git(checkout, "stash", "list"), "")
+
+    def test_diverged_local_commit_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            (checkout / "local.txt").write_text("local\n", encoding="utf-8")
+            self._git(checkout, "add", "local.txt")
+            self._git(checkout, "commit", "-m", "local-only")
+            local_revision = self._git(checkout, "rev-parse", "HEAD")
+            remote_revision = self._push_remote_change(seed, "remote\n")
+
+            with self.assertRaisesRegex(updater.UpdateError, "отдельные коммиты"):
+                self._apply_update(checkout, "main", remote_revision)
+
+            self.assertEqual(self._git(checkout, "rev-parse", "HEAD"), local_revision)
+            self.assertFalse((checkout / "remote.txt").exists())
+
+    def test_fetch_failure_restores_staged_and_worktree_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, checkout = self._create_checkout(root)
+            (checkout / "tracked.txt").write_text("staged\n", encoding="utf-8")
+            self._git(checkout, "add", "tracked.txt")
+            (checkout / "tracked.txt").write_text("unstaged\n", encoding="utf-8")
+            self._git(checkout, "remote", "set-url", "origin", str(root / "missing.git"))
+            revision = self._git(checkout, "rev-parse", "HEAD")
+
+            with self.assertRaises(updater.UpdateError):
+                self._apply_update(checkout, "main", revision)
+
+            self.assertEqual(self._git(checkout, "show", ":tracked.txt"), "staged")
+            self.assertEqual((checkout / "tracked.txt").read_text(), "unstaged\n")
+            self.assertIn("MM tracked.txt", self._git(checkout, "status", "--short"))
+
+    def test_stash_conflict_keeps_backup_in_stash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, seed, checkout = self._create_checkout(Path(temp_dir))
+            (checkout / "tracked.txt").write_text("local edit\n", encoding="utf-8")
+            (seed / "tracked.txt").write_text("remote edit\n", encoding="utf-8")
+            self._git(seed, "add", "tracked.txt")
+            self._git(seed, "commit", "-m", "conflicting remote edit")
+            self._git(seed, "push", "origin", "main")
+            remote_revision = self._git(seed, "rev-parse", "HEAD")
+
+            with self.assertRaisesRegex(updater.UpdateError, "без конфликта"):
+                self._apply_update(checkout, "main", remote_revision)
+
+            self.assertIn("stash@{0}", self._git(checkout, "stash", "list"))
+            self.assertEqual(self._git(checkout, "rev-parse", "HEAD"), remote_revision)
 
 
 if __name__ == "__main__":

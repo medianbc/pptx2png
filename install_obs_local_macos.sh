@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 REPOSITORY_URL="https://github.com/medianbc/pptx2png.git"
 SOURCE_BRANCH="${PPTX2PNG_BRANCH:-main}"
-ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-https://codeload.github.com/medianbc/pptx2png/tar.gz/refs/heads/${SOURCE_BRANCH}}"
+CUSTOM_ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-}"
+SOURCE_REVISION=""
+ARCHIVE_URL=""
 ARCHIVE_DOWNLOADED=false
 DEFAULT_INSTALL_DIR="${HOME}/pptx2png"
 INSTALL_DIR="${1:-$DEFAULT_INSTALL_DIR}"
@@ -27,6 +29,8 @@ command -v tar >/dev/null 2>&1 || die "tar is required to extract the project ar
 printf 'Installing macOS dependencies with Homebrew...\n'
 brew install python
 brew install --cask libreoffice
+PYTHON="$(brew --prefix)/bin/python3"
+[[ -x "$PYTHON" ]] || PYTHON="$(command -v python3)"
 
 if [[ -e "$INSTALL_DIR" ]]; then
     if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -44,6 +48,21 @@ if [[ -e "$INSTALL_DIR" ]]; then
         die "The destination exists and is not a recognized project installation: $INSTALL_DIR"
     fi
 else
+    if [[ -z "$CUSTOM_ARCHIVE_URL" ]]; then
+        if SOURCE_REVISION="$(curl --fail --location --silent --show-error \
+            "https://api.github.com/repos/medianbc/pptx2png/commits/${SOURCE_BRANCH}" |
+            "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"; then
+            [[ "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{40,64}$ ]] ||
+                die "GitHub returned an invalid source revision."
+            ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/${SOURCE_REVISION}"
+        else
+            printf 'Warning: could not resolve the branch revision; update checking will require an initial refresh.\n' >&2
+            ARCHIVE_URL="https://codeload.github.com/medianbc/pptx2png/tar.gz/refs/heads/${SOURCE_BRANCH}"
+            SOURCE_REVISION=""
+        fi
+    else
+        ARCHIVE_URL="$CUSTOM_ARCHIVE_URL"
+    fi
     printf 'Downloading the project archive...\n'
     staging_dir="$(mktemp -d "$(dirname "$INSTALL_DIR")/.pptx2png-install.XXXXXX")"
     cleanup_staging() {
@@ -64,8 +83,6 @@ else
 fi
 
 cd "$INSTALL_DIR"
-PYTHON="$(brew --prefix)/bin/python3"
-[[ -x "$PYTHON" ]] || PYTHON="$(command -v python3)"
 
 printf 'Creating virtual environment and installing Python dependencies...\n'
 "$PYTHON" -m venv .venv
@@ -74,14 +91,42 @@ printf 'Creating virtual environment and installing Python dependencies...\n'
 ".venv/bin/python" -m pip install -r obs_local/requirements.txt
 
 if [[ "$ARCHIVE_DOWNLOADED" == true ]]; then
-    if revision="$(curl --fail --location --silent --show-error \
-        "https://api.github.com/repos/medianbc/pptx2png/commits/${SOURCE_BRANCH}" |
-        "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"; then
+    if [[ -n "$SOURCE_REVISION" ]]; then
         printf '{"branch":"%s","revision":"%s"}\n' \
-            "$SOURCE_BRANCH" "$revision" > "$INSTALL_DIR/.pptx2png-version.json"
-    else
-        printf 'Warning: could not record the installed source revision.\n' >&2
+            "$SOURCE_BRANCH" "$SOURCE_REVISION" > "$INSTALL_DIR/.pptx2png-version.json"
     fi
+
+    "$PYTHON" - "$INSTALL_DIR" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+project = Path(sys.argv[1])
+preserved = {
+    ".git", ".venv", "config.ini", "obs_local/config.ini",
+    "obs_local/settings.ini", "obs_local/song_title_aliases.json",
+    "obs_png", "prepare_obs_songs.sh", "song_assets", "start_obs_local.sh",
+    ".pptx2png-version.json", ".pptx2png-files.json",
+    ".pptx2png-archive-install",
+}
+files = []
+for current, directories, filenames in os.walk(project):
+    current_path = Path(current)
+    relative_dir = current_path.relative_to(project)
+    directories[:] = [
+        name for name in directories
+        if (relative_dir / name).as_posix() not in preserved
+        and name not in {".git", ".venv", "song_assets", "obs_png"}
+    ]
+    for filename in filenames:
+        relative = (relative_dir / filename).as_posix()
+        if relative not in preserved:
+            files.append(relative)
+(project / ".pptx2png-files.json").write_text(
+    json.dumps(sorted(files), indent=2) + "\n", encoding="utf-8"
+)
+PY
 fi
 
 cat > start_obs_local.sh <<'LAUNCHER'

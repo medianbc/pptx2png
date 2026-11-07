@@ -109,7 +109,11 @@ files. Git checkouts are updated with a fast-forward only; uncommitted changes
 are stashed and restored, and local commits that cannot be fast-forwarded are
 not overwritten. Archive installations download the matching branch while
 preserving `.venv`, `config.ini`, `obs_local/settings.ini`, song assets, and
-generated launchers. After source updates, the current Python environment is
+generated launchers. The updater tracks installed source files and removes
+obsolete tracked files; installations predating the manifest begin tracking
+files with their first update. Archive updates are staged and roll back source
+files if installation fails. Git checkouts preserve both working-tree and
+staged changes. After source updates, the current Python environment is
 updated from `core` and `obs_local/requirements.txt`, then checked with
 `pip check`. A successful update asks you to restart the workflow. System
 dependencies such as LibreOffice are not installed automatically by the
