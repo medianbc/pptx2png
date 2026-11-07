@@ -7,7 +7,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from . import app, prepare_songs
+from . import app, prepare_songs, updater
 
 
 def _prepare_presentation() -> None:
@@ -49,6 +49,49 @@ def _prepare_songs(console_debug: bool = False) -> None:
             print(f"Подробный журнал: {log_dir / 'debug.log'}")
 
 
+def _check_updates(input_fn: Callable[[str], str]) -> bool:
+    try:
+        update = updater.check_for_updates()
+    except updater.UpdateError as error:
+        print(f"Не удалось проверить обновления: {error}")
+        return False
+
+    if not update.available:
+        print("Установлена последняя версия.")
+        return False
+
+    if update.local_revision is None:
+        print(
+            "Доступно обновление. Версию текущей архивной установки "
+            "определить не удалось."
+        )
+    else:
+        print(
+            "Доступно обновление: "
+            f"{update.local_revision[:7]} → {update.remote_revision[:7]} "
+            f"(ветка {update.branch})."
+        )
+    try:
+        answer = input_fn("Установить обновление и проверить зависимости? [y/N]: ")
+    except EOFError:
+        print("Обновление отменено.")
+        return False
+    if answer.strip().lower() not in {"y", "yes", "д", "да"}:
+        print("Обновление отменено.")
+        return False
+
+    try:
+        updater.install_update(update)
+    except updater.UpdateError as error:
+        print(f"Не удалось установить обновление: {error}")
+        return False
+    print(
+        "Обновление и проверка Python-зависимостей завершены. "
+        "Перезапустите локальный сценарий, чтобы загрузить новую версию."
+    )
+    return True
+
+
 def run_menu(
     input_fn: Callable[[str], str] = input,
     *,
@@ -63,6 +106,7 @@ def run_menu(
         print("\nЛокальная подготовка материалов для OBS")
         for key, (label, _) in actions.items():
             print(f"  {key}. {label}")
+        print("  3. Проверить обновления")
         print("  0. Выход")
 
         try:
@@ -73,9 +117,13 @@ def run_menu(
 
         if choice in {"0", "q", "quit", "exit", "выход"}:
             return
+        if choice == "3":
+            if _check_updates(input_fn):
+                return
+            continue
         action = actions.get(choice)
         if action is None:
-            print("Введите 1, 2 или 0.")
+            print("Введите 1, 2, 3 или 0.")
             continue
         if choice == "2":
             _prepare_songs(console_debug=debug)

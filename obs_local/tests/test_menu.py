@@ -65,6 +65,40 @@ class MainMenuTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         app_main.assert_not_called()
 
+    def test_update_check_can_install_and_exits_menu_afterwards(self):
+        answers = iter(["3", "y"])
+        update = menu.updater.UpdateInfo(
+            branch="main",
+            local_revision="a" * 40,
+            remote_revision="b" * 40,
+            available=True,
+            is_git_checkout=False,
+        )
+        with (
+            patch.object(menu.updater, "check_for_updates", return_value=update),
+            patch.object(menu.updater, "install_update") as install_update,
+        ):
+            menu.run_menu(input_fn=lambda _: next(answers))
+
+        install_update.assert_called_once_with(update)
+
+    def test_update_check_can_be_cancelled(self):
+        answers = iter(["3", "n", "0"])
+        update = menu.updater.UpdateInfo(
+            branch="main",
+            local_revision="a" * 40,
+            remote_revision="b" * 40,
+            available=True,
+            is_git_checkout=False,
+        )
+        with (
+            patch.object(menu.updater, "check_for_updates", return_value=update),
+            patch.object(menu.updater, "install_update") as install_update,
+        ):
+            menu.run_menu(input_fn=lambda _: next(answers))
+
+        install_update.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

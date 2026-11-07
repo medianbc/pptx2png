@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 
 REPOSITORY_URL="https://github.com/medianbc/pptx2png.git"
-ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-https://codeload.github.com/medianbc/pptx2png/tar.gz/refs/heads/main}"
+SOURCE_BRANCH="${PPTX2PNG_BRANCH:-main}"
+ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-https://codeload.github.com/medianbc/pptx2png/tar.gz/refs/heads/${SOURCE_BRANCH}}"
+ARCHIVE_DOWNLOADED=false
 DEFAULT_INSTALL_DIR="${HOME}/pptx2png"
 INSTALL_DIR="${1:-$DEFAULT_INSTALL_DIR}"
 INSTALL_DIR="$(mkdir -p "$(dirname "$INSTALL_DIR")" && cd "$(dirname "$INSTALL_DIR")" && pwd)/$(basename "$INSTALL_DIR")"
@@ -58,6 +60,7 @@ else
         -C "$staging_dir/source"
     touch "$staging_dir/source/.pptx2png-archive-install"
     mv "$staging_dir/source" "$INSTALL_DIR"
+    ARCHIVE_DOWNLOADED=true
 fi
 
 cd "$INSTALL_DIR"
@@ -69,6 +72,17 @@ printf 'Creating virtual environment and installing Python dependencies...\n'
 ".venv/bin/python" -m pip install --upgrade pip
 ".venv/bin/python" -m pip install -e ./core
 ".venv/bin/python" -m pip install -r obs_local/requirements.txt
+
+if [[ "$ARCHIVE_DOWNLOADED" == true ]]; then
+    if revision="$(curl --fail --location --silent --show-error \
+        "https://api.github.com/repos/medianbc/pptx2png/commits/${SOURCE_BRANCH}" |
+        "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"; then
+        printf '{"branch":"%s","revision":"%s"}\n' \
+            "$SOURCE_BRANCH" "$revision" > "$INSTALL_DIR/.pptx2png-version.json"
+    else
+        printf 'Warning: could not record the installed source revision.\n' >&2
+    fi
+fi
 
 cat > start_obs_local.sh <<'LAUNCHER'
 #!/usr/bin/env bash
