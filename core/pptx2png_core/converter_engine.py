@@ -19,7 +19,12 @@ from typing import List, Tuple, Optional
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-import fitz
+try:
+    import pymupdf
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    import fitz as pymupdf
 
 
 # ==========================================
@@ -184,7 +189,7 @@ def count_slides_via_libreoffice(
     pptx_path: Path, work_dir: Path
 ) -> Optional[int]:
     """
-    Fallback-способ узнать число слайдов: LibreOffice → PDF → fitz.
+    Fallback-способ узнать число слайдов: LibreOffice → PDF → PyMuPDF.
 
     Используется, когда python-pptx не может открыть файл (например,
     специфичный OOXML), но LibreOffice рендерит его нормально.
@@ -196,7 +201,7 @@ def count_slides_via_libreoffice(
         pdf_path = pptx_to_pdf_crossplatform(pptx_path, work_dir)
         if not pdf_path or not pdf_path.exists():
             return None
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         count = len(doc)
         doc.close()
         try:
@@ -222,7 +227,7 @@ def pdf_to_png_fast(
     Конвертирует PDF в набор PNG (по слайду на страницу).
     Возвращает (total_pages, [пути к PNG]).
     """
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     total_pages = len(doc)
     z_fill_len = max(2, len(str(total_pages)))
 
@@ -230,7 +235,7 @@ def pdf_to_png_fast(
     for page_num in range(total_pages):
         page = doc.load_page(page_num)
         zoom = get_resolution_multiplier(quality, page)
-        mat = fitz.Matrix(zoom, zoom)
+        mat = pymupdf.Matrix(zoom, zoom)
 
         pix = page.get_pixmap(matrix=mat)
         slide_index = str(page_num + 1).zfill(z_fill_len)

@@ -105,6 +105,40 @@ class PresentationSourceRecoveryTests(unittest.TestCase):
         self.assertEqual(result, local_presentation)
         self.client.download_file.assert_not_awaited()
 
+    def test_missing_remote_presentation_accepts_a_local_file(self):
+        paths = {"source": "/presentations/service"}
+        local_presentation = self.temp_dir / "local-deck.pptx"
+        local_presentation.write_bytes(b"synthetic pptx placeholder")
+        with (
+            patch.object(
+                app.aiohttp, "ClientSession", return_value=self.session_context
+            ),
+            patch.object(app, "YandexDiskClient", return_value=self.client),
+            patch.object(
+                app,
+                "resolve_sunday_paths",
+                new_callable=AsyncMock,
+                return_value=paths,
+            ),
+            patch.object(
+                app,
+                "find_pptx_in_source",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            result = asyncio.run(
+                app.download_presentation(
+                    self.config,
+                    datetime(2026, 11, 8),
+                    self.temp_dir,
+                    input_fn=lambda _: str(local_presentation),
+                )
+            )
+
+        self.assertEqual(result, local_presentation)
+        self.client.download_file.assert_not_awaited()
+
     def test_enter_retries_yandex_search(self):
         paths = {"source": "/presentations/source"}
         presentation = {

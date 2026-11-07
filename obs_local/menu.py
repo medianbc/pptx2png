@@ -19,13 +19,15 @@ def _prepare_presentation() -> None:
         print(f"Ошибка подготовки презентации: {error}")
 
 
-def _prepare_songs() -> None:
+def _prepare_songs(console_debug: bool = False) -> None:
+    log_dir = None
     try:
         config = prepare_songs.load_config()
-        prepare_songs.setup_logging(config["log_dir"])
+        log_dir = config["log_dir"]
+        prepare_songs.setup_logging(log_dir, console_debug=console_debug)
         prepare_songs.LOGGER.info(
             "Начало локальной подготовки песен; подробный лог: %s",
-            config["log_dir"] / "debug.log",
+            log_dir / "debug.log",
         )
         asyncio.run(
             prepare_songs.run(
@@ -36,13 +38,22 @@ def _prepare_songs() -> None:
         )
     except Exception as error:
         if logging.getLogger().handlers:
-            prepare_songs.LOGGER.exception(
-                "Подготовка песен завершилась ошибкой"
+            prepare_songs.log_user_error(
+                error, "Подготовка песен завершилась ошибкой"
             )
-        print(f"Ошибка подготовки песен: {error}")
+        print(
+            "Ошибка подготовки песен: "
+            f"{prepare_songs.format_user_error(error)}"
+        )
+        if log_dir is not None:
+            print(f"Подробный журнал: {log_dir / 'debug.log'}")
 
 
-def run_menu(input_fn: Callable[[str], str] = input) -> None:
+def run_menu(
+    input_fn: Callable[[str], str] = input,
+    *,
+    debug: bool = False,
+) -> None:
     actions = {
         "1": ("Подготовить презентацию", _prepare_presentation),
         "2": ("Подготовить песни", _prepare_songs),
@@ -66,7 +77,10 @@ def run_menu(input_fn: Callable[[str], str] = input) -> None:
         if action is None:
             print("Введите 1, 2 или 0.")
             continue
-        action[1]()
+        if choice == "2":
+            _prepare_songs(console_debug=debug)
+        else:
+            action[1]()
 
 
 def main() -> None:
@@ -77,8 +91,17 @@ def main() -> None:
         "--date",
         help="Запустить подготовку презентации на дату YYYY-MM-DD без меню.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Показывать подробный DEBUG-лог при подготовке песен из меню."
+        ),
+    )
     args = parser.parse_args()
     if args.date is not None:
+        if args.debug:
+            parser.error("--debug применяется к подготовке песен из меню.")
         app.main()
         return
-    run_menu()
+    run_menu(debug=args.debug)

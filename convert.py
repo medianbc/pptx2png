@@ -3,9 +3,14 @@ import sys
 
 missing = []
 try:
-    import fitz
-except ImportError:
-    missing.append("pymupdf")
+    import pymupdf
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    try:
+        import fitz as pymupdf
+    except ImportError:
+        missing.append("pymupdf")
 try:
     import pptx
 except ImportError:
