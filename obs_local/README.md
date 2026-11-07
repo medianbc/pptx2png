@@ -40,10 +40,12 @@ not update source files in an existing checkout.
 
 - macOS with Homebrew installed and available in Terminal.
 - Internet access to GitHub and Homebrew/PyPI package repositories.
-- Python 3.10 or later. The installer installs Python through Homebrew; the
-  shared package declares `requires-python >= 3.10`.
-- LibreOffice for PPT/PPTX-to-PDF/PNG conversion. The installer installs the
-  application using the Homebrew cask.
+- Python 3.10 or later. The shared package declares
+  `requires-python >= 3.10`; the installer uses a compatible Python already
+  available and installs one through Homebrew only when needed.
+- LibreOffice for PPT/PPTX-to-PDF/PNG conversion. If it is not found in a
+  standard application location or on `PATH`, the installer installs it using
+  the Homebrew cask.
 
 The repository does not specify a minimum macOS version. The
 `OBS macOS installation` GitHub Actions workflow installs the package on a
@@ -73,7 +75,11 @@ on the target machine as well.
 
    The command downloads the `main` source archive and extracts it into
    `$HOME/pptx2png`. Replace that path to choose a different installation
-   directory. The installer uses Homebrew to install Python and LibreOffice,
+   directory. Before installing anything, the installer validates the
+   destination and checks for Python 3.10+ with `venv`/`pip` and LibreOffice.
+   It skips components that are already available and uses Homebrew only for
+   missing ones. The selected Python executable is used by its full path, even
+   if another `python3` command shadows it in `PATH`. The installer then
    creates `.venv`, installs `core` and local application dependencies, and
    creates `start_obs_local.sh` and `prepare_obs_songs.sh`. Git is not required
    for a fresh installation. If you run the installer

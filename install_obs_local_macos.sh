@@ -26,12 +26,7 @@ fi
 command -v curl >/dev/null 2>&1 || die "curl is required to download the project archive."
 command -v tar >/dev/null 2>&1 || die "tar is required to extract the project archive."
 
-printf 'Installing macOS dependencies with Homebrew...\n'
-brew install python
-brew install --cask libreoffice
-PYTHON="$(brew --prefix)/bin/python3"
-[[ -x "$PYTHON" ]] || PYTHON="$(command -v python3)"
-
+EXISTING_INSTALLATION=false
 if [[ -e "$INSTALL_DIR" ]]; then
     if [[ -d "$INSTALL_DIR/.git" ]]; then
         command -v git >/dev/null 2>&1 ||
@@ -47,7 +42,67 @@ if [[ -e "$INSTALL_DIR" ]]; then
     else
         die "The destination exists and is not a recognized project installation: $INSTALL_DIR"
     fi
+    EXISTING_INSTALLATION=true
+fi
+
+BREW_PREFIX="$(brew --prefix)"
+
+find_compatible_python() {
+    local formula_prefix candidate
+    formula_prefix="$(brew --prefix python 2>/dev/null || true)"
+    for candidate in \
+        "$formula_prefix/bin/python3" \
+        "$formula_prefix/libexec/bin/python3" \
+        "$BREW_PREFIX/bin/python3" \
+        "$(command -v python3 2>/dev/null || true)"; do
+        if [[ -x "$candidate" ]] &&
+            "$candidate" -c \
+                'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+                >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_soffice() {
+    local candidate
+    for candidate in \
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice" \
+        "$(command -v soffice 2>/dev/null || true)"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYTHON="$(find_compatible_python || true)"
+SOFFICE="$(find_soffice || true)"
+
+if [[ -n "$PYTHON" ]]; then
+    printf 'Using compatible Python: %s\n' "$PYTHON"
 else
+    printf 'Python 3.10+ with venv and pip was not found; installing it with Homebrew...\n'
+    brew install python
+    PYTHON="$(find_compatible_python || true)"
+    [[ -n "$PYTHON" ]] ||
+        die "Homebrew Python 3.10+ with venv and pip is not available. Check the Homebrew installation and PATH."
+fi
+
+if [[ -n "$SOFFICE" ]]; then
+    printf 'Using existing LibreOffice: %s\n' "$SOFFICE"
+else
+    printf 'LibreOffice was not found; installing it with Homebrew...\n'
+    brew install --cask libreoffice
+    SOFFICE="$(find_soffice || true)"
+    [[ -n "$SOFFICE" ]] ||
+        die "LibreOffice was installed but its soffice executable was not found. Make it available in /Applications or PATH."
+fi
+
+if [[ "$EXISTING_INSTALLATION" != true ]]; then
     if [[ -z "$CUSTOM_ARCHIVE_URL" ]]; then
         if [[ -z "$SOURCE_REVISION" ]]; then
             SOURCE_REVISION="$(curl --fail --location --silent --show-error \
