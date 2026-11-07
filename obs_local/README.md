@@ -110,6 +110,16 @@ when diagnosing an issue), use:
 ./prepare_obs_songs.sh --debug
 ```
 
+To open the interactive menu and show DEBUG output while preparing songs, use:
+
+```bash
+./start_obs_local.sh --debug
+```
+
+In normal mode, unexpected failures are shown as a concise error with the
+`debug.log` location; full tracebacks remain in that log. With `--debug`,
+DEBUG messages and tracebacks are also printed in the console.
+
 From the repository root, run the menu with `python -m obs_local`. Direct
 workflow entry points remain available through `python -m
 obs_local.run_obs_local` and `python -m obs_local.prepare_songs`.
@@ -178,6 +188,9 @@ empty response to skip an alternative. If a saved alias no longer finds a
 match, the original program title is tried as a fallback. A prompted program
 link is saved only after Yandex Disk returns a valid DOCX. Non-interactive runs
 can still use `--program-file` or `--program-url`.
+If Yandex Disk responds with HTTP 429, the interactive workflow explains that
+the public API is rate-limiting requests and lets the operator retry or provide
+a local DOCX program instead.
 
 ## Test song preparation for OBS
 

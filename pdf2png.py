@@ -3,7 +3,7 @@ import glob
 from pathlib import Path
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf
 except ImportError:
     print("Ошибка: библиотека PyMuPDF не установлена.")
     print("Выполните в терминале команду: python3 -m pip install pymupdf")
@@ -32,7 +32,7 @@ def convert_all_pdfs_to_4k():
         output_folder.mkdir(exist_ok=True)
         
         # Открываем PDF документ
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         
         # Проходим по каждой странице документа
         for page_num in range(len(doc)):
@@ -44,7 +44,7 @@ def convert_all_pdfs_to_4k():
             zoom_y = 2160 / rect.height
             
             # Создаем матрицу трансформации для рендера вектора без потери качества
-            matrix = fitz.Matrix(zoom_x, zoom_y)
+            matrix = pymupdf.Matrix(zoom_x, zoom_y)
             pix = page.get_pixmap(matrix=matrix)
             
             # Формируем имя файла (например, Slide_001.png)
@@ -60,4 +60,3 @@ def convert_all_pdfs_to_4k():
 
 if __name__ == "__main__":
     convert_all_pdfs_to_4k()
-

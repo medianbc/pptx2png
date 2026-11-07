@@ -46,6 +46,45 @@ DEFAULT_RAM_LOG_DIR = "/dev/shm/pptx2png_tasks/obs_local/logs"
 LOGGER = logging.getLogger(__name__)
 
 
+class ProgramRateLimitError(RuntimeError):
+    """Raised when Yandex Disk temporarily rate-limits the public API."""
+
+
+def format_user_error(error: Exception) -> str:
+    """Turn common runtime failures into actionable, non-traceback messages."""
+    if isinstance(error, ProgramRateLimitError):
+        return str(error)
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return "Истекло время ожидания ответа Яндекс.Диска. Повторите попытку."
+    if isinstance(error, aiohttp.ClientResponseError):
+        return (
+            f"Яндекс.Диск вернул HTTP {error.status}. "
+            "Проверьте ссылку и доступ к файлу."
+        )
+    if isinstance(error, aiohttp.ClientError):
+        return (
+            "Не удалось связаться с Яндекс.Диском. Проверьте интернет-"
+            "подключение и повторите попытку."
+        )
+    if isinstance(error, PermissionError):
+        return f"Недостаточно прав для доступа к файлу или папке: {error}"
+    if isinstance(error, FileNotFoundError):
+        return f"Не найден файл или каталог: {error}"
+    if isinstance(error, OSError):
+        return f"Ошибка файловой системы: {error}"
+    return str(error).strip() or type(error).__name__
+
+
+def log_user_error(error: Exception, context: str) -> None:
+    """Keep normal console output concise while retaining debug diagnostics."""
+    LOGGER.error("%s: %s", context, format_user_error(error))
+    LOGGER.debug(
+        "%s; traceback:",
+        context,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+
+
 @dataclass
 class SongResult:
     title: str
@@ -638,11 +677,15 @@ async def _cache_remote_song_zips(
                         png_paths, _ = await convert_all_pngs(
                             source, render_dir, config["quality"]
                         )
-                    except Exception:
+                    except Exception as error:
                         failed += 1
-                        LOGGER.exception(
-                            "Не удалось конвертировать удалённый PPTX %s",
-                            item_name,
+                        LOGGER.error(
+                            "Не удалось конвертировать удалённый PPTX %s: %s",
+                            item_name, error,
+                        )
+                        LOGGER.debug(
+                            "Ошибка конвертации удалённого PPTX; traceback:",
+                            exc_info=(type(error), error, error.__traceback__),
                         )
                         continue
 
@@ -778,6 +821,26 @@ def _sanitize_diagnostic(value: str, sensitive_url: str = "") -> str:
     )[:2000]
 
 
+def _validate_program_docx(path: Path) -> None:
+    try:
+        with zipfile.ZipFile(path) as document:
+            if "word/document.xml" not in document.namelist():
+                raise RuntimeError(
+                    "Файл не похож на DOCX: отсутствует word/document.xml"
+                )
+            corrupt_member = document.testzip()
+            if corrupt_member:
+                raise RuntimeError(
+                    f"В DOCX повреждена запись {corrupt_member}"
+                )
+    except RuntimeError:
+        raise
+    except (OSError, zipfile.BadZipFile) as error:
+        raise RuntimeError(
+            "Файл не является корректным DOCX или повреждён"
+        ) from error
+
+
 async def download_program_docx(
     session: aiohttp.ClientSession, url: str, destination: Path
 ) -> None:
@@ -814,6 +877,12 @@ async def download_program_docx(
                     response.status,
                     detail,
                 )
+                if response.status == 429:
+                    raise ProgramRateLimitError(
+                        "Яндекс.Диск временно ограничил частоту запросов "
+                        "к публичному API (HTTP 429). Подождите и повторите "
+                        "запрос либо используйте локальный DOCX программы."
+                    )
                 raise RuntimeError(
                     "Яндекс.Диск не выдал ссылку на программу "
                     f"(HTTP {response.status}): {detail}. Проверьте, что "
@@ -884,20 +953,8 @@ async def download_program_docx(
         raise
 
     try:
-        with zipfile.ZipFile(destination) as document:
-            if "word/document.xml" not in document.namelist():
-                raise RuntimeError(
-                    "Скачанный файл не похож на DOCX: отсутствует "
-                    "word/document.xml"
-                )
-            corrupt_member = document.testzip()
-            if corrupt_member:
-                raise RuntimeError(
-                    f"В скачанном DOCX повреждена запись {corrupt_member}"
-                )
-    except RuntimeError:
-        raise
-    except (OSError, zipfile.BadZipFile) as error:
+        _validate_program_docx(destination)
+    except RuntimeError as error:
         raise RuntimeError(
             "Скачанный по публичной ссылке файл не является DOCX. "
             "Возможно, ссылка ведёт на изображение или Яндекс.Диск вернул "
@@ -911,8 +968,14 @@ async def _response_error_detail(
     """Read bounded API diagnostics while redacting public links and tokens."""
     try:
         body = (await response.text()).strip()
-    except (aiohttp.ClientError, UnicodeDecodeError):
-        LOGGER.exception("Не удалось прочитать тело HTTP-ошибки Яндекс.Диска")
+    except (aiohttp.ClientError, UnicodeDecodeError) as error:
+        LOGGER.warning(
+            "Не удалось прочитать тело HTTP-ошибки Яндекс.Диска: %s", error
+        )
+        LOGGER.debug(
+            "Ошибка чтения тела HTTP-ответа; traceback:",
+            exc_info=(type(error), error, error.__traceback__),
+        )
         return "тело ответа прочитать не удалось"
 
     detail = body[:2000]
@@ -1156,11 +1219,59 @@ async def run(
             if program_file is None:
                 async with aiohttp.ClientSession() as session:
                     program_file = work_dir / "program.docx"
+                    downloaded_program = False
                     while True:
                         try:
                             await download_program_docx(
                                 session, url, program_file
                             )
+                            downloaded_program = True
+                        except ProgramRateLimitError as error:
+                            if not interactive:
+                                raise
+                            print(f"\n{error}")
+                            print(
+                                "Введите путь к локальному DOCX; нажмите "
+                                "Enter, чтобы повторить запрос, или введите "
+                                "esc/exit для отмены."
+                            )
+                            input_fn = input_fn or input
+                            try:
+                                answer = input_fn(
+                                    "Путь к DOCX или Enter для повтора: "
+                                ).strip()
+                            except EOFError as input_error:
+                                raise RuntimeError(
+                                    "Подготовка песен отменена."
+                                ) from input_error
+                            if answer.casefold() in {"esc", "exit", "q"}:
+                                raise RuntimeError("Подготовка песен отменена.")
+                            if answer:
+                                local_program = Path(
+                                    answer.strip("\"' ")
+                                ).expanduser()
+                                if not local_program.is_file():
+                                    print(
+                                        f"Файл не найден: {local_program}. "
+                                        "Попробуйте ещё раз."
+                                    )
+                                    continue
+                                try:
+                                    _validate_program_docx(local_program)
+                                except RuntimeError as file_error:
+                                    print(f"Некорректный DOCX: {file_error}")
+                                    continue
+                                program_file = local_program
+                                print(
+                                    f"Используется локальная программа: "
+                                    f"{program_file}"
+                                )
+                                break
+                            print(
+                                "Повторяю запрос. Если ограничение сохраняется, "
+                                "подождите или укажите локальный DOCX."
+                            )
+                            continue
                         except RuntimeError as error:
                             if not prompted_program_url:
                                 raise
@@ -1168,13 +1279,13 @@ async def run(
                             url = ensure_program_url(config, input_fn)
                             continue
                         break
-                if prompted_program_url:
-                    update_ini_file(
-                        BASE_DIR / "settings.ini",
-                        {"Song preparation": {"program_url": url}},
-                    )
-                    config["program_url"] = url
-                    print("Ссылка сохранена в obs_local/settings.ini.")
+                    if prompted_program_url and downloaded_program:
+                        update_ini_file(
+                            BASE_DIR / "settings.ini",
+                            {"Song preparation": {"program_url": url}},
+                        )
+                        config["program_url"] = url
+                        print("Ссылка сохранена в obs_local/settings.ini.")
 
             LOGGER.info("Разбор программы: %s", program_file.name)
             songs = extract_song_titles(program_file, target_date)
@@ -1424,6 +1535,7 @@ def main() -> None:
     else:
         selected_date = get_nearest_sunday().date()
 
+    log_dir: Path | None = None
     try:
         config = load_config()
         log_dir = args.log_dir or config["log_dir"]
@@ -1443,8 +1555,11 @@ def main() -> None:
         )
     except Exception as error:
         if logging.getLogger().handlers:
-            LOGGER.exception("Подготовка песен завершилась ошибкой")
-        parser.exit(1, f"Ошибка: {error}\n")
+            log_user_error(error, "Подготовка песен завершилась ошибкой")
+        message = f"Ошибка: {format_user_error(error)}\n"
+        if log_dir is not None:
+            message += f"Подробный журнал: {log_dir / 'debug.log'}\n"
+        parser.exit(1, message)
 
 
 if __name__ == "__main__":

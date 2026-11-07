@@ -3,7 +3,7 @@ import sys
 
 missing = []
 try:
-    import fitz
+    import pymupdf
 except ImportError:
     missing.append("pymupdf")
 try:

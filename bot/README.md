@@ -29,6 +29,9 @@ directory on `PYTHONPATH` for existing server environments.
   missed run) and at Monday midnight in the server's local time for the
   upcoming Sunday. Failed attempts are retried at `retry_interval_sec`; the
   configured Yandex Disk base folder must already exist.
+- The administrator can also start creation of the upcoming Sunday's missing
+  folder tree from `/start` → `🛠 Доп. функции`; this manual action asks for
+  confirmation and uses the same `template.yaml`.
 - User allowlists and preferences remain in the repository root to preserve
   existing deployment state.
 

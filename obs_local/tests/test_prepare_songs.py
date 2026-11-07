@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import logging
 import tempfile
@@ -288,6 +289,20 @@ class ConfigTests(unittest.TestCase):
 
 
 class SongOutputTests(unittest.TestCase):
+    def test_network_errors_have_actionable_user_message(self):
+        self.assertIn(
+            "Проверьте интернет-подключение",
+            prepare_songs.format_user_error(
+                prepare_songs.aiohttp.ClientConnectionError()
+            ),
+        )
+
+    def test_timeout_errors_have_actionable_user_message(self):
+        self.assertIn(
+            "Истекло время ожидания",
+            prepare_songs.format_user_error(TimeoutError()),
+        )
+
     def test_docs_view_link_is_rejected_as_not_a_disk_public_key(self):
         docs_url = (
             "https://docs.yandex.ru/view/d/"
@@ -349,6 +364,41 @@ class SongOutputTests(unittest.TestCase):
                 root_logger.addHandler(handler)
             root_logger.setLevel(original_level)
 
+    def test_traceback_is_kept_in_debug_log_but_hidden_from_normal_console(self):
+        root_logger = logging.getLogger()
+        original_handlers = root_logger.handlers[:]
+        original_level = root_logger.level
+        try:
+            with tempfile.TemporaryDirectory(
+                dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+            ) as directory, contextlib.redirect_stderr(io.StringIO()) as console:
+                prepare_songs.setup_logging(Path(directory))
+                try:
+                    raise RuntimeError("synthetic failure")
+                except RuntimeError as error:
+                    prepare_songs.log_user_error(
+                        error, "Проверка понятного сообщения"
+                    )
+                for handler in root_logger.handlers:
+                    handler.flush()
+
+                console_output = console.getvalue()
+                debug_output = (
+                    Path(directory) / "debug.log"
+                ).read_text(encoding="utf-8")
+
+            self.assertNotIn("Traceback", console_output)
+            self.assertIn("Проверка понятного сообщения", console_output)
+            self.assertIn("Traceback", debug_output)
+            self.assertIn("synthetic failure", debug_output)
+        finally:
+            for handler in root_logger.handlers[:]:
+                root_logger.removeHandler(handler)
+                handler.close()
+            for handler in original_handlers:
+                root_logger.addHandler(handler)
+            root_logger.setLevel(original_level)
+
     def test_public_program_http_error_includes_api_diagnostics_without_link(self):
         public_url = "https://disk.yandex.ru/d/example_public_key"
 
@@ -370,6 +420,12 @@ class SongOutputTests(unittest.TestCase):
                 )
 
         class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
             def get(self, *_args, **_kwargs):
                 return FakeResponse()
 
@@ -387,6 +443,100 @@ class SongOutputTests(unittest.TestCase):
             self.assertIn("disk.yandex.ru/d/[share-id redacted]", "\n".join(logs.output))
 
         asyncio.run(execute())
+
+    def test_public_program_rate_limit_has_actionable_error(self):
+        public_url = "https://disk.yandex.ru/d/example_public_key"
+
+        class FakeResponse:
+            status = 429
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def text(self):
+                return (
+                    '{"error":"TooManyRequestsError",'
+                    '"description":"Too Many Requests"}'
+                )
+
+        class FakeSession:
+            def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def execute():
+            with self.assertRaisesRegex(
+                prepare_songs.ProgramRateLimitError,
+                "временно ограничил частоту запросов.*HTTP 429",
+            ):
+                await prepare_songs.download_program_docx(
+                    FakeSession(), public_url, Path("program.docx")
+                )
+
+        asyncio.run(execute())
+
+    def test_interactive_rate_limit_falls_back_to_local_program_docx(self):
+        with tempfile.TemporaryDirectory(
+            dir="/dev/shm" if Path("/dev/shm").is_dir() else None
+        ) as directory:
+            root = Path(directory)
+            local_program = root / "program.docx"
+            _create_docx(local_program)
+            config = {
+                "program_url": "https://disk.yandex.ru/i/example_program",
+                "song_title_aliases_path": root / "aliases.json",
+                "zip_dir": root / "zip",
+                "pptx_dir": root / "pptx",
+                "yandex_zip_png_paths": [],
+                "yandex_pptx_paths": [],
+                "cache_missing_yandex_song_zips": False,
+                "output_dir": root / "Трансляция" / "Песни",
+                "quality": "standard",
+                "yandex_token": "",
+            }
+
+            class FakeResponse:
+                status = 429
+                headers = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                async def text(self):
+                    return (
+                        '{"error":"TooManyRequestsError",'
+                        '"description":"Too Many Requests"}'
+                    )
+
+            class FakeSession:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                def get(self, *_args, **_kwargs):
+                    return FakeResponse()
+
+            inputs = iter([str(local_program), "", ""])
+            with patch.object(
+                prepare_songs.aiohttp, "ClientSession", return_value=FakeSession()
+            ):
+                results = asyncio.run(
+                    prepare_songs.run(
+                        date(2026, 10, 4),
+                        config=config,
+                        interactive=True,
+                        input_fn=lambda _prompt: next(inputs),
+                    )
+                )
+
+        self.assertEqual(len(results), 2)
 
     def test_download_rejects_docs_view_link_before_api_call(self):
         docs_url = (

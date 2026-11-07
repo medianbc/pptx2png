@@ -402,6 +402,13 @@ def create_bot_and_dispatcher(cfg: dict):
                 callback_data="toggle_cat_other",
             ),
         )
+        if user_id == cfg["admin_id"]:
+            b.row(
+                InlineKeyboardButton(
+                    text="🛠 Доп. функции",
+                    callback_data="admin_tools",
+                )
+            )
         return b.as_markup()
 
     async def check_access_by_user(user: types.User, bot: Bot) -> bool:
@@ -442,6 +449,7 @@ def create_bot_and_dispatcher(cfg: dict):
         "http_session": http_session,
         "bot": bot,
         "ADMIN_ID": cfg["admin_id"],
+        "YANDEX_TEMPLATE_PATH": cfg["yandex_template_path"],
     })
 
     dp.include_router(router)
