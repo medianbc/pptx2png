@@ -25,10 +25,8 @@ PATH_COMMANDS = (
 
 class MacOSInstallerDependencyTests(unittest.TestCase):
     def setUp(self):
-        temp_dir = "/dev/shm" if Path("/dev/shm").is_dir() else None
         self.temp_context = tempfile.TemporaryDirectory(
             prefix="pptx2png-installer-test-",
-            dir=temp_dir,
         )
         self.addCleanup(self.temp_context.cleanup)
         self.root = Path(self.temp_context.name)
@@ -38,6 +36,14 @@ class MacOSInstallerDependencyTests(unittest.TestCase):
         self.bin_dir.mkdir()
         self.brew_prefix = self.root / "homebrew"
         self.python_prefix = self.brew_prefix / "opt" / "python"
+        self.soffice_path = (
+            self.root
+            / "Applications"
+            / "LibreOffice.app"
+            / "Contents"
+            / "MacOS"
+            / "soffice"
+        )
         self.brew_log = self.root / "brew.log"
         self.python_log = self.root / "python.log"
         self.installed_python_template = self.root / "installed-python"
@@ -74,11 +80,12 @@ case "$*" in
         chmod +x "{self.python_prefix}/libexec/bin/python3"
         ;;
     "install --cask libreoffice")
-        cat > "{self.bin_dir}/soffice" <<'SOFFICE'
+        mkdir -p "{self.soffice_path.parent}"
+        cat > "{self.soffice_path}" <<'SOFFICE'
 #!/bin/sh
 exit 0
 SOFFICE
-        chmod +x "{self.bin_dir}/soffice"
+        chmod +x "{self.soffice_path}"
         ;;
     *) exit 99 ;;
 esac
@@ -123,6 +130,7 @@ exit 0
                 "HOME": str(self.home),
                 "PATH": str(self.bin_dir),
                 "PYTHON_LOG": str(self.python_log),
+                "PPTX2PNG_LIBREOFFICE_PATH": str(self.soffice_path),
             }
         )
         return subprocess.run(
@@ -149,7 +157,7 @@ exit 0
             label="shadowed-old-python",
         )
         self._write_executable(
-            self.bin_dir / "soffice",
+            self.soffice_path,
             "#!/bin/sh\nexit 0\n",
         )
 
@@ -175,7 +183,7 @@ exit 0
         python_path = self.python_prefix / "libexec" / "bin" / "python3"
         self._add_python(python_path, compatible=True, label="existing-python")
         self._write_executable(
-            self.bin_dir / "soffice",
+            self.soffice_path,
             "#!/bin/sh\nexit 0\n",
         )
 
@@ -184,7 +192,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Using compatible Python: {python_path}", result.stdout)
         self.assertIn(
-            f"Using existing LibreOffice: {self.bin_dir}/soffice",
+            f"Using existing LibreOffice: {self.soffice_path}",
             result.stdout,
         )
         self.assertEqual(self._brew_installs(), [])
@@ -208,7 +216,7 @@ exit 0
             "LibreOffice was not found; installing it with Homebrew",
             result.stdout,
         )
-        self.assertTrue((self.bin_dir / "soffice").is_file())
+        self.assertTrue(self.soffice_path.is_file())
 
 
 if __name__ == "__main__":

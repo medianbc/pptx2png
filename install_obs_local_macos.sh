@@ -7,6 +7,7 @@ CUSTOM_ARCHIVE_URL="${PPTX2PNG_ARCHIVE_URL:-}"
 SOURCE_REVISION="${PPTX2PNG_SOURCE_REVISION:-}"
 ARCHIVE_URL=""
 ARCHIVE_DOWNLOADED=false
+LIBREOFFICE_PATH="${PPTX2PNG_LIBREOFFICE_PATH:-/Applications/LibreOffice.app/Contents/MacOS/soffice}"
 DEFAULT_INSTALL_DIR="${HOME}/pptx2png"
 INSTALL_DIR="${1:-$DEFAULT_INSTALL_DIR}"
 INSTALL_DIR="$(mkdir -p "$(dirname "$INSTALL_DIR")" && cd "$(dirname "$INSTALL_DIR")" && pwd)/$(basename "$INSTALL_DIR")"
@@ -69,7 +70,7 @@ find_compatible_python() {
 find_soffice() {
     local candidate
     for candidate in \
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice" \
+        "$LIBREOFFICE_PATH" \
         "$(command -v soffice 2>/dev/null || true)"; do
         if [[ -x "$candidate" ]]; then
             printf '%s\n' "$candidate"
