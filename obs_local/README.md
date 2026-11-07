@@ -102,9 +102,26 @@ on the target machine as well.
    ./start_obs_local.sh
    ```
 
-The menu offers presentation preparation (`1`), song preparation (`2`), and
-exit (`0`). To run song preparation directly with debug logging (for example,
-when diagnosing an issue), use:
+The menu offers presentation preparation (`1`), song preparation (`2`),
+update checking (`3`), and exit (`0`). Update checking contacts GitHub only
+after you select it. If a newer revision exists, the menu asks before changing
+files. Git checkouts are updated with a fast-forward only; uncommitted changes
+are stashed and restored, and local commits that cannot be fast-forwarded are
+not overwritten. Archive installations download the matching branch while
+preserving `.venv`, `config.ini`, `obs_local/settings.ini`, song assets, and
+generated launchers. The updater tracks installed source files and removes
+obsolete tracked files; installations predating the manifest begin tracking
+files with their first update. Archive updates are staged and roll back source
+files if installation fails. Git checkouts preserve both working-tree and
+staged changes. After source updates, the current Python environment is
+updated from `core` and `obs_local/requirements.txt`, then checked with
+`pip check`. A successful update asks you to restart the workflow. System
+dependencies such as LibreOffice are not installed automatically by the
+updater; install those using the platform installer if a new version requires
+them.
+
+To run song preparation directly with debug logging (for example, when
+diagnosing an issue), use:
 
 ```bash
 ./prepare_obs_songs.sh --debug

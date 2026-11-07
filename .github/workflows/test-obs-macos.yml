@@ -24,7 +24,7 @@ jobs:
       - name: Install the local OBS package from a source archive without Git
         env:
           CI: "true"
-          PPTX2PNG_ARCHIVE_URL: https://codeload.github.com/${{ github.repository }}/tar.gz/${{ github.sha }}
+          PPTX2PNG_SOURCE_REVISION: ${{ github.sha }}
           PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
         run: ./install_obs_local_macos.sh "$PPTX2PNG_INSTALL_DIR"
 
