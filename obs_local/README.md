@@ -251,6 +251,9 @@ file also offer numbered actions: retry (`1`), use a local DOCX (`2`), or cancel
 as an error. Empty input at the local path prompt returns to the recovery menu.
 The same menu handles failures of newly entered program links.
 No automatic retry loop is started.
+Interactive DOCX and PPT/PPTX path prompts accept paths with spaces, optional
+surrounding quotes, and, on macOS/Linux, shell-escaped spaces (`\ `).
+Existing literal file names and Windows path separators are preserved.
 The shared link normally opens a viewer page rather than delivering DOCX bytes.
 Even HTTP 200 may be CAPTCHA HTML; it does not guarantee a working API-free
 download. The workflow uses the public API for shared links and validates the

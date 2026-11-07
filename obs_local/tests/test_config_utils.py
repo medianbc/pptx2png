@@ -8,6 +8,47 @@ from unittest.mock import patch
 from obs_local import config_utils
 
 
+class LocalFilePathTests(unittest.TestCase):
+    def test_plain_quoted_and_shell_escaped_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "local program.docx"
+            path.touch()
+            escaped = str(path).replace(" ", r"\ ")
+            values = (
+                str(path),
+                f' "{path}" ',
+                f"'{path}'",
+                escaped,
+                f'"{escaped}" ',
+            )
+            with patch.object(config_utils.sys, "platform", "darwin"):
+                for value in values:
+                    with self.subTest(value=value):
+                        self.assertEqual(config_utils.parse_local_file_path(value), path)
+
+    def test_home_directory_is_expanded(self):
+        with patch.object(config_utils.sys, "platform", "darwin"):
+            self.assertEqual(
+                config_utils.parse_local_file_path(r'"~/local\ program.docx"'),
+                Path.home() / "local program.docx",
+            )
+
+    @unittest.skipIf(os.name == "nt", "Backslashes are separators on Windows")
+    def test_existing_literal_backslash_filename_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / r"local\ program.docx"
+            path.touch()
+            with patch.object(config_utils.sys, "platform", "darwin"):
+                self.assertEqual(config_utils.parse_local_file_path(str(path)), path)
+
+    def test_windows_backslashes_are_preserved(self):
+        with patch.object(config_utils.sys, "platform", "win32"):
+            self.assertEqual(
+                config_utils.parse_local_file_path(r'"C:\ Program Files\local.docx"'),
+                Path(r"C:\ Program Files\local.docx"),
+            )
+
+
 class PlatformSettingsTests(unittest.TestCase):
     def test_each_platform_gets_independent_settings_and_log_directory(self):
         with tempfile.TemporaryDirectory() as directory:

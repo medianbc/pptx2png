@@ -627,7 +627,7 @@ class SongOutputTests(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                local_program = root / "local.docx"
+                local_program = root / "local program.docx"
                 _create_docx(local_program)
                 config = {
                     "program_url": "https://disk.yandex.ru/i/example_program",
@@ -641,8 +641,11 @@ class SongOutputTests(unittest.TestCase):
                     "quality": "standard",
                     "yandex_token": "",
                 }
+                escaped_path = '"' + str(local_program).replace(
+                    " ", r"\ " if prepare_songs.sys.platform != "win32" else " "
+                ) + '" '
                 inputs = iter(["invalid", "2", "", "2", str(root / "missing.docx"),
-                               "2", str(local_program), "", ""])
+                               "2", escaped_path, "", ""])
                 with patch.object(
                     prepare_songs, "download_program_docx",
                     new_callable=AsyncMock, side_effect=failure,
