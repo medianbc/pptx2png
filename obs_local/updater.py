@@ -372,9 +372,6 @@ def _update_archive_install(info: UpdateInfo) -> None:
                 "исходные файлы восстановлены."
             ) from error
 
-    _write_version(info.branch, info.remote_revision)
-
-
 def _archive_source_files(source_root: Path) -> set[str]:
     result: set[str] = set()
     for source in source_root.rglob("*"):

@@ -215,6 +215,43 @@ class ArchiveUpdateTests(unittest.TestCase):
             self.assertEqual((project_dir / "a.py").read_text(), "old a")
             self.assertEqual((project_dir / "z.py").read_text(), "old z")
 
+    def test_dependency_failure_does_not_mark_archive_revision_current(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / updater.VERSION_FILE).write_text(
+                json.dumps({"branch": "main", "revision": "a" * 40}),
+                encoding="utf-8",
+            )
+            info = updater.UpdateInfo(
+                branch="main",
+                local_revision="a" * 40,
+                remote_revision="b" * 40,
+                available=True,
+                is_git_checkout=False,
+            )
+
+            def create_archive_source(_branch: str, destination: Path) -> None:
+                (destination / "new_module.py").write_text(
+                    "new source", encoding="utf-8"
+                )
+
+            with (
+                patch.object(updater, "PROJECT_DIR", project_dir),
+                patch.object(updater, "_download_archive", side_effect=create_archive_source),
+                patch.object(
+                    updater,
+                    "_install_python_dependencies",
+                    side_effect=updater.UpdateError("dependency failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(updater.UpdateError, "dependency failure"):
+                    updater.install_update(info)
+
+            version = json.loads(
+                (project_dir / updater.VERSION_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(version["revision"], "a" * 40)
+
     def test_archive_extraction_rejects_parent_directory_paths(self):
         archive_buffer = io.BytesIO()
         with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
