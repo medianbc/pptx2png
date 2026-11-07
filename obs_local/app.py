@@ -282,13 +282,18 @@ def _find_categories(
 
 
 def _select_range(
-    results: dict[str, tuple[int | None, int | None, list[int]]], total_slides: int
+    results: dict[str, tuple[int | None, int | None, list[int]]],
+    total_slides: int,
+    category_ranges: dict[str, list[tuple[int, int]]] | None = None,
 ) -> tuple[str, list[tuple[int, int]]]:
+    if category_ranges is None:
+        category_ranges = {}
     while True:
         print("\nВыберите способ обработки:")
         print("  1. Все слайды")
         print("  2. Категория по заметкам / изменить диапазон категории")
         print("  3. Произвольные номера и диапазоны")
+        print("  4. Подготовить несколько категорий")
         print("  0. Отменить")
         try:
             choice = input("Режим [1]: ").strip() or "1"
@@ -298,16 +303,19 @@ def _select_range(
             "1": "all",
             "2": "category",
             "3": "custom",
+            "4": "categories",
             "0": "cancel",
         }
         mode = aliases.get(choice)
-        if mode not in {"all", "category", "custom", "cancel"}:
-            print("Введите 1, 2, 3 или 0.")
+        if mode not in {"all", "category", "custom", "categories", "cancel"}:
+            print("Введите 1, 2, 3, 4 или 0.")
             continue
         if mode == "cancel":
             raise OperationCancelled
         if mode == "all":
             return "all", [(1, total_slides)]
+        if mode == "categories":
+            return "categories", []
 
         category = "custom"
         default = ""
@@ -317,6 +325,8 @@ def _select_range(
             for index, key in enumerate(categories, start=1):
                 start, end, _ = results[key]
                 suggested = f"{start}-{end}" if start is not None else "не найден"
+                if key in category_ranges:
+                    suggested = _format_ranges(category_ranges[key])
                 print(f"  {index}. {CATEGORIES[key]} ({suggested})")
             while True:
                 try:
@@ -339,22 +349,95 @@ def _select_range(
             start, end, _ = results[category]
             if start is not None and end is not None:
                 default = f"{start}-{end}"
-            else:
+            if category in category_ranges:
+                default = _format_ranges(category_ranges[category])
+            if not default:
                 print("Диапазон по заметкам не найден; задайте его вручную.")
 
-        while True:
+        ranges = _prompt_slide_ranges(default, total_slides)
+        if ranges is not None:
+            if category in CATEGORIES:
+                category_ranges[category] = ranges
+            return category, ranges
+
+
+def _format_ranges(ranges: list[tuple[int, int]]) -> str:
+    return ", ".join(
+        str(first) if first == last else f"{first}-{last}"
+        for first, last in ranges
+    )
+
+
+def _prompt_slide_ranges(default: str, total_slides: int) -> list[tuple[int, int]] | None:
+    while True:
+        try:
+            value = input(
+                f"Слайды [{default or 'обязательно'}; формат 1, 3-5; 0 — назад]: "
+            ).strip() or default
+        except EOFError as error:
+            raise OperationCancelled from error
+        if value == "0":
+            return None
+        try:
+            return _parse_slide_ranges(value, total_slides)
+        except ValueError as error:
+            print(f"{error} Например: 1, 3-5, 8.")
+
+
+def _select_categories(
+    category_ranges: dict[str, list[tuple[int, int]]],
+    selected: set[str],
+    total_slides: int,
+) -> dict[str, list[tuple[int, int]]] | None:
+    categories = list(CATEGORIES)
+    while True:
+        print("\nПодготовка категорий (диапазоны сохраняются до завершения этой презентации):")
+        for index, key in enumerate(categories, 1):
+            label = _format_ranges(category_ranges[key]) if key in category_ranges else "не задан"
+            mark = "выбрана" if key in selected else "не выбрана"
+            print(f"  {index}. {CATEGORIES[key]} ({label}; {mark}) — изменить диапазон")
+        print("  4. Конвертировать выбранные категории")
+        print("  5. Выбрать / исключить категорию")
+        print("  0. Назад")
+        try:
+            answer = input("Действие [4]: ").strip() or "4"
+        except EOFError as error:
+            raise OperationCancelled from error
+        if answer == "0":
+            return None
+        if answer == "4":
+            if not selected:
+                print("Выберите хотя бы одну категорию с заданным диапазоном.")
+                continue
+            return {key: category_ranges[key] for key in categories if key in selected}
+        if answer == "5":
             try:
-                value = input(
-                    f"Слайды [{default or 'обязательно'}; формат 1, 3-5; 0 — назад]: "
-                ).strip() or default
+                index = input("Номер категории [0 — назад]: ").strip() or "0"
             except EOFError as error:
                 raise OperationCancelled from error
-            if value == "0":
-                break
-            try:
-                return category, _parse_slide_ranges(value, total_slides)
-            except ValueError as error:
-                print(f"{error} Например: 1, 3-5, 8.")
+            if index == "0":
+                continue
+            if not index.isdecimal() or not 1 <= int(index) <= len(categories):
+                print("Введите номер категории из списка.")
+                continue
+            key = categories[int(index) - 1]
+            if key in selected:
+                selected.remove(key)
+            elif key in category_ranges:
+                selected.add(key)
+            else:
+                print("Сначала задайте диапазон этой категории.")
+            continue
+        if not answer.isdecimal() or not 1 <= int(answer) <= len(categories):
+            print("Введите 1, 2, 3, 4, 5 или 0.")
+            continue
+        key = categories[int(answer) - 1]
+        ranges = _prompt_slide_ranges(
+            _format_ranges(category_ranges.get(key, [])), total_slides,
+        )
+        if ranges is not None:
+            category_ranges[key] = ranges
+            selected.add(key)
 
 
 def _parse_slide_ranges(value: str, total_slides: int) -> list[tuple[int, int]]:
@@ -388,15 +471,17 @@ def _confirm_selection(
     category: str,
     ranges: list[tuple[int, int]],
     total_slides: int,
-    input_fn=input,
+    input_fn=None,
 ) -> bool:
-    selected = ", ".join(
-        str(first) if first == last else f"{first}-{last}"
-        for first, last in ranges
-    )
+    selected = _format_ranges(ranges)
     count = sum(last - first + 1 for first, last in ranges)
     print(f"\nВыбрано: {selected} ({count} из {total_slides} слайдов)")
     print(f"Каталог категории: {CATEGORIES.get(category, category)}")
+    return _confirm_action(input_fn)
+
+
+def _confirm_action(input_fn=None) -> bool:
+    input_fn = input_fn or input
     while True:
         try:
             answer = input_fn(
@@ -433,9 +518,33 @@ async def prepare_obs_folder(
 
         results = _find_categories(notes, config["keywords"])
         total_slides = len(Presentation(str(normalized)).slides)
+        category_ranges = {
+            key: [(start, end)]
+            for key, (start, end, _) in results.items()
+            if start is not None and end is not None and 1 <= start <= end <= total_slides
+        }
+        selected_categories = set(category_ranges)
         while True:
-            category, ranges = _select_range(results, total_slides)
+            category, ranges = _select_range(results, total_slides, category_ranges)
+            if category == "categories":
+                while True:
+                    selections = _select_categories(
+                        category_ranges, selected_categories, total_slides,
+                    )
+                    if selections is None:
+                        break
+                    print("\nВыбранные категории:")
+                    for key, selected_ranges in selections.items():
+                        print(f"  {CATEGORIES[key]}: {_format_ranges(selected_ranges)}")
+                    if _confirm_action():
+                        break
+                if selections is None:
+                    continue
+                break
+            if category in CATEGORIES:
+                selected_categories.add(category)
             if _confirm_selection(category, ranges, total_slides):
+                selections = {category: ranges}
                 break
 
         render_dir = temp_dir / "rendered"
@@ -443,25 +552,28 @@ async def prepare_obs_folder(
         png_paths, _ = await convert_all_pngs(
             normalized, render_dir, config["quality"]
         )
-        highest_slide = max(last for _, last in ranges)
+        highest_slide = max(
+            last for selected_ranges in selections.values() for _, last in selected_ranges
+        )
         if highest_slide > len(png_paths):
             raise RuntimeError(
                 f"В PDF {len(png_paths)} страниц, а выбран слайд {highest_slide}"
             )
 
         run_id = datetime.now().strftime("%H%M%S_%f")
-        output_dir = (
+        run_dir = (
             config["root_path"]
             / sunday.strftime("%Y-%m-%d")
             / _safe_name(source_path.stem)
             / run_id
-            / category
         )
-        output_dir.mkdir(parents=True, exist_ok=False)
-        for first, last in ranges:
-            for png_path in png_paths[first - 1 : last]:
-                shutil.copy2(png_path, output_dir / png_path.name)
-        return output_dir
+        for key, selected_ranges in selections.items():
+            output_dir = run_dir / key
+            output_dir.mkdir(parents=True, exist_ok=False)
+            for first, last in selected_ranges:
+                for png_path in png_paths[first - 1 : last]:
+                    shutil.copy2(png_path, output_dir / png_path.name)
+        return run_dir if category == "categories" else run_dir / category
 
 
 async def run(date: datetime | None = None) -> Path:

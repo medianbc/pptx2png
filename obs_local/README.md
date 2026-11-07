@@ -213,6 +213,16 @@ prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to the current OS file and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
 
+Manual category ranges survive returning to selection and switching categories
+within the current presentation preparation, but are not persisted after exit.
+Mode `2` converts one category. Mode `4` prepares multiple categories: `1`–`3`
+edit a category and select it, `5` toggles selection by category number, and
+`4` confirms the selected categories. Detected categories are selected initially;
+missing categories need a manual range. Changing the confirmation retains edits
+and selection. The renderer runs once and publishes each selected category to
+its own `sermon`/`opening`/`prayer` subfolder under a shared run directory.
+The reported batch result path is that directory; single-category paths are unchanged.
+
 If the upcoming Sunday's service folder or presentation is missing on Yandex
 Disk, the workflow reports it and offers numbered actions: retry (`1`),
 open a local `.ppt`/`.pptx` file (`2`, then enter its path), or cancel (`0` or Enter).

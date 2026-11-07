@@ -11,6 +11,51 @@ from obs_local import app
 
 
 class SlideRangeTests(unittest.TestCase):
+    def test_manual_category_range_is_reused_after_changing_selection(self):
+        results = {
+            "sermon": (140, 140, [140]),
+            "opening": (3, 15, [3, 15]),
+            "prayer": (None, None, []),
+        }
+        saved = {}
+        with patch("builtins.input", side_effect=["2", "3", "105-107"]):
+            self.assertEqual(app._select_range(results, 161, saved), ("prayer", [(105, 107)]))
+        with patch("builtins.input", side_effect=["2", "1", "140-150"]):
+            app._select_range(results, 161, saved)
+        with patch("builtins.input", side_effect=["2", "3", ""]):
+            self.assertEqual(app._select_range(results, 161, saved), ("prayer", [(105, 107)]))
+        self.assertEqual(saved["sermon"], [(140, 150)])
+        with patch("builtins.input", side_effect=["2", "1", ""]):
+            self.assertEqual(app._select_range(results, 161), ("sermon", [(140, 140)]))
+
+    def test_multiple_categories_can_be_edited_and_excluded(self):
+        ranges = {"sermon": [(140, 140)], "opening": [(3, 15)]}
+        selected = set(ranges)
+        with patch("builtins.input", side_effect=[
+            "3", "105-107", "1", "140-150", "2", "3-10, 12", "5", "2", "4",
+        ]):
+            result = app._select_categories(ranges, selected, 161)
+        self.assertEqual(result, {"sermon": [(140, 150)], "prayer": [(105, 107)]})
+        self.assertEqual(ranges["opening"], [(3, 10), (12, 12)])
+        with patch("builtins.input", side_effect=["5", "2", "4"]):
+            self.assertEqual(set(app._select_categories(ranges, selected, 161)), set(app.CATEGORIES))
+
+    def test_batch_back_keeps_edits_and_invalid_inputs_do_not_change_ranges(self):
+        ranges = {}
+        selected = set()
+        with patch("builtins.input", side_effect=[
+            "4", "5", "3", "bad", "3", "162", "107-105", "", "105-107", "0",
+        ]):
+            self.assertIsNone(app._select_categories(ranges, selected, 161))
+        self.assertEqual(ranges, {"prayer": [(105, 107)]})
+        with patch("builtins.input", side_effect=["4"]):
+            self.assertEqual(app._select_categories(ranges, selected, 161), ranges)
+
+    def test_batch_eof_cancels(self):
+        with patch("builtins.input", side_effect=EOFError):
+            with self.assertRaises(app.OperationCancelled):
+                app._select_categories({}, set(), 161)
+
     def test_parses_and_merges_single_slides_and_ranges(self):
         self.assertEqual(
             app._parse_slide_ranges("1, 3-5, 5–7, 10", 12),
@@ -60,6 +105,79 @@ class SlideRangeTests(unittest.TestCase):
                 "custom", [(1, 2)], 12, input_fn=lambda _: "2"
             )
         )
+
+
+class CategoryConversionTests(unittest.TestCase):
+    def execute(self, root, answers, page_count=161):
+        source = root / "synthetic.pptx"
+        source.touch()
+        results = {
+            "sermon": (140, 140, [140]),
+            "opening": (3, 15, [3, 15]),
+            "prayer": (None, None, []),
+        }
+
+        async def render(_source, render_dir, _quality):
+            paths = []
+            for index in range(1, page_count + 1):
+                path = render_dir / f"slide_{index:03d}.png"
+                path.write_bytes(b"synthetic PNG")
+                paths.append(path)
+            return paths, None
+
+        with (
+            patch.object(app, "extract_speaker_notes", return_value=(True, {}, False)),
+            patch.object(app, "_find_categories", return_value=results),
+            patch.object(app, "Presentation") as presentation,
+            patch.object(app, "convert_all_pngs", new_callable=AsyncMock, side_effect=render) as convert,
+            patch("builtins.input", side_effect=answers),
+        ):
+            presentation.return_value.slides = [None] * 161
+            output = asyncio.run(app.prepare_obs_folder(
+                {"keywords": {}, "root_path": root / "output", "quality": "standard"},
+                source, datetime(2026, 11, 8),
+            ))
+        return output, convert
+
+    def test_edit_single_then_prepare_all_categories_and_render_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, convert = self.execute(Path(directory), [
+                "2", "3", "105-107", "2", "4",
+                "1", "140-150", "2", "3-10", "4", "1",
+            ])
+            self.assertEqual({path.name for path in output.iterdir()}, set(app.CATEGORIES))
+            self.assertEqual(len(list((output / "sermon").glob("*.png"))), 11)
+            self.assertEqual(len(list((output / "opening").glob("*.png"))), 8)
+            self.assertEqual(len(list((output / "prayer").glob("*.png"))), 3)
+            convert.assert_awaited_once()
+
+    def test_confirm_change_keeps_batch_ranges_and_single_category_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, convert = self.execute(Path(directory), [
+                "4", "3", "105-107", "4", "2",
+                "5", "1", "5", "2", "4", "1",
+            ])
+            self.assertEqual({path.name for path in output.iterdir()}, {"prayer"})
+            self.assertEqual(len(list((output / "prayer").glob("*.png"))), 3)
+            convert.assert_awaited_once()
+        with tempfile.TemporaryDirectory() as directory:
+            output, convert = self.execute(Path(directory), [
+                "2", "3", "105-107", "2", "2", "3", "", "1",
+            ])
+            self.assertEqual(output.name, "prayer")
+            self.assertEqual(len(list(output.glob("*.png"))), 3)
+            convert.assert_awaited_once()
+
+    def test_cancel_or_missing_rendered_pages_does_not_publish_output(self):
+        for answers, pages, error in (
+            (["4", "4", "0"], 161, app.OperationCancelled),
+            (["4", "4", "1"], 10, RuntimeError),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaises(error):
+                    self.execute(root, answers, page_count=pages)
+                self.assertFalse((root / "output").exists())
 
 
 class PresentationSourceRecoveryTests(unittest.TestCase):
