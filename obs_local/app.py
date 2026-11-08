@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+from contextlib import contextmanager
+import errno
 import getpass
+import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime
@@ -516,37 +520,136 @@ def _safe_name(value: str) -> str:
     return cleaned or "presentation"
 
 
-def _publish_category_output(staging: Path, target: Path) -> Path | None:
-    backup = None
-    backup_root = target.parent / ".backups" / target.name
-    if target.exists() or target.is_symlink():
-        backup_root.mkdir(parents=True, exist_ok=True)
-        backup = backup_root / (
-            f"{datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex[:8]}"
-        )
-        target.rename(backup)
+@contextmanager
+def _category_output_lock(output_root: Path):
+    lock_path = output_root.parent / f".{output_root.name}.category-output.lock"
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLOCK,
+                    }:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _remove_category_path(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def _cleanup_category_backups(backup_root: Path) -> None:
     try:
-        staging.rename(target)
-    except OSError:
-        if backup is not None and backup.exists():
-            backup.rename(target)
-        raise
-    if backup_root.is_dir():
+        if not backup_root.is_dir():
+            return
         generated_backups = sorted(
             path
             for path in backup_root.iterdir()
             if path.is_dir() and not path.is_symlink()
             and re.fullmatch(r"\d{8}-\d{6}-\d{6}-[0-9a-f]{8}", path.name)
         )
-        for old_backup in generated_backups[:-1]:
-            try:
-                shutil.rmtree(old_backup)
-            except OSError as error:
-                print(
-                    "Предупреждение: не удалось удалить старую резервную копию "
-                    f"{old_backup}: {error}"
-                )
-    return backup
+    except OSError as error:
+        print(
+            "Предупреждение: не удалось проверить старые резервные копии "
+            f"{backup_root}: {error}"
+        )
+        return
+    for old_backup in generated_backups[:-1]:
+        try:
+            shutil.rmtree(old_backup)
+        except OSError as error:
+            print(
+                "Предупреждение: не удалось удалить старую резервную копию "
+                f"{old_backup}: {error}"
+            )
+
+
+def _publish_category_outputs(
+    staged_outputs: dict[str, Path], output_root: Path
+) -> dict[str, Path]:
+    published: list[dict[str, Any]] = []
+    backups: dict[str, Path] = {}
+    with _category_output_lock(output_root):
+        try:
+            for key, staging in staged_outputs.items():
+                target = output_root / CATEGORIES[key]
+                backup = None
+                if target.exists() or target.is_symlink():
+                    backup_root = output_root / ".backups" / target.name
+                    backup_root.mkdir(parents=True, exist_ok=True)
+                    backup = backup_root / (
+                        f"{datetime.now():%Y%m%d-%H%M%S-%f}-"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+                    target.rename(backup)
+                    backups[key] = backup
+                state = {
+                    "target": target,
+                    "backup": backup,
+                    "published": False,
+                }
+                published.append(state)
+                staging.rename(target)
+                state["published"] = True
+        except BaseException as error:
+            rollback_errors = []
+            for state in reversed(published):
+                target = state["target"]
+                backup = state["backup"]
+                try:
+                    if state["published"] and (
+                        target.exists() or target.is_symlink()
+                    ):
+                        _remove_category_path(target)
+                    if backup is not None and (
+                        backup.exists() or backup.is_symlink()
+                    ):
+                        backup.rename(target)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{target}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Не удалось полностью отменить публикацию категорий. "
+                    "Резервные копии сохранены; проверьте папку .backups. "
+                    + "; ".join(rollback_errors)
+                ) from error
+            if not isinstance(error, Exception):
+                raise
+            raise RuntimeError(
+                f"Не удалось опубликовать категории; предыдущие файлы восстановлены: {error}"
+            ) from error
+
+        for key in staged_outputs:
+            _cleanup_category_backups(output_root / ".backups" / CATEGORIES[key])
+    return backups
 
 
 async def prepare_obs_folder(
@@ -611,19 +714,23 @@ async def prepare_obs_folder(
                 "category_output_path", config["root_path"] / "Трансляция"
             ))
             category_output_path.mkdir(parents=True, exist_ok=True)
-            for key, selected_ranges in selections.items():
-                with tempfile.TemporaryDirectory(
-                    prefix=".category-staging-", dir=category_output_path
-                ) as staging_name:
-                    output_dir = Path(staging_name) / "output"
+            with tempfile.TemporaryDirectory(
+                prefix=".category-staging-", dir=category_output_path
+            ) as staging_name:
+                staging_root = Path(staging_name)
+                staged_outputs = {}
+                for key, selected_ranges in selections.items():
+                    output_dir = staging_root / key
                     output_dir.mkdir()
                     for first, last in selected_ranges:
                         for png_path in png_paths[first - 1 : last]:
                             shutil.copy2(png_path, output_dir / png_path.name)
-                    target = category_output_path / CATEGORIES[key]
-                    backup = _publish_category_output(output_dir, target)
-                    if backup is not None:
-                        print(f"Предыдущий результат сохранён: {backup}")
+                    staged_outputs[key] = output_dir
+                backups = _publish_category_outputs(
+                    staged_outputs, category_output_path
+                )
+                for backup in backups.values():
+                    print(f"Предыдущий результат сохранён: {backup}")
             return (
                 category_output_path
                 if category == "categories"

@@ -239,7 +239,9 @@ Only the latest generated backup per category is retained; older generated
 backups are removed on the next conversion of that category. Categories not
 selected in a batch remain unchanged. Existing run-specific
 outputs are not moved or deleted. The reported batch result path is
-`category_output_path`.
+`category_output_path`. All selected folders are staged before publication;
+if a replacement fails, already replaced categories are restored. Concurrent
+category publications are serialized with a cross-process lock.
 
 If the upcoming Sunday's service folder or presentation is missing on Yandex
 Disk, the workflow reports it and offers numbered actions: retry (`1`),

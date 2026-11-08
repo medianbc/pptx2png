@@ -1,5 +1,6 @@
 import asyncio
 import configparser
+import multiprocessing
 import os
 import tempfile
 import unittest
@@ -8,6 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from obs_local import app
+
+
+def _hold_category_output_lock(path, acquired, release=None):
+    with app._category_output_lock(Path(path)):
+        acquired.set()
+        if release is not None:
+            release.wait(10)
 
 
 class SlideRangeTests(unittest.TestCase):
@@ -217,6 +225,96 @@ class CategoryConversionTests(unittest.TestCase):
             self.assertEqual(
                 (user_backup / "keep.txt").read_text(encoding="utf-8"), "keep"
             )
+
+    def test_batch_copy_failure_does_not_replace_any_live_category(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output" / "Трансляция"
+            sermon = output_root / "Проповедь"
+            opening = output_root / "Начало собрания"
+            sermon.mkdir(parents=True)
+            opening.mkdir()
+            (sermon / "old.png").write_bytes(b"old sermon")
+            (opening / "old.png").write_bytes(b"old opening")
+            original_copy = app.shutil.copy2
+
+            def fail_opening_copy(source, destination, *args, **kwargs):
+                if Path(destination).parent.name == "opening":
+                    raise OSError("synthetic copy failure")
+                return original_copy(source, destination, *args, **kwargs)
+
+            with patch.object(app.shutil, "copy2", side_effect=fail_opening_copy):
+                with self.assertRaisesRegex(OSError, "synthetic copy failure"):
+                    self.execute(root, ["4", "4", "1"])
+
+            self.assertEqual((sermon / "old.png").read_bytes(), b"old sermon")
+            self.assertEqual((opening / "old.png").read_bytes(), b"old opening")
+            self.assertFalse((output_root / ".backups").exists())
+
+    def test_batch_publish_failure_restores_all_previous_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output" / "Трансляция"
+            sermon = output_root / "Проповедь"
+            opening = output_root / "Начало собрания"
+            sermon.mkdir(parents=True)
+            opening.mkdir()
+            (sermon / "old.png").write_bytes(b"old sermon")
+            (opening / "old.png").write_bytes(b"old opening")
+            original_rename = Path.rename
+
+            def fail_opening_publish(source, target):
+                if (
+                    Path(source).name == "opening"
+                    and Path(target) == opening
+                ):
+                    raise OSError("synthetic publish failure")
+                return original_rename(source, target)
+
+            with patch.object(Path, "rename", fail_opening_publish):
+                with self.assertRaisesRegex(
+                    RuntimeError, "предыдущие файлы восстановлены"
+                ):
+                    self.execute(root, ["4", "4", "1"])
+
+            self.assertEqual((sermon / "old.png").read_bytes(), b"old sermon")
+            self.assertEqual((opening / "old.png").read_bytes(), b"old opening")
+            self.assertEqual({path.name for path in sermon.iterdir()}, {"old.png"})
+            self.assertEqual({path.name for path in opening.iterdir()}, {"old.png"})
+
+    def test_category_output_lock_serializes_processes(self):
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            first_acquired = context.Event()
+            release_first = context.Event()
+            second_acquired = context.Event()
+            first = context.Process(
+                target=_hold_category_output_lock,
+                args=(directory, first_acquired, release_first),
+            )
+            second = context.Process(
+                target=_hold_category_output_lock,
+                args=(directory, second_acquired),
+            )
+            try:
+                first.start()
+                self.assertTrue(first_acquired.wait(10))
+                second.start()
+                self.assertFalse(second_acquired.wait(0.25))
+                release_first.set()
+                self.assertTrue(second_acquired.wait(10))
+            finally:
+                release_first.set()
+                first.join(10)
+                second.join(10)
+                if first.is_alive():
+                    first.terminate()
+                    first.join()
+                if second.is_alive():
+                    second.terminate()
+                    second.join()
+            self.assertEqual(first.exitcode, 0)
+            self.assertEqual(second.exitcode, 0)
 
     def test_all_slides_keep_run_specific_output_layout(self):
         with tempfile.TemporaryDirectory() as directory:
