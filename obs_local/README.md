@@ -105,6 +105,35 @@ on the target machine as well.
    when running the installer. The selected path is saved in both launchers
    and used by presentation and song conversion.
 
+   **Presentation fonts on macOS.** Install every font used by the
+   presentations (for example `Kraskario`) with Font Book or by copying it to
+   `~/Library/Fonts` or `/Library/Fonts`. For reliable conversion, do not
+   rely on fonts embedded in a PPTX. Conversion details:
+
+   - in `--headless` mode LibreOffice on macOS may not see some installed
+     fonts and may substitute another face (for example Linux Libertine).
+     Different font metrics can cause text to wrap and overlap other slide
+     elements;
+   - the converter first runs `--headless` with an isolated temporary
+     LibreOffice profile and copies TrueType/OpenType fonts from
+     `/Library/Fonts` and `~/Library/Fonts` into it. Each conversion gets its
+     own profile, so parallel conversions do not conflict; the profile is
+     removed afterwards;
+   - add extra font directories with the `PPTX2PNG_FONT_DIRS` environment
+     variable, separating paths with a colon (`:`). For one run, use for
+     example `PPTX2PNG_FONT_DIRS="$HOME/Fonts:/Volumes/Shared/Fonts" ./start_obs_local.sh`.
+     The specified directories must exist;
+   - if the profile cannot be prepared, a font cannot be copied, or headless
+     conversion fails, the converter warns and retries with `--invisible`
+     using the normal LibreOffice profile. This fallback may require an active
+     macOS GUI session. A LibreOffice icon may briefly appear in the Dock.
+     The extra `PPTX2PNG_FONT_DIRS` directories are not loaded automatically
+     in fallback mode;
+   - LibreOffice can successfully create a PDF while substituting a missing
+     font, so substitution alone does not trigger the fallback. To check a
+     PDF, run `LC_ALL=C grep -a -o '/BaseFont */[^ /]*' file.pdf | sort -u`
+     and compare the list with the presentation fonts.
+
 4. Configure `obs_local/settings.macos.ini` (created on first launch) and
    `config.ini` as described below.
    Interactive presentation preparation requires a Yandex Disk OAuth token
@@ -221,7 +250,8 @@ folders under `category_output_path` (default `root_path/Трансляция`):
 `Начало собрания`, `Молитва`, and `Проповедь`. Absolute
 `category_output_path` values are used as-is; relative values resolve from
 `root_path`. All-slide and custom-range results remain in
-`root_path/YYYY-MM-DD/presentation/run-id/category`. The interactive workflow
+`root_path/YYYY-MM-DD/presentation/run-id/folder` (`Все слайды` or
+`Выбранные слайды`). The interactive workflow
 prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to the current OS file and the token to a private `config.ini`.
 The token is not stored in `settings.ini`.
@@ -415,3 +445,13 @@ The isolated tests use synthetic DOCX/ZIP fixtures and do not access Yandex Disk
 ```bash
 python -m unittest obs_local.tests.test_prepare_songs -v
 ```
+
+The macOS CI conversion smoke test generates a temporary, uniquely named font.
+To run it locally on macOS with LibreOffice installed:
+
+```bash
+python -m pip install -r obs_local/requirements-test.txt
+python -m obs_local.tests.macos_font_smoke
+```
+
+The additional test dependency is not required for normal OBS use.
