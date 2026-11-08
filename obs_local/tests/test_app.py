@@ -359,9 +359,20 @@ class CategoryConversionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output, _ = self.execute(Path(directory), ["1", "1"])
 
-            self.assertEqual(output.name, "all")
+            self.assertEqual(output.name, "Все слайды")
             self.assertEqual(output.parent.parent.parent.name, "2026-11-08")
             self.assertEqual(len(list(output.glob("*.png"))), 161)
+
+    def test_selected_slides_use_russian_label_and_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("builtins.print") as print_mock:
+                output, _ = self.execute(Path(directory), ["3", "141", "1"])
+
+            print_mock.assert_any_call("Каталог категории: Выбранные слайды")
+            self.assertEqual(output.name, "Выбранные слайды")
+            self.assertEqual(
+                {path.name for path in output.glob("*.png")}, {"slide_141.png"}
+            )
 
     def test_cancel_or_missing_rendered_pages_does_not_publish_output(self):
         for answers, pages, error in (
