@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+from contextlib import contextmanager
+import errno
 import getpass
+import os
 import re
 import shutil
 import tempfile
+import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +37,11 @@ from .config_utils import get_settings_path, parse_local_file_path
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
-CATEGORIES = {"sermon": "Проповедь", "opening": "Начало", "prayer": "Молитва"}
+CATEGORIES = {
+    "sermon": "Проповедь",
+    "opening": "Начало собрания",
+    "prayer": "Молитва",
+}
 DEFAULT_ROOT_PATH = "./obs_png"
 
 
@@ -74,6 +83,9 @@ def load_config(
     base_path = setting("YandexDisk", "base_path")
     source_folder = setting("YandexDisk", "source_folder", "Служение")
     root_value = setting("OBS Local paths", "root_path")
+    category_output_value = setting(
+        "OBS Local paths", "category_output_path", "Трансляция"
+    )
     quality = setting("OBS Local paths", "quality").lower()
 
     settings_updates: dict[str, dict[str, str]] = {}
@@ -135,6 +147,10 @@ def load_config(
     if not root_path.is_absolute():
         root_path = PROJECT_DIR / root_path
 
+    category_output_path = Path(category_output_value).expanduser()
+    if not category_output_path.is_absolute():
+        category_output_path = root_path / category_output_path
+
     legacy_keyword = setting("YandexDisk", "sermon_keyword", "проповед")
     raw_keywords = {
         "sermon": setting(
@@ -157,6 +173,7 @@ def load_config(
         "base_path": base_path,
         "source_folder": source_folder,
         "root_path": root_path,
+        "category_output_path": category_output_path,
         "quality": quality,
         "keywords": keywords,
     }
@@ -503,6 +520,146 @@ def _safe_name(value: str) -> str:
     return cleaned or "presentation"
 
 
+@contextmanager
+def _category_output_lock(output_root: Path):
+    lock_path = output_root / ".category-output.lock"
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLOCK,
+                    }:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _remove_category_path(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def _cleanup_category_backups(
+    backup_root: Path, keep_backup: Path | None = None
+) -> None:
+    try:
+        if not backup_root.is_dir():
+            return
+        generated_backups = sorted(
+            path
+            for path in backup_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+            and re.fullmatch(r"\d{8}-\d{6}-\d{6}-[0-9a-f]{8}", path.name)
+        )
+    except OSError as error:
+        print(
+            "Предупреждение: не удалось проверить старые резервные копии "
+            f"{backup_root}: {error}"
+        )
+        return
+    if keep_backup is None and generated_backups:
+        keep_backup = generated_backups[-1]
+    for old_backup in generated_backups:
+        if old_backup == keep_backup:
+            continue
+        try:
+            shutil.rmtree(old_backup)
+        except OSError as error:
+            print(
+                "Предупреждение: не удалось удалить старую резервную копию "
+                f"{old_backup}: {error}"
+            )
+
+
+def _publish_category_outputs(
+    staged_outputs: dict[str, Path], output_root: Path
+) -> dict[str, Path]:
+    published: list[dict[str, Any]] = []
+    backups: dict[str, Path] = {}
+    with _category_output_lock(output_root):
+        try:
+            for key, staging in staged_outputs.items():
+                target = output_root / CATEGORIES[key]
+                backup = None
+                if target.exists() or target.is_symlink():
+                    backup_root = output_root / ".backups" / target.name
+                    backup_root.mkdir(parents=True, exist_ok=True)
+                    backup = backup_root / (
+                        f"{datetime.now():%Y%m%d-%H%M%S-%f}-"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+                    target.rename(backup)
+                    backups[key] = backup
+                state = {
+                    "target": target,
+                    "backup": backup,
+                    "published": False,
+                }
+                published.append(state)
+                staging.rename(target)
+                state["published"] = True
+        except BaseException as error:
+            rollback_errors = []
+            for state in reversed(published):
+                target = state["target"]
+                backup = state["backup"]
+                try:
+                    if state["published"] and (
+                        target.exists() or target.is_symlink()
+                    ):
+                        _remove_category_path(target)
+                    if backup is not None and (
+                        backup.exists() or backup.is_symlink()
+                    ):
+                        backup.rename(target)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{target}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Не удалось полностью отменить публикацию категорий. "
+                    "Резервные копии сохранены; проверьте папку .backups. "
+                    + "; ".join(rollback_errors)
+                ) from error
+            if not isinstance(error, Exception):
+                raise
+            raise RuntimeError(
+                f"Не удалось опубликовать категории; предыдущие файлы восстановлены: {error}"
+            ) from error
+
+        for key in staged_outputs:
+            _cleanup_category_backups(
+                output_root / ".backups" / CATEGORIES[key], backups.get(key)
+            )
+    return backups
+
+
 async def prepare_obs_folder(
     config: dict[str, Any], source_path: Path, sunday: datetime
 ) -> Path:
@@ -560,6 +717,34 @@ async def prepare_obs_folder(
                 f"В PDF {len(png_paths)} страниц, а выбран слайд {highest_slide}"
             )
 
+        if all(key in CATEGORIES for key in selections):
+            category_output_path = Path(config.get(
+                "category_output_path", config["root_path"] / "Трансляция"
+            ))
+            category_output_path.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=".category-staging-", dir=category_output_path
+            ) as staging_name:
+                staging_root = Path(staging_name)
+                staged_outputs = {}
+                for key, selected_ranges in selections.items():
+                    output_dir = staging_root / key
+                    output_dir.mkdir()
+                    for first, last in selected_ranges:
+                        for png_path in png_paths[first - 1 : last]:
+                            shutil.copy2(png_path, output_dir / png_path.name)
+                    staged_outputs[key] = output_dir
+                backups = _publish_category_outputs(
+                    staged_outputs, category_output_path
+                )
+                for backup in backups.values():
+                    print(f"Предыдущий результат сохранён: {backup}")
+            return (
+                category_output_path
+                if category == "categories"
+                else category_output_path / CATEGORIES[category]
+            )
+
         run_id = datetime.now().strftime("%H%M%S_%f")
         run_dir = (
             config["root_path"]
@@ -567,13 +752,12 @@ async def prepare_obs_folder(
             / _safe_name(source_path.stem)
             / run_id
         )
-        for key, selected_ranges in selections.items():
-            output_dir = run_dir / key
-            output_dir.mkdir(parents=True, exist_ok=False)
-            for first, last in selected_ranges:
-                for png_path in png_paths[first - 1 : last]:
-                    shutil.copy2(png_path, output_dir / png_path.name)
-        return run_dir if category == "categories" else run_dir / category
+        output_dir = run_dir / category
+        output_dir.mkdir(parents=True, exist_ok=False)
+        for first, last in selections[category]:
+            for png_path in png_paths[first - 1 : last]:
+                shutil.copy2(png_path, output_dir / png_path.name)
+        return output_dir
 
 
 async def run(date: datetime | None = None) -> Path:
