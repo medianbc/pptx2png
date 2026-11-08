@@ -8,12 +8,15 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 from unittest.mock import patch
 
+from pptx import Presentation
+
 from pptx2png_core.converter_engine import (
     _find_libreoffice,
     _install_macos_fonts,
     _macos_font_dirs,
     _run_libreoffice_conversion,
     _soffice_fallback_args,
+    librenormalize_to_pptx,
 )
 
 
@@ -395,6 +398,57 @@ class SofficeFallbackModeTests(unittest.TestCase):
     def test_other_platforms_keep_headless_fallback(self):
         with patch("pptx2png_core.converter_engine.sys.platform", "linux"):
             self.assertEqual(_soffice_fallback_args(), ["--headless"])
+
+
+class LibreOfficeRepairTests(unittest.TestCase):
+    def test_repairs_pptx_in_its_own_directory_without_overwriting_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "slides.pptx"
+            source.write_bytes(b"original presentation")
+
+            def fake_conversion(input_path, output_dir):
+                self.assertEqual(input_path, source)
+                self.assertNotEqual(output_dir, root)
+                self.assertEqual(output_dir.parent, root)
+                presentation = Presentation()
+                presentation.slides.add_slide(presentation.slide_layouts[6])
+                result = output_dir / source.name
+                presentation.save(str(result))
+                return result
+
+            with patch(
+                "pptx2png_core.converter_engine.ppt_to_pptx_crossplatform",
+                side_effect=fake_conversion,
+            ):
+                result = librenormalize_to_pptx(source, root)
+
+            self.assertIsNotNone(result)
+            normalized, count = result
+            self.assertEqual(count, 1)
+            self.assertTrue(normalized.is_file())
+            self.assertNotEqual(normalized, source)
+            self.assertEqual(source.read_bytes(), b"original presentation")
+
+    def test_failed_repair_removes_temporary_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "slides.pptx"
+            source.write_bytes(b"original")
+
+            with (
+                patch(
+                    "pptx2png_core.converter_engine.ppt_to_pptx_crossplatform",
+                    side_effect=OSError("conversion failed"),
+                ),
+                self.assertLogs(level="WARNING"),
+            ):
+                result = librenormalize_to_pptx(source, root)
+
+            self.assertIsNone(result)
+            self.assertEqual(list(root.iterdir()), [source])
+            self.assertEqual(source.read_bytes(), b"original")
+
 
 class LibreOfficeDiscoveryTests(unittest.TestCase):
     def test_uses_configured_executable_path(self):

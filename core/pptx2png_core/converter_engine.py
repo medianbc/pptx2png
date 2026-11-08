@@ -267,9 +267,15 @@ def librenormalize_to_pptx(
     Возвращает (путь к новому .pptx, число слайдов) или None,
     если ни LibreOffice-конвертация, ни чтение результата не удались.
     """
+    repair_dir = None
+    keep_repair_dir = False
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
-        normalized = ppt_to_pptx_crossplatform(src_pptx, work_dir)
+        output_dir = work_dir
+        if (work_dir / f"{src_pptx.stem}.pptx").resolve() == src_pptx.resolve():
+            repair_dir = Path(tempfile.mkdtemp(prefix=".lo-repair-", dir=work_dir))
+            output_dir = repair_dir
+        normalized = ppt_to_pptx_crossplatform(src_pptx, output_dir)
         if not normalized or not Path(normalized).exists():
             return None
         # Проверяем, что python-pptx теперь его открывает
@@ -277,10 +283,21 @@ def librenormalize_to_pptx(
         count = len(prs.slides._sldIdLst)
         if count <= 0:
             return None
+        keep_repair_dir = True
         return Path(normalized), count
     except Exception as e:
         logging.warning(f"librenormalize_to_pptx({src_pptx}): {e}")
         return None
+    finally:
+        if repair_dir is not None and not keep_repair_dir:
+            try:
+                shutil.rmtree(repair_dir)
+            except OSError as error:
+                logging.warning(
+                    "Could not remove temporary LibreOffice repair directory %s: %s",
+                    repair_dir,
+                    error,
+                )
 
 def count_slides_via_libreoffice(
     pptx_path: Path, work_dir: Path
