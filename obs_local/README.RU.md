@@ -467,3 +467,13 @@ CAPTCHA.
 ```bash
 python -m unittest obs_local.tests.test_prepare_songs -v
 ```
+
+Smoke-тест конвертации в macOS CI создаёт временный шрифт с уникальным именем.
+Для локального запуска на macOS с установленным LibreOffice:
+
+```bash
+python -m pip install -r obs_local/requirements-test.txt
+python -m obs_local.tests.macos_font_smoke
+```
+
+Для обычной работы OBS дополнительная тестовая зависимость не нужна.

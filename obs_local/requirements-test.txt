@@ -1,0 +1,2 @@
+# Used only to generate an isolated font for the macOS CI smoke test.
+fonttools>=4.0

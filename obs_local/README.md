@@ -445,3 +445,13 @@ The isolated tests use synthetic DOCX/ZIP fixtures and do not access Yandex Disk
 ```bash
 python -m unittest obs_local.tests.test_prepare_songs -v
 ```
+
+The macOS CI conversion smoke test generates a temporary, uniquely named font.
+To run it locally on macOS with LibreOffice installed:
+
+```bash
+python -m pip install -r obs_local/requirements-test.txt
+python -m obs_local.tests.macos_font_smoke
+```
+
+The additional test dependency is not required for normal OBS use.
