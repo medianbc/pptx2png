@@ -566,7 +566,9 @@ def _remove_category_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _cleanup_category_backups(backup_root: Path) -> None:
+def _cleanup_category_backups(
+    backup_root: Path, keep_backup: Path | None = None
+) -> None:
     try:
         if not backup_root.is_dir():
             return
@@ -582,7 +584,11 @@ def _cleanup_category_backups(backup_root: Path) -> None:
             f"{backup_root}: {error}"
         )
         return
-    for old_backup in generated_backups[:-1]:
+    if keep_backup is None and generated_backups:
+        keep_backup = generated_backups[-1]
+    for old_backup in generated_backups:
+        if old_backup == keep_backup:
+            continue
         try:
             shutil.rmtree(old_backup)
         except OSError as error:
@@ -648,7 +654,9 @@ def _publish_category_outputs(
             ) from error
 
         for key in staged_outputs:
-            _cleanup_category_backups(output_root / ".backups" / CATEGORIES[key])
+            _cleanup_category_backups(
+                output_root / ".backups" / CATEGORIES[key], backups.get(key)
+            )
     return backups
 
 

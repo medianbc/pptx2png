@@ -230,6 +230,41 @@ class CategoryConversionTests(unittest.TestCase):
                 (user_backup / "keep.txt").read_text(encoding="utf-8"), "keep"
             )
 
+    def test_category_cleanup_keeps_backup_created_with_clock_moved_backwards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory) / "Трансляция"
+            target = output_root / "Молитва"
+            target.mkdir(parents=True)
+            (target / "previous.png").write_bytes(b"previous slides")
+
+            backup_root = output_root / ".backups" / "Молитва"
+            future_backup = backup_root / "20261231-235959-000000-aaaaaaaa"
+            future_backup.mkdir(parents=True)
+            (future_backup / "older.png").write_bytes(b"older backup")
+
+            staging = Path(directory) / "staging"
+            staging.mkdir()
+            (staging / "current.png").write_bytes(b"current slides")
+            with patch.object(
+                app,
+                "datetime",
+                Mock(now=Mock(return_value=datetime(2026, 1, 1))),
+            ):
+                backups = app._publish_category_outputs(
+                    {"prayer": staging}, output_root
+                )
+
+            self.assertEqual(
+                {path.name for path in target.iterdir()}, {"current.png"}
+            )
+            self.assertEqual(
+                {path.name for path in backups["prayer"].iterdir()},
+                {"previous.png"},
+            )
+            self.assertEqual(
+                list(backup_root.iterdir()), [backups["prayer"]]
+            )
+
     def test_batch_copy_failure_does_not_replace_any_live_category(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
