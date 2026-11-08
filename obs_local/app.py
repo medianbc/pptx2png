@@ -522,7 +522,7 @@ def _safe_name(value: str) -> str:
 
 @contextmanager
 def _category_output_lock(output_root: Path):
-    lock_path = output_root.parent / f".{output_root.name}.category-output.lock"
+    lock_path = output_root / ".category-output.lock"
     with lock_path.open("a+b") as lock_file:
         if os.name == "nt":
             import msvcrt

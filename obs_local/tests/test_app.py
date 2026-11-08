@@ -159,9 +159,10 @@ class CategoryConversionTests(unittest.TestCase):
                 "1", "140-150", "2", "3-10", "4", "1",
             ])
             self.assertEqual(
-                {path.name for path in output.iterdir()},
+                {path.name for path in output.iterdir() if path.is_dir()},
                 {"Проповедь", "Начало собрания", "Молитва"},
             )
+            self.assertTrue((output / ".category-output.lock").is_file())
             self.assertEqual(len(list((output / "Проповедь").glob("*.png"))), 11)
             self.assertEqual(len(list((output / "Начало собрания").glob("*.png"))), 8)
             self.assertEqual(len(list((output / "Молитва").glob("*.png"))), 3)
@@ -174,7 +175,10 @@ class CategoryConversionTests(unittest.TestCase):
                 "4", "3", "105-107", "4", "2",
                 "5", "1", "5", "2", "4", "1",
             ])
-            self.assertEqual({path.name for path in output.iterdir()}, {"Молитва"})
+            self.assertEqual(
+                {path.name for path in output.iterdir() if path.is_dir()},
+                {"Молитва"},
+            )
             self.assertEqual(len(list((output / "Молитва").glob("*.png"))), 3)
             convert.assert_awaited_once()
         with tempfile.TemporaryDirectory() as directory:
