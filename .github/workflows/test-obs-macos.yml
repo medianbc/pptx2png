@@ -55,26 +55,5 @@ jobs:
           PPTX2PNG_INSTALL_DIR: ${{ runner.temp }}/pptx2png-install
         run: |
           cd "$PPTX2PNG_INSTALL_DIR"
-          ./.venv/bin/python - <<'PY'
-          import asyncio
-          import tempfile
-          from pathlib import Path
-
-          from pptx import Presentation
-          from pptx2png_core.converter_engine import convert_all_pngs
-
-          with tempfile.TemporaryDirectory(prefix="pptx2png-macos-") as directory:
-              root = Path(directory)
-              presentation = Presentation()
-              presentation.slides.add_slide(presentation.slide_layouts[6])
-              source = root / "smoke-test.pptx"
-              presentation.save(source)
-              output = root / "png"
-              output.mkdir()
-
-              png_paths, _ = asyncio.run(
-                  convert_all_pngs(source, output, "standard")
-              )
-              if len(png_paths) != 1 or not png_paths[0].is_file():
-                  raise SystemExit("Expected one rendered PNG slide")
-          PY
+          ./.venv/bin/python -m pip install -r obs_local/requirements-test.txt
+          ./.venv/bin/python -m obs_local.tests.macos_font_smoke

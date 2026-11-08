@@ -20,8 +20,22 @@ PNG = prepare_songs.PNG_SIGNATURE + b"test-png"
 def _minimal_docx_bytes() -> bytes:
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w") as document:
-        document.writestr("word/document.xml", b"<document/>")
+        document.writestr(zipfile.ZipInfo("word/document.xml"), b"<document/>")
     return data.getvalue()
+
+
+class DocxFixtureTests(unittest.TestCase):
+    def test_minimal_docx_is_independent_of_current_time(self):
+        with patch(
+            "zipfile.time.localtime", return_value=(2024, 1, 1, 0, 0, 0, 0, 1, -1)
+        ):
+            first = _minimal_docx_bytes()
+        with patch(
+            "zipfile.time.localtime", return_value=(2026, 11, 8, 12, 0, 0, 6, 312, -1)
+        ):
+            second = _minimal_docx_bytes()
+
+        self.assertEqual(first, second)
 
 
 def _paragraph(text: str) -> ElementTree.Element:
