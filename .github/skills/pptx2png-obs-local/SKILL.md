@@ -56,8 +56,13 @@ feature exists. For a new checkout/chat, use the
   recovery keeps its own `1` retry, `2` local file, `0` cancel numbering.
 - Presentation category ranges are kept only during the current preparation,
   including back/change-selection paths. Mode `2` converts one category; mode
-  `4` edits/selects multiple categories, renders once and writes separate
-  category folders under one run directory. Do not persist edits to source files.
+  `4` edits/selects multiple categories and renders once. Category PNGs go into
+  configurable stable Russian-named folders under `category_output_path`
+  (default `root_path/Трансляция`); all-slide/custom outputs remain
+  run-specific. Stage every selected category before publication, serialize
+  publishers with a cross-process lock, and roll back earlier replacements if
+  a later replacement fails. Keep only the latest generated category backup.
+  Do not persist edits to source files.
 - Song search prioritizes local PNG ZIPs, then local PPTX, then configured
   Yandex Disk ZIP/PPTX sources. Matching supports strong partial title matches;
   ambiguous candidates are not selected automatically.

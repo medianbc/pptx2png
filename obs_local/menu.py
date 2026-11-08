@@ -19,6 +19,126 @@ from . import app, prepare_songs, updater
 from .config_utils import get_settings_path, update_ini_file
 
 
+SETTING_DESCRIPTIONS = {
+    ("YandexDisk", "base_path"): (
+        "Папка презентаций на Яндекс.Диске",
+        "Корневая папка, где приложение ищет презентацию ближайшего воскресенья.",
+    ),
+    ("YandexDisk", "source_folder"): (
+        "Папка служения",
+        "Название подпапки внутри каталога презентаций, где хранятся материалы собрания.",
+    ),
+    ("YandexDisk", "sermon_keyword"): (
+        "Старое ключевое слово для проповеди",
+        "Используется как запасное значение, если список слов для проповеди не задан.",
+    ),
+    ("SlideCategories", "sermon_keywords"): (
+        "Слова для поиска проповеди",
+        "Слова из заметок докладчика, по которым определяются границы слайдов проповеди.",
+    ),
+    ("SlideCategories", "opening_keywords"): (
+        "Слова для поиска начала собрания",
+        "Слова из заметок докладчика, по которым определяется диапазон начала собрания.",
+    ),
+    ("SlideCategories", "prayer_keywords"): (
+        "Слова для поиска молитвы",
+        "Слова из заметок докладчика, по которым определяется диапазон молитвы.",
+    ),
+    ("OBS Local paths", "root_path"): (
+        "Корневая папка готовых материалов",
+        "Основное место сохранения PNG и песен. Относительный путь отсчитывается от папки проекта.",
+    ),
+    ("OBS Local paths", "category_output_path"): (
+        "Папка категорий презентаций",
+        "Постоянное место для папок «Начало собрания», «Молитва» и «Проповедь». Относительный путь отсчитывается от корневой папки материалов.",
+    ),
+    ("OBS Local paths", "quality"): (
+        "Качество PNG",
+        "Разрешение изображений презентации. Более высокое качество создаёт файлы большего размера.",
+    ),
+    ("Song preparation", "priority_cloud_disk"): (
+        "Приоритетный диск для программы",
+        "Выберите Google или Яндекс.Диск как источник программы собрания. При ошибке автоматического перехода на другой диск нет.",
+    ),
+    ("Song preparation", "program_google_url"): (
+        "Ссылка на программу в Google Docs",
+        "Публичная ссылка на документ Google. Для загрузки в документе должны быть разрешены просмотр и скачивание.",
+    ),
+    ("Song preparation", "program_yandex_url"): (
+        "Ссылка на программу на Яндекс.Диске",
+        "Публичная ссылка на файл программы DOCX на Яндекс.Диске.",
+    ),
+    ("Song preparation", "program_url"): (
+        "Общая ссылка на программу",
+        "Совместимая ссылка на DOCX-программу. Используется, если для выбранного облака не задана отдельная ссылка.",
+    ),
+    ("Song preparation", "local_zip_dir"): (
+        "Локальная папка песен PNG ZIP",
+        "Папка с ZIP-архивами, содержащими PNG-слайды песен. Проверяется перед поиском на Яндекс.Диске.",
+    ),
+    ("Song preparation", "local_pptx_dir"): (
+        "Локальная папка песен PPTX",
+        "Папка с презентациями песен. Файлы из неё конвертируются в PNG при подготовке.",
+    ),
+    ("Song preparation", "yandex_zip_png_paths"): (
+        "Папки PNG ZIP песен на Яндекс.Диске",
+        "Пути к удалённым папкам с ZIP-архивами песен. Несколько путей разделяйте символом |.",
+    ),
+    ("Song preparation", "yandex_zip_png_url"): (
+        "Ссылка на папку PNG ZIP песен",
+        "Справочная публичная ссылка на папку с архивами песен; для поиска используются настроенные выше пути.",
+    ),
+    ("Song preparation", "yandex_pptx_paths"): (
+        "Папки презентаций песен на Яндекс.Диске",
+        "Пути к удалённым папкам с PPTX-файлами песен. Несколько путей разделяйте символом |.",
+    ),
+    ("Song preparation", "yandex_pptx_url"): (
+        "Ссылка на папку презентаций песен",
+        "Справочная публичная ссылка на папку с PPTX-файлами; для поиска используются настроенные пути.",
+    ),
+    ("Song preparation", "cache_missing_yandex_song_zips"): (
+        "Кэшировать недостающие архивы песен",
+        "Включает дополнительный обход всей удалённой библиотеки после обработки программы. Обычно оставьте выключенным.",
+    ),
+    ("Logging", "log_dir"): (
+        "Папка журналов",
+        "Место сохранения файлов obs_local.log и debug.log. Обычно менять его не требуется.",
+    ),
+}
+
+
+def _setting_label(section: str, key: str) -> str:
+    return SETTING_DESCRIPTIONS.get(
+        (section, key),
+        ("Дополнительная настройка", "Пользовательский параметр конфигурации."),
+    )[0]
+
+
+def _setting_description(section: str, key: str) -> str:
+    return SETTING_DESCRIPTIONS.get(
+        (section, key),
+        ("Дополнительная настройка", "Пользовательский параметр конфигурации."),
+    )[1]
+
+
+def _display_setting_value(section: str, key: str, value: str) -> str:
+    if not value:
+        return "не задано"
+    if (section, key) == ("OBS Local paths", "quality"):
+        return {
+            "standard": "Стандартное",
+            "2k": "Высокое (2K)",
+            "4k": "Максимальное (4K)",
+        }.get(value.lower(), value)
+    if (section, key) == ("Song preparation", "priority_cloud_disk"):
+        return {"google": "Google", "yandex": "Яндекс.Диск"}.get(
+            value.lower(), value
+        )
+    if key == "cache_missing_yandex_song_zips":
+        return {"true": "Да", "false": "Нет"}.get(value.lower(), value)
+    return value
+
+
 def _settings_menu(input_fn: Callable[[str], str]) -> bool:
     while True:
         try:
@@ -36,18 +156,22 @@ def _settings_menu(input_fn: Callable[[str], str]) -> bool:
                 ]
                 legacy_url = settings.get("Song preparation", "program_url", fallback="")
                 default_cloud = prepare_songs._legacy_program_cloud(legacy_url)
-                for key, default in (
-                    ("priority_cloud_disk", default_cloud),
-                    ("program_google_url", ""),
-                    ("program_yandex_url", ""),
+                for section, key, default in (
+                    ("OBS Local paths", "category_output_path", "Трансляция"),
+                    ("Song preparation", "priority_cloud_disk", default_cloud),
+                    ("Song preparation", "program_google_url", ""),
+                    ("Song preparation", "program_yandex_url", ""),
                 ):
-                    if not settings.has_option("Song preparation", key):
-                        entries.append(("Song preparation", key, default))
+                    if not settings.has_option(section, key):
+                        entries.append((section, key, default))
             except (configparser.Error, OSError, UnicodeError) as error:
                 print(f"Не удалось прочитать настройки: {error}")
             print("\nНастройки OBS")
             for index, (section, key, value) in enumerate(entries, 1):
-                print(f"  {index}. [{section}] {key} = {value}")
+                print(
+                    f"  {index}. {_setting_label(section, key)}"
+                    f" [{_display_setting_value(section, key, value)}]"
+                )
             token_choice = str(len(entries) + 1)
             update_choice = str(len(entries) + 2)
             print(f"  {token_choice}. Ввести токен Яндекс.Диска")
@@ -82,9 +206,20 @@ def _settings_menu(input_fn: Callable[[str], str]) -> bool:
                 print("Введите номер из списка.")
                 continue
             section, key, old_value = entries[int(choice) - 1]
+            label = _setting_label(section, key)
+            print(f"\nКратко: {label}.")
+            print(f"Подробнее: {_setting_description(section, key)}")
+            print(
+                "Текущее значение: "
+                f"[{_display_setting_value(section, key, old_value)}]"
+            )
             if key == "priority_cloud_disk":
                 print("  1. Google\n  2. Яндекс")
-            value = input_fn(f"Новое значение [{old_value}] (Enter — оставить): ")
+            elif key == "quality":
+                print("  standard — стандартное\n  2k — высокое\n  4k — максимальное")
+            elif key == "cache_missing_yandex_song_zips":
+                print("  true — да\n  false — нет")
+            value = input_fn("Новое значение:\n")
             if not value.strip():
                 continue
             value = value.strip()

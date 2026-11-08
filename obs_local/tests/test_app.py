@@ -1,5 +1,6 @@
 import asyncio
 import configparser
+import multiprocessing
 import os
 import tempfile
 import unittest
@@ -8,6 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from obs_local import app
+
+
+def _hold_category_output_lock(path, acquired, release=None):
+    with app._category_output_lock(Path(path)):
+        acquired.set()
+        if release is not None:
+            release.wait(10)
 
 
 class SlideRangeTests(unittest.TestCase):
@@ -134,7 +142,12 @@ class CategoryConversionTests(unittest.TestCase):
         ):
             presentation.return_value.slides = [None] * 161
             output = asyncio.run(app.prepare_obs_folder(
-                {"keywords": {}, "root_path": root / "output", "quality": "standard"},
+                {
+                    "keywords": {},
+                    "root_path": root / "output",
+                    "category_output_path": root / "output" / "Трансляция",
+                    "quality": "standard",
+                },
                 source, datetime(2026, 11, 8),
             ))
         return output, convert
@@ -145,10 +158,15 @@ class CategoryConversionTests(unittest.TestCase):
                 "2", "3", "105-107", "2", "4",
                 "1", "140-150", "2", "3-10", "4", "1",
             ])
-            self.assertEqual({path.name for path in output.iterdir()}, set(app.CATEGORIES))
-            self.assertEqual(len(list((output / "sermon").glob("*.png"))), 11)
-            self.assertEqual(len(list((output / "opening").glob("*.png"))), 8)
-            self.assertEqual(len(list((output / "prayer").glob("*.png"))), 3)
+            self.assertEqual(
+                {path.name for path in output.iterdir() if path.is_dir()},
+                {"Проповедь", "Начало собрания", "Молитва"},
+            )
+            self.assertTrue((output / ".category-output.lock").is_file())
+            self.assertEqual(len(list((output / "Проповедь").glob("*.png"))), 11)
+            self.assertEqual(len(list((output / "Начало собрания").glob("*.png"))), 8)
+            self.assertEqual(len(list((output / "Молитва").glob("*.png"))), 3)
+            self.assertEqual(output, Path(directory) / "output" / "Трансляция")
             convert.assert_awaited_once()
 
     def test_confirm_change_keeps_batch_ranges_and_single_category_output(self):
@@ -157,16 +175,158 @@ class CategoryConversionTests(unittest.TestCase):
                 "4", "3", "105-107", "4", "2",
                 "5", "1", "5", "2", "4", "1",
             ])
-            self.assertEqual({path.name for path in output.iterdir()}, {"prayer"})
-            self.assertEqual(len(list((output / "prayer").glob("*.png"))), 3)
+            self.assertEqual(
+                {path.name for path in output.iterdir() if path.is_dir()},
+                {"Молитва"},
+            )
+            self.assertEqual(len(list((output / "Молитва").glob("*.png"))), 3)
             convert.assert_awaited_once()
         with tempfile.TemporaryDirectory() as directory:
             output, convert = self.execute(Path(directory), [
                 "2", "3", "105-107", "2", "2", "3", "", "1",
             ])
-            self.assertEqual(output.name, "prayer")
+            self.assertEqual(output.name, "Молитва")
+            self.assertEqual(output.parent.name, "Трансляция")
             self.assertEqual(len(list(output.glob("*.png"))), 3)
             convert.assert_awaited_once()
+
+    def test_category_reruns_keep_only_the_latest_generated_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, _ = self.execute(
+                root, ["2", "3", "105-107", "1"]
+            )
+
+            second, _ = self.execute(
+                root, ["2", "3", "110-112", "1"]
+            )
+
+            backup_root = second.parent / ".backups" / "Молитва"
+            user_backup = backup_root / "ручной-архив"
+            user_backup.mkdir(parents=True)
+            (user_backup / "keep.txt").write_text("keep", encoding="utf-8")
+
+            third, _ = self.execute(
+                root, ["2", "3", "120-122", "1"]
+            )
+
+            self.assertEqual(first, second)
+            self.assertEqual(second, third)
+            self.assertEqual(
+                {path.name for path in third.glob("*.png")},
+                {"slide_120.png", "slide_121.png", "slide_122.png"},
+            )
+            generated_backups = [
+                path
+                for path in backup_root.iterdir()
+                if path.name != "ручной-архив"
+            ]
+            self.assertEqual(len(generated_backups), 1)
+            self.assertEqual(
+                {path.name for path in generated_backups[0].glob("*.png")},
+                {"slide_110.png", "slide_111.png", "slide_112.png"},
+            )
+            self.assertEqual(
+                (user_backup / "keep.txt").read_text(encoding="utf-8"), "keep"
+            )
+
+    def test_batch_copy_failure_does_not_replace_any_live_category(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output" / "Трансляция"
+            sermon = output_root / "Проповедь"
+            opening = output_root / "Начало собрания"
+            sermon.mkdir(parents=True)
+            opening.mkdir()
+            (sermon / "old.png").write_bytes(b"old sermon")
+            (opening / "old.png").write_bytes(b"old opening")
+            original_copy = app.shutil.copy2
+
+            def fail_opening_copy(source, destination, *args, **kwargs):
+                if Path(destination).parent.name == "opening":
+                    raise OSError("synthetic copy failure")
+                return original_copy(source, destination, *args, **kwargs)
+
+            with patch.object(app.shutil, "copy2", side_effect=fail_opening_copy):
+                with self.assertRaisesRegex(OSError, "synthetic copy failure"):
+                    self.execute(root, ["4", "4", "1"])
+
+            self.assertEqual((sermon / "old.png").read_bytes(), b"old sermon")
+            self.assertEqual((opening / "old.png").read_bytes(), b"old opening")
+            self.assertFalse((output_root / ".backups").exists())
+
+    def test_batch_publish_failure_restores_all_previous_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output" / "Трансляция"
+            sermon = output_root / "Проповедь"
+            opening = output_root / "Начало собрания"
+            sermon.mkdir(parents=True)
+            opening.mkdir()
+            (sermon / "old.png").write_bytes(b"old sermon")
+            (opening / "old.png").write_bytes(b"old opening")
+            original_rename = Path.rename
+
+            def fail_opening_publish(source, target):
+                if (
+                    Path(source).name == "opening"
+                    and Path(target) == opening
+                ):
+                    raise OSError("synthetic publish failure")
+                return original_rename(source, target)
+
+            with patch.object(Path, "rename", fail_opening_publish):
+                with self.assertRaisesRegex(
+                    RuntimeError, "предыдущие файлы восстановлены"
+                ):
+                    self.execute(root, ["4", "4", "1"])
+
+            self.assertEqual((sermon / "old.png").read_bytes(), b"old sermon")
+            self.assertEqual((opening / "old.png").read_bytes(), b"old opening")
+            self.assertEqual({path.name for path in sermon.iterdir()}, {"old.png"})
+            self.assertEqual({path.name for path in opening.iterdir()}, {"old.png"})
+
+    def test_category_output_lock_serializes_processes(self):
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            first_acquired = context.Event()
+            release_first = context.Event()
+            second_acquired = context.Event()
+            first = context.Process(
+                target=_hold_category_output_lock,
+                args=(directory, first_acquired, release_first),
+            )
+            second = context.Process(
+                target=_hold_category_output_lock,
+                args=(directory, second_acquired),
+            )
+            try:
+                first.start()
+                self.assertTrue(first_acquired.wait(10))
+                second.start()
+                self.assertFalse(second_acquired.wait(0.25))
+                release_first.set()
+                self.assertTrue(second_acquired.wait(10))
+            finally:
+                release_first.set()
+                first.join(10)
+                second.join(10)
+                if first.is_alive():
+                    first.terminate()
+                    first.join()
+                if second.is_alive():
+                    second.terminate()
+                    second.join()
+            self.assertEqual(first.exitcode, 0)
+            self.assertEqual(second.exitcode, 0)
+
+    def test_all_slides_keep_run_specific_output_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, _ = self.execute(Path(directory), ["1", "1"])
+
+            self.assertEqual(output.name, "all")
+            self.assertEqual(output.parent.parent.parent.name, "2026-11-08")
+            self.assertEqual(len(list(output.glob("*.png"))), 161)
 
     def test_cancel_or_missing_rendered_pages_does_not_publish_output(self):
         for answers, pages, error in (
@@ -380,6 +540,9 @@ class InteractiveConfigTests(unittest.TestCase):
             self.assertIn("quality = 2k", saved_settings)
             self.assertNotIn("quality = invalid", saved_settings)
             self.assertEqual(config["root_path"], project_dir / "obs_png")
+            self.assertEqual(
+                config["category_output_path"], project_dir / "obs_png" / "Трансляция"
+            )
             self.assertEqual(config["quality"], "2k")
             self.assertEqual(config["token"], "test-token")
             self.assertIn("token = test-token", secret_path.read_text(encoding="utf-8"))
@@ -427,6 +590,39 @@ class InteractiveConfigTests(unittest.TestCase):
 
         self.assertEqual(config["token"], "local-token")
         self.assertEqual(config["base_path"], "/disk")
+        self.assertEqual(
+            config["category_output_path"], project_dir / "obs_png" / "Трансляция"
+        )
+
+    def test_category_output_path_can_be_relative_to_root_or_absolute(self):
+        for configured, expected in (
+            ("Категории OBS", "configured-root/Категории OBS"),
+            ("/shared/OBS/Трансляция", "/shared/OBS/Трансляция"),
+        ):
+            with self.subTest(configured=configured), tempfile.TemporaryDirectory() as directory:
+                project_dir = Path(directory)
+                obs_dir = project_dir / "obs_local"
+                obs_dir.mkdir()
+                (obs_dir / "settings.ini").write_text(
+                    "[YandexDisk]\nbase_path = /disk\n"
+                    "[OBS Local paths]\n"
+                    "root_path = configured-root\n"
+                    f"category_output_path = {configured}\n"
+                    "quality = standard\n",
+                    encoding="utf-8",
+                )
+                (project_dir / "config.ini").write_text(
+                    "[YandexDisk]\ntoken = test-token\n", encoding="utf-8"
+                )
+                with (
+                    patch.object(app, "BASE_DIR", obs_dir),
+                    patch.object(app, "PROJECT_DIR", project_dir),
+                ):
+                    config = app.load_config()
+                expected_path = Path(expected)
+                if not expected_path.is_absolute():
+                    expected_path = project_dir / expected_path
+                self.assertEqual(config["category_output_path"], expected_path)
 
 
 if __name__ == "__main__":
