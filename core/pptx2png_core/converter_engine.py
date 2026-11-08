@@ -10,10 +10,12 @@
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 import re
 import asyncio
 import logging
+import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -126,44 +128,130 @@ def _find_libreoffice() -> str:
     )
 
 
+MACOS_FONT_EXTENSIONS = {".otc", ".otf", ".ttc", ".ttf"}
+
+
+def _macos_font_dirs() -> list[Path]:
+    directories = [Path("/Library/Fonts"), Path.home() / "Library" / "Fonts"]
+    extra_directories = os.environ.get("PPTX2PNG_FONT_DIRS", "").strip()
+    if extra_directories:
+        for value in extra_directories.split(os.pathsep):
+            if not value.strip():
+                continue
+            directory = Path(value.strip()).expanduser()
+            if not directory.is_dir():
+                raise FileNotFoundError(
+                    f"Configured LibreOffice font directory is unavailable: {directory}"
+                )
+            directories.append(directory)
+    return directories
+
+
+def _install_macos_fonts(profile_dir: Path) -> int:
+    font_dir = profile_dir / "user" / "fonts"
+    font_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for source_dir in _macos_font_dirs():
+        if not source_dir.is_dir():
+            continue
+        for source in sorted(source_dir.rglob("*")):
+            if source.is_file() and source.suffix.lower() in MACOS_FONT_EXTENSIONS:
+                destination = font_dir / source.name
+                suffix = 1
+                while destination.exists():
+                    destination = font_dir / f"{source.stem}_{suffix}{source.suffix}"
+                    suffix += 1
+                try:
+                    shutil.copyfile(source, destination)
+                except OSError as error:
+                    raise OSError(
+                        f"Could not copy LibreOffice font {source}: {error}"
+                    ) from error
+                copied += 1
+    return copied
+
+
+def _soffice_fallback_args() -> List[str]:
+    if sys.platform == "darwin":
+        return ["--invisible", "--norestore", "--nologo", "--nodefault"]
+    return ["--headless"]
+
+
+def _run_libreoffice_conversion(
+    libreoffice_path: str,
+    source_path: Path,
+    output_dir: Path,
+    output_format: str,
+) -> Path:
+    output_path = output_dir / f"{source_path.stem}.{output_format}"
+    if source_path.resolve() == output_path.resolve():
+        raise ValueError(f"LibreOffice output would overwrite the source: {source_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def run(args: list[str]) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".pptx2png-convert-", dir=output_dir
+        ) as temp_output:
+            staging_dir = Path(temp_output)
+            subprocess.run(
+                [
+                    libreoffice_path,
+                    *args,
+                    "--convert-to", output_format,
+                    "--outdir", str(staging_dir),
+                    str(source_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            generated_path = staging_dir / output_path.name
+            if not generated_path.is_file():
+                raise FileNotFoundError(
+                    f"LibreOffice did not create the expected output: {output_path}"
+                )
+            os.replace(generated_path, output_path)
+
+    if sys.platform != "darwin":
+        run(["--headless"])
+        return output_path
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="pptx2png-lo-profile-") as temp_dir:
+            profile_dir = Path(temp_dir)
+            font_count = _install_macos_fonts(profile_dir)
+            if font_count == 0:
+                raise FileNotFoundError(
+                    "No TrueType/OpenType fonts found in the configured macOS font directories"
+                )
+            run([
+                "--headless",
+                f"-env:UserInstallation={profile_dir.as_uri()}",
+            ])
+    except (OSError, subprocess.SubprocessError) as error:
+        logging.warning(
+            "LibreOffice headless conversion with an isolated font profile "
+            "failed; retrying with the logged-in macOS session: %s",
+            error,
+        )
+        run(_soffice_fallback_args())
+    return output_path
+
+
 def pptx_to_pdf_crossplatform(pptx_path: Path, output_dir: Path) -> Path:
     """Конвертирует PPTX в PDF через LibreOffice."""
     libreoffice_path = _find_libreoffice()
-
-    cmd = [
-        libreoffice_path,
-        "--headless",
-        "--convert-to", "pdf",
-        "--outdir", str(output_dir),
-        str(pptx_path),
-    ]
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
+    return _run_libreoffice_conversion(
+        libreoffice_path, pptx_path, output_dir, "pdf"
     )
-    return output_dir / f"{pptx_path.stem}.pdf"
 
 
 def ppt_to_pptx_crossplatform(ppt_path: Path, output_dir: Path) -> Path:
     """Конвертирует PPT (старый формат) в PPTX через LibreOffice."""
     libreoffice_path = _find_libreoffice()
-
-    cmd = [
-        libreoffice_path,
-        "--headless",
-        "--convert-to", "pptx",
-        "--outdir", str(output_dir),
-        str(ppt_path),
-    ]
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
+    return _run_libreoffice_conversion(
+        libreoffice_path, ppt_path, output_dir, "pptx"
     )
-    return output_dir / f"{ppt_path.stem}.pptx"
 
 def librenormalize_to_pptx(
     src_pptx: Path, work_dir: Path

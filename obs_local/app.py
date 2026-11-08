@@ -42,6 +42,7 @@ CATEGORIES = {
     "opening": "Начало собрания",
     "prayer": "Молитва",
 }
+OUTPUT_LABELS = {**CATEGORIES, "all": "Все слайды", "custom": "Выбранные слайды"}
 DEFAULT_ROOT_PATH = "./obs_png"
 
 
@@ -493,7 +494,7 @@ def _confirm_selection(
     selected = _format_ranges(ranges)
     count = sum(last - first + 1 for first, last in ranges)
     print(f"\nВыбрано: {selected} ({count} из {total_slides} слайдов)")
-    print(f"Каталог категории: {CATEGORIES.get(category, category)}")
+    print(f"Каталог категории: {OUTPUT_LABELS.get(category, category)}")
     return _confirm_action(input_fn)
 
 
@@ -752,7 +753,7 @@ async def prepare_obs_folder(
             / _safe_name(source_path.stem)
             / run_id
         )
-        output_dir = run_dir / category
+        output_dir = run_dir / OUTPUT_LABELS.get(category, category)
         output_dir.mkdir(parents=True, exist_ok=False)
         for first, last in selections[category]:
             for png_path in png_paths[first - 1 : last]:
