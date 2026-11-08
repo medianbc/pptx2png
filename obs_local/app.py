@@ -8,6 +8,7 @@ import getpass
 import re
 import shutil
 import tempfile
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,11 @@ from .config_utils import get_settings_path, parse_local_file_path
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
-CATEGORIES = {"sermon": "Проповедь", "opening": "Начало", "prayer": "Молитва"}
+CATEGORIES = {
+    "sermon": "Проповедь",
+    "opening": "Начало собрания",
+    "prayer": "Молитва",
+}
 DEFAULT_ROOT_PATH = "./obs_png"
 
 
@@ -74,6 +79,9 @@ def load_config(
     base_path = setting("YandexDisk", "base_path")
     source_folder = setting("YandexDisk", "source_folder", "Служение")
     root_value = setting("OBS Local paths", "root_path")
+    category_output_value = setting(
+        "OBS Local paths", "category_output_path", "Трансляция"
+    )
     quality = setting("OBS Local paths", "quality").lower()
 
     settings_updates: dict[str, dict[str, str]] = {}
@@ -135,6 +143,10 @@ def load_config(
     if not root_path.is_absolute():
         root_path = PROJECT_DIR / root_path
 
+    category_output_path = Path(category_output_value).expanduser()
+    if not category_output_path.is_absolute():
+        category_output_path = root_path / category_output_path
+
     legacy_keyword = setting("YandexDisk", "sermon_keyword", "проповед")
     raw_keywords = {
         "sermon": setting(
@@ -157,6 +169,7 @@ def load_config(
         "base_path": base_path,
         "source_folder": source_folder,
         "root_path": root_path,
+        "category_output_path": category_output_path,
         "quality": quality,
         "keywords": keywords,
     }
@@ -503,6 +516,39 @@ def _safe_name(value: str) -> str:
     return cleaned or "presentation"
 
 
+def _publish_category_output(staging: Path, target: Path) -> Path | None:
+    backup = None
+    backup_root = target.parent / ".backups" / target.name
+    if target.exists() or target.is_symlink():
+        backup_root.mkdir(parents=True, exist_ok=True)
+        backup = backup_root / (
+            f"{datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex[:8]}"
+        )
+        target.rename(backup)
+    try:
+        staging.rename(target)
+    except OSError:
+        if backup is not None and backup.exists():
+            backup.rename(target)
+        raise
+    if backup_root.is_dir():
+        generated_backups = sorted(
+            path
+            for path in backup_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+            and re.fullmatch(r"\d{8}-\d{6}-\d{6}-[0-9a-f]{8}", path.name)
+        )
+        for old_backup in generated_backups[:-1]:
+            try:
+                shutil.rmtree(old_backup)
+            except OSError as error:
+                print(
+                    "Предупреждение: не удалось удалить старую резервную копию "
+                    f"{old_backup}: {error}"
+                )
+    return backup
+
+
 async def prepare_obs_folder(
     config: dict[str, Any], source_path: Path, sunday: datetime
 ) -> Path:
@@ -560,6 +606,30 @@ async def prepare_obs_folder(
                 f"В PDF {len(png_paths)} страниц, а выбран слайд {highest_slide}"
             )
 
+        if all(key in CATEGORIES for key in selections):
+            category_output_path = Path(config.get(
+                "category_output_path", config["root_path"] / "Трансляция"
+            ))
+            category_output_path.mkdir(parents=True, exist_ok=True)
+            for key, selected_ranges in selections.items():
+                with tempfile.TemporaryDirectory(
+                    prefix=".category-staging-", dir=category_output_path
+                ) as staging_name:
+                    output_dir = Path(staging_name) / "output"
+                    output_dir.mkdir()
+                    for first, last in selected_ranges:
+                        for png_path in png_paths[first - 1 : last]:
+                            shutil.copy2(png_path, output_dir / png_path.name)
+                    target = category_output_path / CATEGORIES[key]
+                    backup = _publish_category_output(output_dir, target)
+                    if backup is not None:
+                        print(f"Предыдущий результат сохранён: {backup}")
+            return (
+                category_output_path
+                if category == "categories"
+                else category_output_path / CATEGORIES[category]
+            )
+
         run_id = datetime.now().strftime("%H%M%S_%f")
         run_dir = (
             config["root_path"]
@@ -567,13 +637,12 @@ async def prepare_obs_folder(
             / _safe_name(source_path.stem)
             / run_id
         )
-        for key, selected_ranges in selections.items():
-            output_dir = run_dir / key
-            output_dir.mkdir(parents=True, exist_ok=False)
-            for first, last in selected_ranges:
-                for png_path in png_paths[first - 1 : last]:
-                    shutil.copy2(png_path, output_dir / png_path.name)
-        return run_dir if category == "categories" else run_dir / category
+        output_dir = run_dir / category
+        output_dir.mkdir(parents=True, exist_ok=False)
+        for first, last in selections[category]:
+            for png_path in png_paths[first - 1 : last]:
+                shutil.copy2(png_path, output_dir / png_path.name)
+        return output_dir
 
 
 async def run(date: datetime | None = None) -> Path:

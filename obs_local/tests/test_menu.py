@@ -72,7 +72,7 @@ class MainMenuTests(unittest.TestCase):
         app_main.assert_not_called()
 
     def test_update_check_can_install_and_exits_menu_afterwards(self):
-        answers = iter(["3", "6", "1"])
+        answers = iter(["3", "7", "1"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -94,7 +94,7 @@ class MainMenuTests(unittest.TestCase):
         install_update.assert_called_once_with(update)
 
     def test_update_check_can_be_cancelled(self):
-        answers = iter(["3", "6", "0", "0", "0"])
+        answers = iter(["3", "7", "0", "0", "0"])
         update = menu.updater.UpdateInfo(
             branch="main",
             local_revision="a" * 40,
@@ -125,7 +125,7 @@ class MainMenuTests(unittest.TestCase):
                     remote_revision="a" * 40, available=False,
                     is_git_checkout=False,
                 )
-                answers = iter(["6", "0"])
+                answers = iter(["7", "0"])
                 with (
                     patch.object(menu, "get_settings_path", return_value=path),
                     patch.object(menu.updater, "check_for_updates", return_value=update, side_effect=error),
@@ -156,12 +156,58 @@ class MainMenuTests(unittest.TestCase):
                 encoding="utf-8",
             )
             answers = iter(["1", "2k", "0"])
-            with patch.object(menu.app, "BASE_DIR", root):
-                menu._settings_menu(lambda _: next(answers))
+            input_fn = Mock(side_effect=answers)
+            with (
+                patch.object(menu.app, "BASE_DIR", root),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                menu._settings_menu(input_fn)
             text = menu.get_settings_path(root).read_text(encoding="utf-8")
             self.assertIn("# keep", text)
             self.assertIn("quality = 2k", text)
             self.assertIn("quality = standard", settings_path.read_text(encoding="utf-8"))
+            self.assertIn("Качество PNG [Стандартное]", output.getvalue())
+            self.assertIn("Кратко: Качество PNG.", output.getvalue())
+            self.assertIn("Подробнее: Разрешение изображений презентации.", output.getvalue())
+            self.assertIn("Текущее значение: [Стандартное]", output.getvalue())
+            self.assertNotIn("quality =", output.getvalue())
+            self.assertEqual(input_fn.call_args_list[1].args[0], "Новое значение:\n")
+
+    def test_unknown_settings_use_localized_label_without_technical_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "settings.ini").write_text(
+                "[Custom]\nprivate_option = visible-value\n",
+                encoding="utf-8",
+            )
+            input_fn = Mock(side_effect=["0"])
+            with (
+                patch.object(menu.app, "BASE_DIR", root),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                menu._settings_menu(input_fn)
+
+            self.assertIn("1. Дополнительная настройка [visible-value]", output.getvalue())
+            self.assertNotIn("Custom", output.getvalue())
+            self.assertNotIn("private_option", output.getvalue())
+
+    def test_settings_exposes_category_output_path_for_existing_configs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings_path = root / "settings.ini"
+            settings_path.write_text(
+                "[OBS Local paths]\nroot_path = ./obs_png\n",
+                encoding="utf-8",
+            )
+            answers = iter(["3", "/shared/OBS/Трансляция", "0"])
+            with patch.object(menu.app, "BASE_DIR", root):
+                menu._settings_menu(lambda _: next(answers))
+            settings = configparser.ConfigParser(interpolation=None)
+            settings.read(menu.get_settings_path(root), encoding="utf-8")
+            self.assertEqual(
+                settings.get("OBS Local paths", "category_output_path"),
+                "/shared/OBS/Трансляция",
+            )
 
     def test_settings_accepts_google_docs_program_url(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -182,7 +228,7 @@ class MainMenuTests(unittest.TestCase):
         for answers, expected in (
             (["0"], "https://[broken"),
             (["1", "https://disk.yandex.ru/d/repaired", "0"], "https://disk.yandex.ru/d/repaired"),
-            (["6", "0"], "https://[broken"),
+            (["7", "0"], "https://[broken"),
         ):
             with self.subTest(answers=answers), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "settings.ini"
@@ -195,7 +241,7 @@ class MainMenuTests(unittest.TestCase):
                 ):
                     self.assertFalse(menu._settings_menu(input_fn))
                 self.assertEqual(input_fn.call_count, len(answers))
-                self.assertEqual(check.call_count, int(answers[0] == "6"))
+                self.assertEqual(check.call_count, int(answers[0] == "7"))
                 settings = configparser.ConfigParser()
                 settings.read(path, encoding="utf-8")
                 self.assertEqual(settings.get("Song preparation", "program_url"), expected)
@@ -209,7 +255,7 @@ class MainMenuTests(unittest.TestCase):
                 encoding="utf-8",
             )
             google_url = "https://docs.google.com/document/d/synthetic-program/edit?usp=sharing"
-            answers = iter(["2", "1", "3", google_url, "2", "2", "0"])
+            answers = iter(["3", "2", "4", google_url, "0"])
             with (
                 patch.object(menu, "get_settings_path", return_value=path),
                 contextlib.redirect_stdout(io.StringIO()) as output,
@@ -314,7 +360,7 @@ class MainMenuTests(unittest.TestCase):
             (local / "config.ini").write_text(
                 "[YandexDisk]\ntoken = old\n", encoding="utf-8"
             )
-            answers = iter(["6", "0"])
+            answers = iter(["7", "0"])
             with (
                 patch.object(menu.app, "BASE_DIR", local),
                 patch.object(menu.app, "PROJECT_DIR", root),

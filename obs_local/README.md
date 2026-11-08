@@ -118,8 +118,12 @@ on the target machine as well.
    ```
 
 The menu offers presentation preparation (`1`), song preparation (`2`),
-settings (`3`), and exit (`0`). Settings lists numbered
-parameters from the current OS settings file and saves edits while preserving comments.
+settings (`3`), and exit (`0`). Settings shows numbered Russian descriptions and
+current values instead of configuration keys. Selecting a setting displays a
+short and detailed explanation, the current value in brackets, and a prompt
+for the replacement value on the next line. Unknown settings are labeled
+"Additional setting" without exposing their technical key. Edits are saved
+while preserving comments.
 A separate numbered action accepts a hidden Yandex token and saves it in
 private `config.ini` files. Another numbered action in Settings checks updates;
 its number follows the token action. Empty input keeps the current parameter value.
@@ -182,8 +186,11 @@ obs_local.run_obs_local` and `python -m obs_local.prepare_songs`.
   `[YandexDisk]` defines
   `base_path` and `source_folder` used to fetch the upcoming Sunday's
   presentation.
-- `[OBS Local paths]` defines `root_path` and quality (`standard`, `2k`, or
-  `4k`). Relative `root_path` values resolve from the repository root.
+- `[OBS Local paths]` defines `root_path`, `category_output_path`, and quality
+  (`standard`, `2k`, or `4k`). Relative `root_path` values resolve from the
+  repository root; relative `category_output_path` values resolve from
+  `root_path`. This option affects presentation categories only; songs remain
+  under `root_path/Трансляция/Песни`.
 - `[SlideCategories]` contains keywords used to detect slide categories in
   speaker notes.
 - `[Song preparation]` defines `program_url`, `local_zip_dir`,
@@ -209,7 +216,11 @@ select one (`0` or Enter cancels the selection). It reads speaker notes and lets
 operator prepare all slides, select a detected category, or enter one or more
 custom slide ranges (for example `1-4, 7, 9-11`). The chosen slides and output
 category are shown for confirmation before rendering; the operator can return
-to selection or cancel. Output is written to
+to selection or cancel. Category slides are written to stable Russian-named
+folders under `category_output_path` (default `root_path/Трансляция`):
+`Начало собрания`, `Молитва`, and `Проповедь`. Absolute
+`category_output_path` values are used as-is; relative values resolve from
+`root_path`. All-slide and custom-range results remain in
 `root_path/YYYY-MM-DD/presentation/run-id/category`. The interactive workflow
 prompts for missing paths, quality and Yandex Disk token on first run, saves
 ordinary settings to the current OS file and the token to a private `config.ini`.
@@ -222,8 +233,13 @@ edit a category and select it, `5` toggles selection by category number, and
 `4` confirms the selected categories. Detected categories are selected initially;
 missing categories need a manual range. Changing the confirmation retains edits
 and selection. The renderer runs once and publishes each selected category to
-its own `sermon`/`opening`/`prayer` subfolder under a shared run directory.
-The reported batch result path is that directory; single-category paths are unchanged.
+its stable Russian-named folder. Replaced category folders are retained under
+the hidden `category_output_path/.backups/<category>/<timestamp>` directory.
+Only the latest generated backup per category is retained; older generated
+backups are removed on the next conversion of that category. Categories not
+selected in a batch remain unchanged. Existing run-specific
+outputs are not moved or deleted. The reported batch result path is
+`category_output_path`.
 
 If the upcoming Sunday's service folder or presentation is missing on Yandex
 Disk, the workflow reports it and offers numbered actions: retry (`1`),
